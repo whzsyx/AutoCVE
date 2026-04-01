@@ -1,0 +1,556 @@
+﻿import asyncio
+import logging
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from .base import AgentConfig, AgentPattern, AgentResult, AgentType, BaseAgent, TaskHandoff
+from ..prompts import MULTI_AGENT_RULES
+
+logger = logging.getLogger(__name__)
+
+
+ORCHESTRATOR_SYSTEM_PROMPT = """You are the deterministic orchestrator for AuditAI.
+You do not let the LLM choose major stages.
+You execute a fixed plan:
+1. planning
+2. recon
+3. parallel analysis:
+   - scan -> triage
+   - finding
+4. merge
+5. verification
+6. finalize
+"""
+
+
+@dataclass
+class ExecutionPlan:
+    recon_mode: str
+    verification_confidence_threshold: float
+    verification_limit: int
+
+
+class OrchestratorAgent(BaseAgent):
+    def __init__(
+        self,
+        llm_service,
+        tools: Dict[str, Any],
+        event_emitter=None,
+        sub_agents: Optional[Dict[str, BaseAgent]] = None,
+        tracer=None,
+    ):
+        config = AgentConfig(
+            name="Orchestrator",
+            agent_type=AgentType.ORCHESTRATOR,
+            pattern=AgentPattern.PLAN_AND_EXECUTE,
+            max_iterations=8,
+            system_prompt=f"{ORCHESTRATOR_SYSTEM_PROMPT}\n\n{MULTI_AGENT_RULES}",
+        )
+        super().__init__(config, llm_service, tools, event_emitter)
+        self.sub_agents = sub_agents or {}
+        self.tracer = tracer
+        self._agent_results: Dict[str, Dict[str, Any]] = {}
+        self._agent_handoffs: Dict[str, TaskHandoff] = {}
+        self._all_findings: List[Dict[str, Any]] = []
+        self._runtime_context: Dict[str, Any] = {}
+
+    def _resolve_workflow_state(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        configured_agents = {
+            "orchestrator": True,
+            "recon": True,
+            "scan": True,
+            "triage": True,
+            "finding": True,
+            "verification": True,
+        }
+
+        workflow_config = config.get("workflow") or config.get("workflow_config") or {}
+        incoming_states = workflow_config.get("agentStates", {}) if isinstance(workflow_config, dict) else {}
+        if isinstance(incoming_states, dict):
+            for agent in configured_agents:
+                raw_state = incoming_states.get(agent)
+                if isinstance(raw_state, dict):
+                    configured_agents[agent] = bool(raw_state.get("enabled", True))
+                elif isinstance(raw_state, bool):
+                    configured_agents[agent] = raw_state
+
+        configured_agents["orchestrator"] = True
+        configured_agents["recon"] = True
+
+        effective_agents = dict(configured_agents)
+        effective_agents["triage"] = configured_agents["triage"] and effective_agents["scan"]
+        effective_agents["verification"] = configured_agents["verification"] and (
+            effective_agents["triage"] or effective_agents["finding"]
+        )
+
+        active_edges: List[tuple[str, str]] = [("orchestrator", "recon")]
+        if effective_agents["scan"]:
+            active_edges.append(("recon", "scan"))
+        if effective_agents["triage"]:
+            active_edges.append(("scan", "triage"))
+        if effective_agents["finding"]:
+            active_edges.append(("recon", "finding"))
+        if effective_agents["verification"] and effective_agents["triage"]:
+            active_edges.append(("triage", "verification"))
+        if effective_agents["verification"] and effective_agents["finding"]:
+            active_edges.append(("finding", "verification"))
+
+        return {
+            "configured_agents": configured_agents,
+            "effective_agents": effective_agents,
+            "active_edges": active_edges,
+        }
+
+    def _build_skipped_result(self, agent_name: str, reason: str, *, output_key: str = "findings") -> AgentResult:
+        data: Dict[str, Any] = {"summary": reason}
+        data[output_key] = []
+        if output_key != "findings":
+            data["findings"] = []
+        return AgentResult(success=True, data=data, metadata={"skipped": True, "reason": reason, "agent": agent_name})
+
+    def register_sub_agent(self, name: str, agent: BaseAgent):
+        self.sub_agents[name] = agent
+
+    def cancel(self):
+        self._cancelled = True
+        for agent in self.sub_agents.values():
+            if hasattr(agent, "cancel"):
+                agent.cancel()
+
+    def _build_execution_plan(self, project_info: Dict[str, Any], config: Dict[str, Any]) -> ExecutionPlan:
+        file_count = project_info.get("file_count", 0)
+        target_files = config.get("target_files") or []
+        if target_files and len(target_files) <= 20:
+            recon_mode = "light"
+        elif file_count <= 40:
+            recon_mode = "light"
+        elif file_count >= 400:
+            recon_mode = "full"
+        else:
+            recon_mode = "light"
+
+        return ExecutionPlan(
+            recon_mode=recon_mode,
+            verification_confidence_threshold=0.8,
+            verification_limit=20,
+        )
+
+    async def _run_sub_agent(self, name: str, payload: Dict[str, Any]) -> AgentResult:
+        agent = self.sub_agents[name]
+        await self.emit_debug_payload(
+            "handoff_out",
+            {
+                "from_agent": self.agent_type.value,
+                "to_agent": name,
+                "payload": payload,
+            },
+            message=f"orchestrator dispatched payload to {name}",
+        )
+        await self.emit_event("dispatch", f"Dispatching {name}", metadata={"agent": name})
+        result = await agent.run(payload)
+        self._agent_results[name] = result.to_dict()
+        if result.handoff:
+            self._agent_handoffs[name] = result.handoff
+            await self.emit_debug_payload(
+                "handoff_in",
+                {
+                    "from_agent": name,
+                    "to_agent": self.agent_type.value,
+                    "payload": result.handoff.to_dict(),
+                },
+                message=f"{name} returned handoff to orchestrator",
+            )
+        await self.emit_event("dispatch_complete", f"{name} completed", metadata={"agent": name, "success": result.success})
+        return result
+
+    def _normalize_finding(self, finding: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(finding, dict):
+            return None
+        normalized = dict(finding)
+        if "file" in normalized and "file_path" not in normalized:
+            normalized["file_path"] = normalized["file"]
+        if "line" in normalized and "line_start" not in normalized:
+            normalized["line_start"] = normalized["line"]
+        if "severity" not in normalized:
+            normalized["severity"] = "medium"
+        normalized["severity"] = str(normalized.get("severity", "medium")).lower()
+        if "vulnerability_type" not in normalized:
+            normalized["vulnerability_type"] = normalized.get("type", "other")
+        normalized.setdefault("title", f"{normalized['vulnerability_type']} finding")
+        normalized.setdefault("description", "")
+        normalized.setdefault("code_snippet", "")
+        normalized.setdefault("confidence", 0.7)
+        normalized.setdefault("needs_verification", True)
+        normalized.setdefault("origins", [normalized.get("origin")] if normalized.get("origin") else [])
+        normalized.setdefault("verdict", "candidate")
+        normalized.setdefault("report_status", self._derive_report_status(normalized))
+
+        file_path = normalized.get("file_path", "")
+        if file_path and not self._validate_file_path(file_path):
+            logger.warning("Skipping finding with invalid file path: %s", file_path)
+            return None
+        return normalized
+
+    def _validate_file_path(self, file_path: str) -> bool:
+        if not file_path:
+            return True
+        project_root = self._runtime_context.get("project_root", ".")
+        try:
+            abs_path = os.path.abspath(os.path.join(project_root, file_path))
+            project_root_abs = os.path.abspath(project_root)
+            return abs_path.startswith(project_root_abs) and os.path.exists(abs_path)
+        except Exception:
+            return False
+
+    def _merge_findings(self, findings_groups: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        merged: Dict[str, Dict[str, Any]] = {}
+        for group in findings_groups:
+            for finding in group:
+                normalized = self._normalize_finding(finding)
+                if not normalized:
+                    continue
+                key = "|".join([
+                    normalized.get("file_path", ""),
+                    str(normalized.get("line_start", 0)),
+                    normalized.get("vulnerability_type", "other"),
+                ])
+                current = merged.get(key)
+                if not current:
+                    merged[key] = normalized
+                    continue
+
+                current["confidence"] = max(current.get("confidence", 0.0), normalized.get("confidence", 0.0))
+                severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+                if severity_rank.get(normalized.get("severity", "low"), 1) > severity_rank.get(current.get("severity", "low"), 1):
+                    current["severity"] = normalized["severity"]
+                if len(normalized.get("description", "")) > len(current.get("description", "")):
+                    current["description"] = normalized["description"]
+                if len(normalized.get("code_snippet", "")) > len(current.get("code_snippet", "")):
+                    current["code_snippet"] = normalized["code_snippet"]
+                if normalized.get("source") and not current.get("source"):
+                    current["source"] = normalized["source"]
+                if normalized.get("sink") and not current.get("sink"):
+                    current["sink"] = normalized["sink"]
+                if normalized.get("suggestion") and not current.get("suggestion"):
+                    current["suggestion"] = normalized["suggestion"]
+                if normalized.get("impact") and not current.get("impact"):
+                    current["impact"] = normalized["impact"]
+                if normalized.get("cve_justification") and not current.get("cve_justification"):
+                    current["cve_justification"] = normalized["cve_justification"]
+                if normalized.get("verification_notes") and not current.get("verification_notes"):
+                    current["verification_notes"] = normalized["verification_notes"]
+                if normalized.get("exploit_chain") and not current.get("exploit_chain"):
+                    current["exploit_chain"] = normalized["exploit_chain"]
+                if normalized.get("poc") and not current.get("poc"):
+                    current["poc"] = normalized["poc"]
+                if normalized.get("references") and not current.get("references"):
+                    current["references"] = normalized["references"]
+                if normalized.get("verdict") and current.get("verdict") in {None, "", "candidate"}:
+                    current["verdict"] = normalized["verdict"]
+                current["needs_verification"] = current.get("needs_verification", True) or normalized.get("needs_verification", True)
+                origin = normalized.get("origin")
+                if origin and origin not in current["origins"]:
+                    current["origins"].append(origin)
+                current["origin"] = current["origins"][0] if len(current["origins"]) == 1 else "multiple"
+                current["report_status"] = self._derive_report_status(current)
+        return list(merged.values())
+
+    def _merge_context_data(self, base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(base)
+        for key, value in (incoming or {}).items():
+            existing = merged.get(key)
+            if isinstance(existing, dict) and isinstance(value, dict):
+                merged[key] = self._merge_context_data(existing, value)
+            elif isinstance(existing, list) and isinstance(value, list):
+                merged[key] = list(dict.fromkeys([*existing, *value]))
+            elif existing in (None, "", [], {}):
+                merged[key] = value
+            else:
+                merged[key] = value
+        return merged
+
+    def _merge_handoffs(self, handoffs: List[Optional[TaskHandoff]]) -> Optional[TaskHandoff]:
+        valid_handoffs = [handoff for handoff in handoffs if handoff]
+        if not valid_handoffs:
+            return None
+        if len(valid_handoffs) == 1:
+            return valid_handoffs[0]
+
+        merged_context: Dict[str, Any] = {}
+        key_findings: List[Dict[str, Any]] = []
+        work_completed: List[str] = []
+        insights: List[str] = []
+        suggested_actions: List[Dict[str, Any]] = []
+        attention_points: List[str] = []
+        priority_areas: List[str] = []
+        summaries: List[str] = []
+
+        for handoff in valid_handoffs:
+            if handoff.summary:
+                summaries.append(f"{handoff.from_agent}: {handoff.summary}")
+            for finding in handoff.key_findings:
+                if finding not in key_findings:
+                    key_findings.append(finding)
+            work_completed.extend(item for item in handoff.work_completed if item not in work_completed)
+            insights.extend(item for item in handoff.insights if item not in insights)
+            for action in handoff.suggested_actions:
+                if action not in suggested_actions:
+                    suggested_actions.append(action)
+            attention_points.extend(item for item in handoff.attention_points if item not in attention_points)
+            priority_areas.extend(item for item in handoff.priority_areas if item not in priority_areas)
+            merged_context = self._merge_context_data(merged_context, handoff.context_data or {})
+
+        return TaskHandoff(
+            from_agent=self.agent_type.value,
+            to_agent="verification",
+            summary="\n".join(summaries),
+            work_completed=work_completed,
+            key_findings=key_findings[:20],
+            insights=insights,
+            suggested_actions=suggested_actions[:20],
+            attention_points=attention_points[:20],
+            priority_areas=priority_areas[:20],
+            context_data=merged_context,
+            confidence=max(handoff.confidence for handoff in valid_handoffs),
+        )
+
+    def _finding_key(self, finding: Dict[str, Any]) -> str:
+        return "|".join(
+            [
+                str(finding.get("file_path", "")),
+                str(finding.get("line_start", 0)),
+                str(finding.get("vulnerability_type", "other")),
+            ]
+        )
+
+    def _derive_report_status(self, finding: Dict[str, Any]) -> str:
+        verdict = str(finding.get("verdict", "") or "").lower()
+        if verdict in {"confirmed", "false_positive", "candidate", "likely", "uncertain"}:
+            return "candidate" if verdict == "likely" else verdict
+        if finding.get("is_verified"):
+            return "confirmed"
+        if str(finding.get("status", "")).lower() == "false_positive":
+            return "false_positive"
+        return "candidate"
+
+    def _finalize_findings(self, merged_findings: List[Dict[str, Any]], verification_result: Optional[AgentResult]) -> List[Dict[str, Any]]:
+        baseline = [dict(item, report_status=self._derive_report_status(item)) for item in merged_findings]
+        if not verification_result or not verification_result.success or not isinstance(verification_result.data, dict):
+            return baseline
+
+        verification_findings = verification_result.data.get("findings", [])
+        if not isinstance(verification_findings, list) or not verification_findings:
+            return baseline
+
+        final_map = {self._finding_key(finding): dict(finding) for finding in baseline}
+        for verified in verification_findings:
+            normalized = self._normalize_finding(verified)
+            if not normalized:
+                continue
+            key = self._finding_key(normalized)
+            current = final_map.get(key, {})
+            merged = {**current, **normalized}
+            merged["report_status"] = self._derive_report_status(merged)
+            final_map[key] = merged
+        return list(final_map.values())
+
+    def _select_findings_for_verification(self, findings: List[Dict[str, Any]], plan: ExecutionPlan) -> List[Dict[str, Any]]:
+        selected = []
+        for finding in findings:
+            severity = finding.get("severity", "low")
+            confidence = finding.get("confidence", 0.0)
+            if severity in {"critical", "high"}:
+                selected.append(finding)
+            elif finding.get("needs_verification") and confidence >= plan.verification_confidence_threshold:
+                selected.append(finding)
+        return selected[: plan.verification_limit]
+
+    async def run(self, input_data: Dict[str, Any]) -> AgentResult:
+        import time
+
+        start_time = time.time()
+        project_info = input_data.get("project_info", {})
+        config = input_data.get("config", {})
+        self._runtime_context = {
+            "project_info": project_info,
+            "config": config,
+            "project_root": input_data.get("project_root", project_info.get("root", ".")),
+            "task_id": input_data.get("task_id"),
+        }
+        self._agent_results = {}
+        self._agent_handoffs = {}
+        self._all_findings = []
+
+        try:
+            plan = self._build_execution_plan(project_info, config)
+            workflow_state = self._resolve_workflow_state(config)
+            await self.emit_agent_start_debug(
+                {
+                    "project_info": project_info,
+                    "config": config,
+                    "project_root": self._runtime_context.get("project_root"),
+                }
+            )
+            await self.emit_prompt_debug("system", self.config.system_prompt)
+            await self.emit_prompt_debug(
+                "user",
+                f"Execute deterministic orchestration for task {input_data.get('task_id')} with project {project_info.get('name', 'unknown')}",
+            )
+            await self.emit_event(
+                "phase_start",
+                "planning",
+                metadata={"phase": "planning", "plan": plan.__dict__, "workflow": workflow_state},
+            )
+
+            recon_payload = {
+                **input_data,
+                "task": "light recon for project profiling",
+                "task_context": f"Run {plan.recon_mode} recon and output project profile, entry points, priority paths and recommended scanners.",
+            }
+            await self.emit_event("phase_complete", "planning completed", metadata={"phase": "planning"})
+
+            recon_result = await self._run_sub_agent("recon", recon_payload)
+            previous_results = {"recon": recon_result.to_dict()}
+
+            scan_payload = {
+                **input_data,
+                "previous_results": previous_results,
+                "task": "mandatory scanner execution",
+                "task_context": "Run scanner tools only and produce raw findings.",
+            }
+            finding_payload = {
+                **input_data,
+                "previous_results": previous_results,
+                "task": "direct source finding",
+                "task_context": "Review source code directly for logic and auth risks.",
+            }
+
+            await self.emit_event(
+                "phase_start",
+                "analysis",
+                metadata={
+                    "phase": "analysis",
+                    "execution_mode": "finding_first_sequential",
+                    "workflow": workflow_state,
+                },
+            )
+
+            if workflow_state["effective_agents"]["finding"]:
+                finding_result = await self._run_sub_agent("finding", finding_payload)
+            else:
+                finding_result = self._build_skipped_result("finding", "Finding agent disabled in workflow config.")
+                await self.emit_event("thinking", "Skipping finding: disabled in workflow config.", metadata={"agent": "finding", "skipped": True})
+
+            if workflow_state["effective_agents"]["scan"]:
+                scan_result = await self._run_sub_agent("scan", scan_payload)
+            else:
+                scan_result = self._build_skipped_result("scan", "Scan agent disabled in workflow config.", output_key="raw_findings")
+                await self.emit_event("thinking", "Skipping scan: disabled in workflow config.", metadata={"agent": "scan", "skipped": True})
+
+            if workflow_state["effective_agents"]["triage"]:
+                triage_payload = {
+                    **input_data,
+                    "previous_results": {
+                        "recon": recon_result.to_dict(),
+                        "scan": scan_result.to_dict(),
+                    },
+                    "task": "triage scanner output",
+                    "task_context": "Filter false positives and enrich scanner findings.",
+                    "handoff": scan_result.handoff.to_dict() if scan_result.handoff else None,
+                }
+                triage_result = await self._run_sub_agent("triage", triage_payload)
+            else:
+                triage_reason = (
+                    "Triage agent disabled in workflow config."
+                    if workflow_state["configured_agents"]["triage"] is False
+                    else "Triage skipped because scan is disabled."
+                )
+                triage_result = self._build_skipped_result("triage", triage_reason)
+                await self.emit_event("thinking", f"Skipping triage: {triage_reason}", metadata={"agent": "triage", "skipped": True})
+            await self.emit_event("phase_complete", "analysis completed", metadata={"phase": "analysis"})
+
+            triage_findings = triage_result.data.get("findings", []) if triage_result.success and isinstance(triage_result.data, dict) else []
+            direct_findings = finding_result.data.get("findings", []) if finding_result.success and isinstance(finding_result.data, dict) else []
+            merged_findings = self._merge_findings([triage_findings, direct_findings])
+            self._all_findings = merged_findings
+
+            verification_candidates: List[Dict[str, Any]] = []
+            verification_result: Optional[AgentResult] = None
+            if workflow_state["effective_agents"]["verification"]:
+                verification_candidates = self._select_findings_for_verification(merged_findings, plan)
+                candidate_handoff = self._merge_handoffs([triage_result.handoff, finding_result.handoff])
+                verification_payload = {
+                    **input_data,
+                    "previous_results": {"findings": verification_candidates},
+                    "task": "verify high-confidence findings",
+                    "handoff": candidate_handoff.to_dict() if candidate_handoff else None,
+                }
+                await self.emit_event(
+                    "phase_start",
+                    "verification",
+                    metadata={"phase": "verification", "candidates": len(verification_candidates)},
+                )
+                verification_result = await self._run_sub_agent("verification", verification_payload)
+                await self.emit_event("phase_complete", "verification completed", metadata={"phase": "verification"})
+            else:
+                verification_reason = (
+                    "Verification agent disabled in workflow config."
+                    if workflow_state["configured_agents"]["verification"] is False
+                    else "Verification skipped because no analysis branch is enabled."
+                )
+                await self.emit_event(
+                    "thinking",
+                    f"Skipping verification: {verification_reason}",
+                    metadata={"agent": "verification", "skipped": True},
+                )
+
+            final_findings = self._finalize_findings(merged_findings, verification_result)
+            duration_ms = int((time.time() - start_time) * 1000)
+            report_distribution = {
+                "confirmed": sum(1 for finding in final_findings if finding.get("report_status") == "confirmed"),
+                "candidate": sum(1 for finding in final_findings if finding.get("report_status") == "candidate"),
+                "false_positive": sum(1 for finding in final_findings if finding.get("report_status") == "false_positive"),
+            }
+            summary = {
+                "recon_mode": plan.recon_mode,
+                "scan_candidates": len(scan_result.data.get("raw_findings", [])) if scan_result.success and isinstance(scan_result.data, dict) else 0,
+                "triaged_findings": len(triage_findings),
+                "direct_findings": len(direct_findings),
+                "merged_findings": len(merged_findings),
+                "verified_findings": report_distribution["confirmed"],
+                "candidate_findings": report_distribution["candidate"],
+                "false_positive_findings": report_distribution["false_positive"],
+                "workflow": workflow_state,
+            }
+            phases = {
+                "recon": recon_result.to_dict(),
+            }
+            if workflow_state["effective_agents"]["scan"]:
+                phases["scan"] = scan_result.to_dict()
+            if workflow_state["effective_agents"]["triage"]:
+                phases["triage"] = triage_result.to_dict()
+            if workflow_state["effective_agents"]["finding"]:
+                phases["finding"] = finding_result.to_dict()
+            if workflow_state["effective_agents"]["verification"] and verification_result:
+                phases["verification"] = verification_result.to_dict()
+            return AgentResult(
+                success=True,
+                data={
+                    "findings": final_findings,
+                    "verification_candidates": verification_candidates,
+                    "raw_findings": scan_result.data.get("raw_findings", []) if scan_result.success and isinstance(scan_result.data, dict) else [],
+                    "summary": summary,
+                    "plan": plan.__dict__,
+                    "workflow": workflow_state,
+                    "phases": phases,
+                },
+                iterations=1,
+                tool_calls=self._tool_calls,
+                tokens_used=self._total_tokens,
+                duration_ms=duration_ms,
+                handoff=verification_result.handoff if verification_result else None,
+            )
+        except Exception as exc:
+            logger.error("Orchestrator failed: %s", exc, exc_info=True)
+            return AgentResult(success=False, error=str(exc))

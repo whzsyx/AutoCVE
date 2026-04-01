@@ -1,0 +1,37 @@
+{
+  "skills": [
+    {
+      "id": "finding:code-security",
+      "skill_id": "code-security",
+      "slug": "code-security",
+      "agent_type": "finding",
+      "enabled": false,
+      "always_include": true,
+      "sort_order": 1,
+      "match_keywords": [
+        "security",
+        "injection",
+        "auth",
+        "idor",
+        "ssrf",
+        "deserialization"
+      ],
+      "match_config": {},
+      "bindings_file": "/app/skill_library/agents/finding/bindings.json",
+      "skill_file": "/app/skill_library/code-security/SKILL.md"
+    },
+    {
+      "id": "scan:code-security",
+      "skill_id": "code-security",
+      "slug": "code-security",
+      "agent_type": "scan",
+      "enabled": true,
+      "always_include": false,
+      "sort_order": 0,
+      "match_keywords": [],
+      "match_config": {},
+      "bindings_file": "/app/skill_library/agents/scan/bindings.json",
+      "skill_file": "/app/skill_library/code-security/SKILL.md"
+    }
+  ]
+}

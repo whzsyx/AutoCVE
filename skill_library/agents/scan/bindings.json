@@ -1,0 +1,13 @@
+{
+  "agent_type": "scan",
+  "skills": [
+    {
+      "slug": "code-security",
+      "enabled": true,
+      "always_include": false,
+      "sort_order": 0,
+      "match_keywords": [],
+      "match_config": {}
+    }
+  ]
+}
