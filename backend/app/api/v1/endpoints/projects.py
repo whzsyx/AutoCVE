@@ -6,12 +6,14 @@ from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from datetime import datetime, timezone
+from pathlib import Path
 import shutil
 import os
 import uuid
 import json
 
 from app.api import deps
+from app.core.config import settings
 from app.db.session import get_db, AsyncSessionLocal
 from app.models.project import Project
 from app.models.user import User
@@ -19,7 +21,18 @@ from app.models.audit import AuditTask, AuditIssue
 from app.models.agent_task import AgentTask, AgentTaskStatus, AgentFinding
 from app.models.user_config import UserConfig
 import zipfile
-from app.services.scanner import scan_repo_task, get_github_files, get_gitlab_files, get_github_branches, get_gitlab_branches, get_gitea_branches, should_exclude, is_text_file
+from app.services.scanner import (
+    scan_repo_task,
+    get_github_files,
+    get_gitlab_files,
+    get_gitea_files,
+    get_github_branches,
+    get_gitlab_branches,
+    get_gitea_branches,
+    fetch_file_content,
+    should_exclude,
+    is_text_file,
+)
 from app.services.zip_storage import (
     save_project_zip, load_project_zip, get_project_zip_meta,
     delete_project_zip, has_project_zip
@@ -33,6 +46,8 @@ class ProjectCreate(BaseModel):
     source_type: Optional[str] = "repository"  # 'repository' 或 'zip'
     repository_url: Optional[str] = None
     repository_type: Optional[str] = "other"  # github, gitlab, other
+    local_path: Optional[str] = None
+    workspace_mode: Optional[str] = None
     description: Optional[str] = None
     default_branch: Optional[str] = "main"
     programming_languages: Optional[List[str]] = None
@@ -42,6 +57,8 @@ class ProjectUpdate(BaseModel):
     source_type: Optional[str] = None
     repository_url: Optional[str] = None
     repository_type: Optional[str] = None
+    local_path: Optional[str] = None
+    workspace_mode: Optional[str] = None
     description: Optional[str] = None
     default_branch: Optional[str] = None
     programming_languages: Optional[List[str]] = None
@@ -63,6 +80,8 @@ class ProjectResponse(BaseModel):
     source_type: Optional[str] = "repository"  # 'repository' 或 'zip'
     repository_url: Optional[str] = None
     repository_type: Optional[str] = None  # github, gitlab, other
+    local_path: Optional[str] = None
+    workspace_mode: Optional[str] = None
     default_branch: Optional[str] = None
     programming_languages: Optional[str] = None
     owner_id: str
@@ -83,6 +102,84 @@ class StatsResponse(BaseModel):
     resolved_issues: int
     avg_quality_score: float = 0.0
 
+
+class ManagedLocalDirectoryResponse(BaseModel):
+    name: str
+    path: str
+
+
+class ProjectFileContentResponse(BaseModel):
+    path: str
+    content: str
+    size: int
+    truncated: bool = False
+
+
+def _get_managed_projects_root() -> Path:
+    return Path(settings.MANAGED_PROJECTS_ROOT).resolve()
+
+
+def _normalize_managed_local_path(local_path: str) -> str:
+    managed_root = _get_managed_projects_root()
+    candidate = Path(local_path).resolve()
+
+    try:
+        candidate.relative_to(managed_root)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="local_path must stay within the managed projects directory",
+        ) from exc
+
+    if not candidate.exists() or not candidate.is_dir():
+        raise HTTPException(status_code=400, detail="local_path does not exist or is not a directory")
+
+    return str(candidate)
+
+
+def _ensure_project_relative_path(relative_path: str) -> str:
+    candidate = Path(relative_path)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise HTTPException(status_code=400, detail="path must stay inside the project root")
+    normalized = candidate.as_posix().lstrip("/")
+    if not normalized:
+        raise HTTPException(status_code=400, detail="path is required")
+    return normalized
+
+
+def _build_file_content_response(*, relative_path: str, content: str) -> ProjectFileContentResponse:
+    encoded = content.encode("utf-8", errors="ignore")
+    size = len(encoded)
+    max_size = settings.MAX_FILE_SIZE_BYTES
+    truncated = size > max_size
+    if truncated:
+        content = encoded[:max_size].decode("utf-8", errors="ignore")
+    return ProjectFileContentResponse(
+        path=relative_path,
+        content=content,
+        size=size,
+        truncated=truncated,
+    )
+
+
+@router.get("/managed-local-directories", response_model=List[ManagedLocalDirectoryResponse])
+async def list_managed_local_directories(
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """
+    List first-level managed project directories available for local import.
+    """
+    managed_root = _get_managed_projects_root()
+    if not managed_root.exists():
+        return []
+
+    directories = [
+        ManagedLocalDirectoryResponse(name=entry.name, path=str(entry.resolve()))
+        for entry in sorted(managed_root.iterdir(), key=lambda item: item.name.lower())
+        if entry.is_dir()
+    ]
+    return directories
+
 @router.post("/", response_model=ProjectResponse)
 async def create_project(
     *,
@@ -96,12 +193,30 @@ async def create_project(
     import json
     # 根据 source_type 设置默认值
     source_type = project_in.source_type or "repository"
+    normalized_local_path: Optional[str] = None
+
+    if source_type == "local_directory":
+        if not project_in.local_path:
+            raise HTTPException(status_code=422, detail="local_path is required for local_directory projects")
+        normalized_local_path = _normalize_managed_local_path(project_in.local_path)
+        existing_result = await db.execute(
+            select(Project).where(
+                Project.owner_id == current_user.id,
+                Project.source_type == "local_directory",
+                Project.local_path == normalized_local_path,
+                Project.is_active == True,
+            )
+        )
+        if existing_result.scalars().first():
+            raise HTTPException(status_code=400, detail="local directory is already registered")
     
     project = Project(
         name=project_in.name,
         source_type=source_type,
         repository_url=project_in.repository_url if source_type == "repository" else None,
         repository_type=project_in.repository_type or "other" if source_type == "repository" else "other",
+        local_path=normalized_local_path if source_type == "local_directory" else None,
+        workspace_mode=project_in.workspace_mode or ("in_place" if source_type == "local_directory" else None),
         description=project_in.description,
         default_branch=project_in.default_branch or "main",
         programming_languages=json.dumps(project_in.programming_languages or []),
@@ -109,8 +224,12 @@ async def create_project(
     )
     db.add(project)
     await db.commit()
-    await db.refresh(project)
-    return project
+    result = await db.execute(
+        select(Project)
+        .options(selectinload(Project.owner))
+        .where(Project.id == project.id)
+    )
+    return result.scalars().first()
 
 @router.get("/", response_model=List[ProjectResponse])
 async def read_projects(
@@ -265,8 +384,34 @@ async def update_project(
         raise HTTPException(status_code=403, detail="无权更新此项目")
     
     update_data = project_in.model_dump(exclude_unset=True)
+    target_source_type = update_data.get("source_type", project.source_type)
+
     if "programming_languages" in update_data and update_data["programming_languages"] is not None:
         update_data["programming_languages"] = json.dumps(update_data["programming_languages"])
+
+    if target_source_type == "local_directory":
+        local_path = update_data.get("local_path", project.local_path)
+        if not local_path:
+            raise HTTPException(status_code=422, detail="local_path is required for local_directory projects")
+
+        normalized_local_path = _normalize_managed_local_path(local_path)
+        existing_result = await db.execute(
+            select(Project).where(
+                Project.owner_id == current_user.id,
+                Project.source_type == "local_directory",
+                Project.local_path == normalized_local_path,
+                Project.id != project.id,
+                Project.is_active == True,
+            )
+        )
+        if existing_result.scalars().first():
+            raise HTTPException(status_code=400, detail="local directory is already registered")
+
+        update_data["local_path"] = normalized_local_path
+        update_data["workspace_mode"] = update_data.get("workspace_mode") or project.workspace_mode or "in_place"
+    elif "source_type" in update_data and update_data["source_type"] != "local_directory":
+        update_data["local_path"] = None
+        update_data["workspace_mode"] = None
     
     for field, value in update_data.items():
         setattr(project, field, value)
@@ -409,6 +554,30 @@ async def get_project_files(
             print(f"Error reading zip file: {e}")
             raise HTTPException(status_code=500, detail="无法读取项目文件")
             
+    elif project.source_type == "local_directory":
+        if not project.local_path:
+            raise HTTPException(status_code=400, detail="local directory project is missing local_path")
+
+        project_root = Path(project.local_path)
+        if not project_root.exists() or not project_root.is_dir():
+            raise HTTPException(status_code=400, detail="local project directory is unavailable")
+
+        for file_path in project_root.rglob("*"):
+            if not file_path.is_file():
+                continue
+
+            relative_path = file_path.relative_to(project_root).as_posix()
+            if should_exclude(relative_path, parsed_exclude_patterns):
+                continue
+            if not is_text_file(relative_path):
+                continue
+
+            try:
+                file_size = file_path.stat().st_size
+            except OSError:
+                continue
+            files.append({"path": relative_path, "size": file_size})
+
     elif project.source_type == "repository":
         # Handle Repository project
         if not project.repository_url:
@@ -485,6 +654,152 @@ async def get_project_files(
              raise HTTPException(status_code=500, detail=f"无法获取仓库文件: {str(e)}")
 
     return files
+
+
+@router.get("/{id}/file-content", response_model=ProjectFileContentResponse)
+async def get_project_file_content(
+    id: str,
+    path: str,
+    branch: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """
+    Read a single text file from the selected project for workspace preview.
+    """
+    project = await db.get(Project, id)
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    if project.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权查看此项目")
+
+    relative_path = _ensure_project_relative_path(path)
+
+    if project.source_type == "local_directory":
+        if not project.local_path:
+            raise HTTPException(status_code=400, detail="local directory project is missing local_path")
+
+        project_root = Path(project.local_path).resolve()
+        file_path = (project_root / relative_path).resolve()
+        try:
+            file_path.relative_to(project_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="path must stay inside the project root") from exc
+
+        if not file_path.exists() or not file_path.is_file():
+            raise HTTPException(status_code=404, detail="project file not found")
+        if not is_text_file(relative_path):
+            raise HTTPException(status_code=400, detail="only text files can be previewed")
+
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="file is not valid UTF-8 text")
+
+        return _build_file_content_response(relative_path=relative_path, content=content)
+
+    if project.source_type == "zip":
+        zip_path = await load_project_zip(id)
+        if not zip_path or not os.path.exists(zip_path):
+            raise HTTPException(status_code=404, detail="project zip not found")
+
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                try:
+                    with zip_ref.open(relative_path, "r") as file_handle:
+                        raw_content = file_handle.read()
+                except KeyError as exc:
+                    raise HTTPException(status_code=404, detail="project file not found") from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="无法读取项目文件") from exc
+
+        try:
+            content = raw_content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=400, detail="file is not valid UTF-8 text") from exc
+
+        return _build_file_content_response(relative_path=relative_path, content=content)
+
+    if project.source_type == "repository":
+        if not project.repository_url:
+            raise HTTPException(status_code=400, detail="repository_url is required for repository projects")
+
+        from app.core.encryption import decrypt_sensitive_data
+        from app.services.git_ssh_service import GitSSHOperations
+
+        sensitive_fields = ["githubToken", "gitlabToken", "giteaToken", "sshPrivateKey"]
+        result = await db.execute(select(UserConfig).where(UserConfig.user_id == current_user.id))
+        config = result.scalar_one_or_none()
+
+        github_token = settings.GITHUB_TOKEN
+        gitlab_token = settings.GITLAB_TOKEN
+        gitea_token = settings.GITEA_TOKEN
+        ssh_private_key = None
+
+        if config and config.other_config:
+            other_config = json.loads(config.other_config)
+            for field in sensitive_fields:
+                if field in other_config and other_config[field]:
+                    decrypted_val = decrypt_sensitive_data(other_config[field])
+                    if field == "githubToken":
+                        github_token = decrypted_val
+                    elif field == "gitlabToken":
+                        gitlab_token = decrypted_val
+                    elif field == "giteaToken":
+                        gitea_token = decrypted_val
+                    elif field == "sshPrivateKey":
+                        ssh_private_key = decrypted_val
+
+        target_branch = branch or project.default_branch or "main"
+
+        if GitSSHOperations.is_ssh_url(project.repository_url):
+            if not ssh_private_key:
+                raise HTTPException(status_code=400, detail="repository uses SSH but ssh private key is not configured")
+
+            files_with_content = GitSSHOperations.get_repo_files_via_ssh(
+                project.repository_url,
+                ssh_private_key,
+                target_branch,
+                [],
+            )
+            matched_file = next((item for item in files_with_content if item.get("path") == relative_path), None)
+            if not matched_file:
+                raise HTTPException(status_code=404, detail="project file not found")
+            content = matched_file.get("content", "")
+            return _build_file_content_response(relative_path=relative_path, content=content)
+
+        repo_type = project.repository_type or "other"
+        if repo_type == "github":
+            repo_files = await get_github_files(project.repository_url, target_branch, github_token, [])
+        elif repo_type == "gitlab":
+            repo_files = await get_gitlab_files(project.repository_url, target_branch, gitlab_token, [])
+        elif repo_type == "gitea":
+            repo_files = await get_gitea_files(project.repository_url, target_branch, gitea_token, [])
+        else:
+            raise HTTPException(status_code=400, detail="不支持的仓库类型")
+
+        matched_file = next((item for item in repo_files if item.get("path") == relative_path), None)
+        if not matched_file:
+            raise HTTPException(status_code=404, detail="project file not found")
+
+        headers = {}
+        if repo_type == "github" and github_token:
+            headers["Authorization"] = f"Bearer {github_token}"
+        elif repo_type == "gitlab" and matched_file.get("token"):
+            headers["PRIVATE-TOKEN"] = matched_file["token"]
+        elif repo_type == "gitea" and matched_file.get("token"):
+            headers["Authorization"] = f"token {matched_file['token']}"
+
+        content = await fetch_file_content(matched_file["url"], headers)
+        if content is None:
+            raise HTTPException(status_code=404, detail="project file not found")
+
+        return _build_file_content_response(relative_path=relative_path, content=content)
+
+    raise HTTPException(status_code=400, detail="unsupported project source type")
 
 class ScanRequest(BaseModel):
     file_paths: Optional[List[str]] = None

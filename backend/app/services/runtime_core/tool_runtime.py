@@ -259,6 +259,11 @@ class ToolOrchestrator:
                 is_concurrency_safe=prepared_call.is_concurrency_safe,
                 started=started,
                 message=runtime_permission.reason or "Tool permission denied",
+                output_payload={
+                    "permission_source": runtime_permission.source,
+                    "permission_mode": runtime_permission.mode,
+                    "permission_reason": runtime_permission.reason,
+                },
             )
 
         permission = await prepared_call.tool.check_permission(prepared_call.parsed_input, context)
@@ -276,6 +281,12 @@ class ToolOrchestrator:
                 is_concurrency_safe=prepared_call.is_concurrency_safe,
                 started=started,
                 message=permission.reason or "Tool permission denied",
+                output_payload={
+                    "permission_source": permission.source or "tool",
+                    "permission_mode": getattr(permission, "mode", "deny"),
+                    "permission_reason": permission.reason,
+                    "guardrail_code": getattr(permission, "guardrail_code", None),
+                },
             )
 
         self._emit_hook_event(event_name="PreToolUse", context=context, tool_name=request.name)
@@ -369,9 +380,10 @@ class ToolOrchestrator:
         is_concurrency_safe: bool,
         started: float,
         message: str,
+        output_payload: dict[str, Any] | None = None,
     ) -> ToolExecutionRecord:
         duration_ms = max(0, int((perf_counter() - started) * 1000))
-        result = ToolExecutionPayload(content=message, output_payload={}, metadata={}, is_error=True)
+        result = ToolExecutionPayload(content=message, output_payload=dict(output_payload or {}), metadata={}, is_error=True)
         self._session_store.complete_tool_call(
             tool_call_id,
             status=status,

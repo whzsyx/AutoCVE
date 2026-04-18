@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -10,6 +12,7 @@ from app.services.agent.tools.plan_mode_runtime_tool import EnterPlanModeRuntime
 from app.services.agent.tools.todo_runtime_tool import TodoWriteRuntimeTool
 from app.services.finding_runtime.models import ToolExecutionPayload
 from app.services.finding_runtime.skills import RuntimeSkillTool
+from app.services.runtime_core.permission_runtime import ToolPermissionDecision
 from app.services.runtime_core.tool_runtime import RuntimeTool, ToolExecutionContext, ToolRegistry
 
 
@@ -36,6 +39,12 @@ class GrepToolInput(BaseModel):
     case_sensitive: bool = Field(default=False, description="Whether the search is case sensitive.")
     max_results: int = Field(default=80, description="Maximum number of matches to return.")
     is_regex: bool = Field(default=False, description="Whether pattern should be treated as regex.")
+
+
+class WriteToolInput(BaseModel):
+    path: str = Field(description="Target path relative to the project root. Managed outputs should go under .auditai/outputs/.")
+    content: str = Field(description="Text content to write.")
+    overwrite: bool = Field(default=False, description="Whether to overwrite an existing file.")
 
 
 def _result_to_payload(result: Any) -> ToolExecutionPayload:
@@ -171,6 +180,169 @@ class CanonicalGrepTool(RuntimeTool):
         return _result_to_payload(result)
 
 
+class CanonicalWriteTool(RuntimeTool):
+    APPROVAL_METADATA_KEY = "write_approvals"
+    name = "Write"
+    description = (
+        "Write a text artifact for the current audit session. "
+        "Managed outputs are allowed under .auditai/outputs/. "
+        "Writes to source files or outside the project root require explicit user approval."
+    )
+    input_model = WriteToolInput
+
+    def __init__(self, *, session_store=None):
+        self._session_store = session_store
+
+    @staticmethod
+    def _utc_now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _normalize_relative_path(path: str) -> str:
+        return Path(str(path or "").strip()).as_posix().lstrip("./")
+
+    @classmethod
+    def register_approval(
+        cls,
+        runtime_state,
+        *,
+        path: str,
+        guardrail_code: str,
+        tool_call_id: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_path = cls._normalize_relative_path(path)
+        approvals = runtime_state.metadata.setdefault(cls.APPROVAL_METADATA_KEY, [])
+        for item in approvals:
+            if (
+                cls._normalize_relative_path(str(item.get("path") or "")) == normalized_path
+                and str(item.get("guardrail_code") or "") == str(guardrail_code or "")
+            ):
+                item["approved_at"] = cls._utc_now()
+                if tool_call_id:
+                    item["tool_call_id"] = tool_call_id
+                return dict(item)
+        record = {
+            "path": normalized_path,
+            "guardrail_code": str(guardrail_code or "").strip(),
+            "tool_call_id": str(tool_call_id or "").strip() or None,
+            "approved_at": cls._utc_now(),
+        }
+        approvals.append(record)
+        return dict(record)
+
+    def _has_matching_approval(
+        self,
+        *,
+        context: ToolExecutionContext,
+        project_root: Path,
+        resolved_path: Path,
+        guardrail_code: str,
+    ) -> bool:
+        if self._session_store is None:
+            return False
+        runtime_state = self._session_store.load_runtime_state(context.session_id)
+        approvals = runtime_state.metadata.get(self.APPROVAL_METADATA_KEY) or []
+        try:
+            relative_path = resolved_path.relative_to(project_root).as_posix()
+        except ValueError:
+            return False
+        normalized_relative_path = self._normalize_relative_path(relative_path)
+        for item in approvals:
+            if self._normalize_relative_path(str(item.get("path") or "")) != normalized_relative_path:
+                continue
+            if str(item.get("guardrail_code") or "") != str(guardrail_code or ""):
+                continue
+            return True
+        return False
+
+    @staticmethod
+    def _resolve_project_root(context: ToolExecutionContext) -> Path:
+        payload = dict(context.recon_payload or {})
+        if not payload and getattr(context.session, "recon_payload", None):
+            payload = dict(context.session.recon_payload or {})
+        project_info = payload.get("project_info") if isinstance(payload, dict) else {}
+        workspace_root = str((project_info or {}).get("workspace_root") or "").strip()
+        if not workspace_root:
+            raise ValueError("Missing workspace root for write tool")
+        return Path(workspace_root).resolve()
+
+    async def check_permission(
+        self,
+        parsed_input: WriteToolInput,
+        context: ToolExecutionContext,
+    ) -> ToolPermissionDecision:
+        project_root = self._resolve_project_root(context)
+        requested_path = str(parsed_input.path or "").strip()
+        candidate = Path(requested_path)
+        if candidate.is_absolute():
+            return ToolPermissionDecision(
+                allowed=False,
+                source="tool_guardrail",
+                mode="ask",
+                reason="Writing to an absolute path requires explicit approval.",
+                guardrail_code="absolute_path_requires_approval",
+            )
+
+        resolved_path = (project_root / candidate).resolve()
+        try:
+            resolved_path.relative_to(project_root)
+        except ValueError:
+            return ToolPermissionDecision(
+                allowed=False,
+                source="tool_guardrail",
+                mode="ask",
+                reason="Writing outside the project root requires explicit approval.",
+                guardrail_code="outside_project_root_requires_approval",
+            )
+
+        artifact_root = (project_root / ".auditai" / "outputs").resolve()
+        try:
+            resolved_path.relative_to(artifact_root)
+        except ValueError:
+            if self._has_matching_approval(
+                context=context,
+                project_root=project_root,
+                resolved_path=resolved_path,
+                guardrail_code="source_write_requires_approval",
+            ):
+                return ToolPermissionDecision(allowed=True, source="tool_guardrail", mode="allow")
+            return ToolPermissionDecision(
+                allowed=False,
+                source="tool_guardrail",
+                mode="ask",
+                reason="Writing source files requires explicit approval. Use .auditai/outputs/ for generated audit artifacts.",
+                guardrail_code="source_write_requires_approval",
+            )
+
+        if resolved_path.exists() and not parsed_input.overwrite:
+            return ToolPermissionDecision(
+                allowed=False,
+                source="tool_guardrail",
+                mode="deny",
+                reason="Target file already exists. Re-run with overwrite=true to replace an existing artifact.",
+                guardrail_code="artifact_exists_requires_overwrite",
+            )
+
+        return ToolPermissionDecision(allowed=True, source="tool_guardrail", mode="allow")
+
+    async def execute(self, parsed_input: WriteToolInput, context: ToolExecutionContext) -> ToolExecutionPayload:
+        project_root = self._resolve_project_root(context)
+        resolved_path = (project_root / parsed_input.path).resolve()
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_path.write_text(parsed_input.content, encoding="utf-8")
+        return ToolExecutionPayload(
+            content=f"Wrote audit artifact to {resolved_path}",
+            output_payload={
+                "path": parsed_input.path,
+                "resolved_path": str(resolved_path),
+                "bytes_written": len(parsed_input.content.encode("utf-8")),
+                "artifact_type": "managed_output",
+                "overwrite": parsed_input.overwrite,
+            },
+            metadata={"managed_output": True},
+        )
+
+
 def build_runtime_tool_registry(*, session_store, agent_tools: dict[str, AgentTool], agent_type: str, user_id: str | None = None) -> ToolRegistry:
     tools: list[RuntimeTool] = []
 
@@ -191,6 +363,8 @@ def build_runtime_tool_registry(*, session_store, agent_tools: dict[str, AgentTo
     search_tool = agent_tools.get("search_code")
     if isinstance(search_tool, AgentTool):
         tools.append(CanonicalGrepTool(search_tool=search_tool))
+
+    tools.append(CanonicalWriteTool(session_store=session_store))
 
     tools.append(
         RuntimeSkillTool(

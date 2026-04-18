@@ -14,6 +14,7 @@ class ToolPermissionDecision:
     reason: str | None = None
     source: str | None = None
     mode: str = "allow"
+    guardrail_code: str | None = None
 
 
 def resolve_permission_rule_decision(rules: Any, *, agent_type: str, tool_name: str) -> ToolPermissionDecision | None:

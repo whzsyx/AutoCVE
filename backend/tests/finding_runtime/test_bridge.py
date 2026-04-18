@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
-from app.services.finding_runtime.bridge import FindingRuntimeBridge
+from app.services.finding_runtime.bridge import FindingRuntimeBridge, RuntimeLLMModelClient
 from app.services.finding_runtime.models import RuntimeMemoryBundle, RuntimeMessageRole, RuntimeStopReason, TranscriptItem, TurnExecutionResult
 from app.services.agent.tools.base import AgentTool, ToolResult
 
@@ -41,6 +41,15 @@ class FakeLLMService:
         if not self.responses:
             return {"content": "{}", "finish_reason": "stop"}
         return self.responses.pop(0)
+
+    async def chat_completion_stream(self, *, messages, agent_type, tools, parallel_tool_calls, max_tokens=None):
+        assert agent_type == "finding"
+        self.calls.append({"messages": messages, "tools": tools, "max_tokens": max_tokens, "stream": True})
+        if not self.responses:
+            yield {"type": "done", "content": "{}", "usage": {}, "tool_calls": []}
+            return
+        for event in self.responses.pop(0):
+            yield event
 
 
 def build_session_factory():
@@ -159,7 +168,7 @@ def test_bridge_exposes_restored_style_runtime_tools():
 
     tool_names = [item["name"] for item in bridge._build_tool_registry().describe_tools()]
 
-    assert tool_names == ["Read", "Glob", "Grep", "Skill", "TodoWrite", "AskUser", "EnterPlanMode", "ExitPlanMode"]
+    assert tool_names == ["Read", "Glob", "Grep", "Write", "Skill", "TodoWrite", "AskUser", "EnterPlanMode", "ExitPlanMode"]
     assert "read_many_files" not in tool_names
 
 
@@ -200,6 +209,96 @@ def test_bridge_extracts_json_from_mixed_final_answer():
     )
 
     assert payload == {"findings": [{"title": "auth bypass"}], "summary": "done"}
+
+
+def test_runtime_model_client_complete_stream_emits_tokens_and_returns_tool_calls():
+    llm = FakeLLMService(
+        responses=[
+            [
+                {"type": "token", "content": "审", "accumulated": "审"},
+                {"type": "token", "content": "计", "accumulated": "审计"},
+                {
+                    "type": "done",
+                    "content": "审计完成",
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "name": "Read",
+                            "arguments": "{\"file_path\":\"main.py\"}",
+                        }
+                    ],
+                    "finish_reason": "stop",
+                },
+            ]
+        ]
+    )
+    client = RuntimeLLMModelClient(llm_service=llm, agent_type="finding")
+
+    streamed_events = []
+
+    async def run():
+        return await client.complete_stream(
+            system_prompt="system",
+            recon_payload={"repo": "demo"},
+            transcript=[TranscriptItem(role=RuntimeMessageRole.USER, content="inspect")],
+            model_name="finding",
+            tool_definitions=[
+                {
+                    "name": "Read",
+                    "description": "Read a file",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ],
+            on_event=streamed_events.append,
+        )
+
+    response = asyncio.run(run())
+
+    assert [event["type"] for event in streamed_events] == ["token", "token", "done"]
+    assert response.content == "审计完成"
+    assert response.tool_calls == [{"id": "call-1", "name": "Read", "input": {"file_path": "main.py"}}]
+
+
+def test_bridge_run_chat_session_stream_emits_runtime_events():
+    llm = FakeLLMService(
+        responses=[
+            [
+                {"type": "token", "content": "实", "accumulated": "实"},
+                {"type": "token", "content": "时", "accumulated": "实时"},
+                {
+                    "type": "done",
+                    "content": "实时审计",
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 4, "total_tokens": 8},
+                    "tool_calls": [],
+                    "finish_reason": "stop",
+                },
+            ]
+        ]
+    )
+    bridge = FindingRuntimeBridge(
+        llm_service=llm,
+        tools={},
+        session_factory=build_session_factory(),
+    )
+
+    streamed_events = []
+
+    async def run():
+        return await bridge.run_chat_session_stream(
+            project_id="project-1",
+            task_id=None,
+            system_prompt="system",
+            recon_payload={"repo": "demo"},
+            user_message="inspect",
+            event_sink=streamed_events.append,
+        )
+
+    result = asyncio.run(run())
+
+    assert result["session_id"]
+    assert [event["type"] for event in streamed_events] == ["assistant_start", "token", "token", "done"]
+    assert streamed_events[-1]["message"]["content"] == "实时审计"
 
 
 def test_bridge_continue_session_refreshes_skill_catalog(monkeypatch):

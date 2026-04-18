@@ -13,6 +13,8 @@ class Project(Base):
     
     # 项目来源类型: 'repository' (远程仓库) 或 'zip' (ZIP上传)
     source_type = Column(String(20), default="repository", nullable=False)
+    local_path = Column(String, nullable=True)
+    workspace_mode = Column(String(32), nullable=True)
     
     # 仓库相关字段 (仅 source_type='repository' 时使用)
     repository_url = Column(String, nullable=True)

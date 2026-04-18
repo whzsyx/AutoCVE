@@ -110,6 +110,10 @@ class AuditSessionStore:
             db.refresh(message)
             return message.id
 
+    def get_message(self, message_id: str) -> AuditSessionMessage | None:
+        with self._session_factory() as db:
+            return db.get(AuditSessionMessage, message_id)
+
     def open_turn(self, session_id: str, *, model_name: str | None = None) -> str:
         with self._session_factory() as db:
             sequence = self._next_sequence(db, AuditSessionTurn, AuditSessionTurn.session_id, session_id)

@@ -1,5 +1,5 @@
 ﻿import { useMemo, useState } from "react";
-import { Check, ChevronDown, ChevronUp, Copy, DatabaseZap, Hammer, ShieldCheck } from "lucide-react";
+import { Check, ChevronDown, ChevronUp, Copy, DatabaseZap, Hammer, Loader2, ShieldCheck } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -7,6 +7,8 @@ import type { AuditSessionToolCall } from "@/pages/AuditSession/types";
 
 interface ToolTracePanelProps {
   toolCalls: AuditSessionToolCall[];
+  onApproveToolCall?: (toolCall: AuditSessionToolCall) => void | Promise<void>;
+  approvalLoadingToolCallId?: string | null;
 }
 
 function formatPayload(payload: Record<string, unknown>) {
@@ -20,9 +22,36 @@ function statusTone(status: string) {
   return "bg-amber-50 text-amber-700 border-amber-200";
 }
 
-function ToolTraceCard({ toolCall }: { toolCall: AuditSessionToolCall }) {
+function getApprovalState(toolCall: AuditSessionToolCall) {
+  const permissionMode = typeof toolCall.output_payload?.permission_mode === "string" ? toolCall.output_payload.permission_mode : null;
+  const guardrailCode = typeof toolCall.output_payload?.guardrail_code === "string" ? toolCall.output_payload.guardrail_code : null;
+  const permissionReason = typeof toolCall.output_payload?.permission_reason === "string" ? toolCall.output_payload.permission_reason : null;
+  if (toolCall.status !== "denied" || permissionMode !== "ask") {
+    return null;
+  }
+  return {
+    guardrailCode,
+    permissionReason,
+  };
+}
+
+function ToolTraceCard({
+  toolCall,
+  onApproveToolCall,
+  approvalLoadingToolCallId,
+}: {
+  toolCall: AuditSessionToolCall;
+  onApproveToolCall?: (toolCall: AuditSessionToolCall) => void | Promise<void>;
+  approvalLoadingToolCallId?: string | null;
+}) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
+  const approvalState = getApprovalState(toolCall);
+  const canApprove =
+    Boolean(approvalState && onApproveToolCall) &&
+    toolCall.tool_name === "Write" &&
+    approvalState.guardrailCode === "source_write_requires_approval";
+  const approvalLoading = approvalLoadingToolCallId === toolCall.id;
 
   const detailJson = useMemo(
     () => ({
@@ -73,6 +102,36 @@ function ToolTraceCard({ toolCall }: { toolCall: AuditSessionToolCall }) {
         </Button>
       </div>
 
+      {approvalState ? (
+        <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50/90 p-3 text-amber-900">
+          <div className="mb-1 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide">
+            <ShieldCheck className="h-3.5 w-3.5" />
+            Needs Approval
+          </div>
+          <p className="text-xs leading-6">
+            {approvalState.permissionReason || "This tool call was blocked by a Phase 3 guardrail and needs explicit approval."}
+          </p>
+          {approvalState.guardrailCode ? (
+            <p className="mt-1 text-[11px] text-amber-800/80">Guardrail: {approvalState.guardrailCode}</p>
+          ) : null}
+          {canApprove ? (
+            <div className="mt-3">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={approvalLoading}
+                className="h-8 rounded-full border-amber-300 bg-white px-3 text-xs text-amber-900 hover:bg-amber-100"
+                onClick={() => void onApproveToolCall?.(toolCall)}
+              >
+                {approvalLoading ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="mr-1.5 h-3.5 w-3.5" />}
+                {approvalLoading ? "批准中..." : "批准写入此文件"}
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
       {expanded ? (
         <div className="mt-4 space-y-3 text-xs">
           <div>
@@ -98,7 +157,7 @@ function ToolTraceCard({ toolCall }: { toolCall: AuditSessionToolCall }) {
   );
 }
 
-export function ToolTracePanel({ toolCalls }: ToolTracePanelProps) {
+export function ToolTracePanel({ toolCalls, onApproveToolCall, approvalLoadingToolCallId }: ToolTracePanelProps) {
   return (
     <Card className="overflow-hidden rounded-[26px] border border-[rgba(191,208,198,.72)] bg-[linear-gradient(180deg,rgba(255,255,255,.98),rgba(247,250,248,.96))] shadow-[0_18px_48px_rgba(84,110,93,.08)]">
       <CardHeader className="border-b border-[rgba(186,203,193,.4)] pb-4">
@@ -113,7 +172,14 @@ export function ToolTracePanel({ toolCalls }: ToolTracePanelProps) {
         {toolCalls.length === 0 ? (
           <p className="text-sm leading-6 text-muted-foreground">这次会话还没有记录任何工具调用。</p>
         ) : (
-          toolCalls.map((toolCall) => <ToolTraceCard key={toolCall.id} toolCall={toolCall} />)
+          toolCalls.map((toolCall) => (
+            <ToolTraceCard
+              key={toolCall.id}
+              toolCall={toolCall}
+              onApproveToolCall={onApproveToolCall}
+              approvalLoadingToolCallId={approvalLoadingToolCallId}
+            />
+          ))
         )}
       </CardContent>
     </Card>

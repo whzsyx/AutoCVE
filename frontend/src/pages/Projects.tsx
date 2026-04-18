@@ -34,13 +34,14 @@ import {
   Github,
   Folder,
   ArrowUpRight,
-  Key
+  Key,
+  HardDrive
 } from "lucide-react";
 import { api } from "@/shared/config/database";
 import { validateZipFile } from "@/features/projects/services";
-import type { Project, CreateProjectForm } from "@/shared/types";
+import type { Project, CreateProjectForm, ManagedLocalDirectory } from "@/shared/types";
 import { uploadZipFile, getZipFileInfo, type ZipFileMeta } from "@/shared/utils/zipStorage";
-import { isRepositoryProject, isZipProject, getSourceTypeBadge } from "@/shared/utils/projectUtils";
+import { isLocalDirectoryProject, isRepositoryProject, isZipProject, getSourceTypeBadge } from "@/shared/utils/projectUtils";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
 import CreateTaskDialog from "@/components/audit/CreateTaskDialog";
@@ -63,6 +64,8 @@ export default function Projects() {
   const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
   const [showEditDialog, setShowEditDialog] = useState(false);
   const [projectToEdit, setProjectToEdit] = useState<Project | null>(null);
+  const [managedDirectories, setManagedDirectories] = useState<ManagedLocalDirectory[]>([]);
+  const [loadingManagedDirectories, setLoadingManagedDirectories] = useState(false);
   const [editForm, setEditForm] = useState<CreateProjectForm>({
     name: "",
     description: "",
@@ -115,6 +118,12 @@ export default function Projects() {
     loadProjects();
   }, []);
 
+  useEffect(() => {
+    if (showCreateDialog) {
+      void loadManagedDirectories();
+    }
+  }, [showCreateDialog]);
+
   const loadProjects = async () => {
     try {
       setLoading(true);
@@ -128,6 +137,19 @@ export default function Projects() {
     }
   };
 
+  const loadManagedDirectories = async () => {
+    try {
+      setLoadingManagedDirectories(true);
+      const data = await api.getManagedLocalDirectories();
+      setManagedDirectories(data);
+    } catch (error) {
+      console.error('Failed to load managed directories:', error);
+      toast.error("加载受管本地目录失败");
+    } finally {
+      setLoadingManagedDirectories(false);
+    }
+  };
+
   const handleFastScanStarted = (taskId: string) => {
     setCurrentTaskId(taskId);
     setShowTerminal(true);
@@ -136,6 +158,11 @@ export default function Projects() {
   const handleCreateProject = async () => {
     if (!createForm.name.trim()) {
       toast.error("请输入项目名称");
+      return;
+    }
+
+    if (createForm.source_type === "local_directory" && !createForm.local_path?.trim()) {
+      toast.error("请选择一个受管本地目录");
       return;
     }
 
@@ -173,6 +200,8 @@ export default function Projects() {
       source_type: "repository",
       repository_url: "",
       repository_type: "github",
+      local_path: "",
+      workspace_mode: "",
       default_branch: "main",
       programming_languages: []
     });
@@ -299,6 +328,8 @@ export default function Projects() {
       source_type: project.source_type || "repository",
       repository_url: project.repository_url || "",
       repository_type: project.repository_type || "github",
+      local_path: project.local_path || "",
+      workspace_mode: project.workspace_mode || "",
       default_branch: project.default_branch || "main",
       programming_languages: project.programming_languages ? JSON.parse(project.programming_languages) : []
     });
@@ -447,7 +478,25 @@ export default function Projects() {
           </DialogHeader>
 
           <div className="flex-1 overflow-y-auto p-6">
-            <Tabs defaultValue="repository" className="w-full">
+            <Tabs
+              defaultValue="repository"
+              className="w-full"
+              onValueChange={(value) => {
+                if (value === "repository") {
+                  setCreateForm((previous) => ({ ...previous, source_type: "repository" }));
+                  return;
+                }
+                if (value === "upload") {
+                  setCreateForm((previous) => ({ ...previous, source_type: "zip" }));
+                  return;
+                }
+                setCreateForm((previous) => ({
+                  ...previous,
+                  source_type: "local_directory",
+                  workspace_mode: "in_place",
+                }));
+              }}
+            >
               <TabsList className="flex w-full bg-muted border border-border p-1 h-auto gap-1 rounded">
                 <TabsTrigger
                   value="repository"
@@ -462,6 +511,13 @@ export default function Projects() {
                 >
                   <Upload className="w-4 h-4 mr-2" />
                   上传源码
+                </TabsTrigger>
+                <TabsTrigger
+                  value="local"
+                  className="flex-1 data-[state=active]:bg-primary data-[state=active]:text-foreground font-mono font-bold uppercase py-2 text-muted-foreground transition-all rounded-sm"
+                >
+                  <HardDrive className="w-4 h-4 mr-2" />
+                  本地目录
                 </TabsTrigger>
               </TabsList>
 
@@ -740,6 +796,134 @@ export default function Projects() {
                   </Button>
                 </div>
               </TabsContent>
+
+              <TabsContent value="local" className="flex flex-col gap-5 mt-5">
+                <div className="space-y-1.5">
+                  <Label htmlFor="local-name" className="font-mono font-bold uppercase text-xs text-muted-foreground">项目名称 *</Label>
+                  <Input
+                    id="local-name"
+                    value={createForm.name}
+                    onChange={(e) => setCreateForm({ ...createForm, name: e.target.value })}
+                    placeholder="输入项目名称"
+                    className="cyber-input"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label htmlFor="local-description" className="font-mono font-bold uppercase text-xs text-muted-foreground">描述</Label>
+                  <Textarea
+                    id="local-description"
+                    value={createForm.description}
+                    onChange={(e) => setCreateForm({ ...createForm, description: e.target.value })}
+                    placeholder="// 本地目录项目描述..."
+                    rows={3}
+                    className="cyber-input min-h-[80px]"
+                  />
+                </div>
+
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <Label className="font-mono font-bold uppercase text-xs text-muted-foreground">受管本地目录</Label>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="cyber-btn-outline h-8 text-xs"
+                      onClick={() => void loadManagedDirectories()}
+                      disabled={loadingManagedDirectories}
+                    >
+                      {loadingManagedDirectories ? "刷新中..." : "刷新目录"}
+                    </Button>
+                  </div>
+
+                  {managedDirectories.length === 0 ? (
+                    <div className="rounded border border-dashed border-border bg-muted/50 p-4 text-sm text-muted-foreground">
+                      {loadingManagedDirectories
+                        ? "正在扫描 AuditAI/projects 目录..."
+                        : "未发现可导入目录。请先把项目解压到 AuditAI/projects/[项目名]/ 下。"}
+                    </div>
+                  ) : (
+                    <div className="space-y-2 rounded border border-border bg-muted/40 p-3">
+                      {managedDirectories.map((directory) => {
+                        const selected = createForm.local_path === directory.path;
+                        return (
+                          <button
+                            key={directory.path}
+                            type="button"
+                            onClick={() =>
+                              setCreateForm((previous) => ({
+                                ...previous,
+                                source_type: "local_directory",
+                                workspace_mode: "in_place",
+                                local_path: directory.path,
+                                name: previous.name || directory.name,
+                              }))
+                            }
+                            className={`w-full rounded border px-4 py-3 text-left transition ${selected ? "border-primary bg-primary/10 text-primary" : "border-border bg-white/80 text-foreground hover:bg-white"}`}
+                          >
+                            <div className="flex items-center gap-2">
+                              <HardDrive className="h-4 w-4" />
+                              <span className="font-mono font-bold text-sm">{directory.name}</span>
+                            </div>
+                            <p className="mt-1 truncate font-mono text-xs text-muted-foreground">{directory.path}</p>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {createForm.local_path ? (
+                    <div className="rounded border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs font-mono text-emerald-300">
+                      已选择目录: {createForm.local_path}
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="space-y-2">
+                  <Label className="font-mono font-bold uppercase text-xs text-muted-foreground">技术栈</Label>
+                  <div className="flex flex-wrap gap-2">
+                    {supportedLanguages.map((lang) => (
+                      <label key={lang} className={`flex items-center space-x-2 px-3 py-1.5 border cursor-pointer transition-all rounded ${createForm.programming_languages.includes(lang)
+                        ? 'border-primary bg-primary/10 text-primary'
+                        : 'border-border hover:border-border text-muted-foreground'
+                        }`}>
+                        <input
+                          type="checkbox"
+                          checked={createForm.programming_languages.includes(lang)}
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setCreateForm({
+                                ...createForm,
+                                programming_languages: [...createForm.programming_languages, lang]
+                              });
+                            } else {
+                              setCreateForm({
+                                ...createForm,
+                                programming_languages: createForm.programming_languages.filter(l => l !== lang)
+                              });
+                            }
+                          }}
+                          className="rounded border border-border w-3.5 h-3.5 text-primary focus:ring-0 bg-transparent"
+                        />
+                        <span className="text-xs font-mono font-bold uppercase">{lang}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="rounded border border-sky-500/30 bg-sky-500/10 p-3 text-xs font-mono text-sky-300">
+                  目录规范: 先将项目解压到 AuditAI/projects/[项目名]/，再在这里登记为正式项目，之后可直接在 Agent直审 中打开。
+                </div>
+
+                <div className="flex justify-end space-x-4 pt-4 border-t border-border">
+                  <Button variant="outline" onClick={() => setShowCreateDialog(false)} className="cyber-btn-outline">
+                    取消
+                  </Button>
+                  <Button onClick={handleCreateProject} className="cyber-btn-primary" disabled={!createForm.local_path}>
+                    创建本地项目
+                  </Button>
+                </div>
+              </TabsContent>
             </Tabs>
           </div>
         </DialogContent>
@@ -747,7 +931,7 @@ export default function Projects() {
 
       {/* Stats Section */}
       {projects.length > 0 && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 relative z-10">
+        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4 relative z-10">
           <div className="cyber-card p-4">
             <div className="flex items-center justify-between">
               <div>
@@ -795,6 +979,18 @@ export default function Projects() {
               </div>
             </div>
           </div>
+
+          <div className="cyber-card p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="stat-label">本地目录</p>
+                <p className="stat-value">{projects.filter(p => isLocalDirectoryProject(p)).length}</p>
+              </div>
+              <div className="stat-icon text-violet-400">
+                <HardDrive className="w-6 h-6" />
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
@@ -824,7 +1020,7 @@ export default function Projects() {
               <div className="p-4 border-b border-border bg-muted/50 flex justify-between items-start">
                 <div className="flex items-center space-x-3">
                   <div className="w-10 h-10 border border-border bg-muted rounded flex items-center justify-center text-muted-foreground">
-                    {getRepositoryIcon(project.repository_type)}
+                    {isLocalDirectoryProject(project) ? <HardDrive className="w-5 h-5 text-violet-500" /> : getRepositoryIcon(project.repository_type)}
                   </div>
                   <div>
                     <h3 className="font-bold text-base text-foreground group-hover:text-primary transition-colors">
@@ -836,7 +1032,7 @@ export default function Projects() {
                       <Badge className={`cyber-badge ${project.is_active ? 'cyber-badge-success' : 'cyber-badge-muted'}`}>
                         {project.is_active ? '活跃' : '暂停'}
                       </Badge>
-                      <Badge className={`cyber-badge ${isRepositoryProject(project) ? 'cyber-badge-info' : 'cyber-badge-warning'}`}>
+                      <Badge className={`cyber-badge ${isRepositoryProject(project) ? 'cyber-badge-info' : isLocalDirectoryProject(project) ? 'cyber-badge-success' : 'cyber-badge-warning'}`}>
                         {getSourceTypeBadge(project.source_type)}
                       </Badge>
                     </div>
@@ -864,6 +1060,13 @@ export default function Projects() {
                       >
                         {project.repository_url.replace('https://', '')}
                       </a>
+                    </div>
+                  )}
+
+                  {project.local_path && (
+                    <div className="flex items-center text-xs font-mono text-muted-foreground bg-muted p-2 border border-border rounded">
+                      <HardDrive className="w-3 h-3 mr-2 flex-shrink-0 text-violet-500" />
+                      <span className="truncate">{project.local_path}</span>
                     </div>
                   )}
 
@@ -896,6 +1099,12 @@ export default function Projects() {
                     <Code className="w-3 h-3 mr-2" />
                     查看详情
                     <ArrowUpRight className="w-3 h-3 ml-auto" />
+                  </Button>
+                </Link>
+                <Link to={`/agent-direct-audit?projectId=${project.id}`}>
+                  <Button size="sm" variant="outline" className="w-full cyber-btn-outline h-8 text-xs">
+                    <HardDrive className="w-3 h-3 mr-2" />
+                    直审
                   </Button>
                 </Link>
                 <Button size="sm" className="cyber-btn-primary h-8 text-xs" onClick={() => handleCreateTask(project.id)}>
@@ -971,8 +1180,8 @@ export default function Projects() {
               <Edit className="w-5 h-5 text-primary" />
               编辑项目配置
               {projectToEdit && (
-                <Badge className={`ml-2 ${editForm.source_type === 'repository' ? 'cyber-badge-info' : 'cyber-badge-warning'}`}>
-                  {editForm.source_type === 'repository' ? '远程仓库' : 'ZIP上传'}
+                <Badge className={`ml-2 ${editForm.source_type === 'repository' ? 'cyber-badge-info' : editForm.source_type === 'local_directory' ? 'cyber-badge-success' : 'cyber-badge-warning'}`}>
+                  {editForm.source_type === 'repository' ? '远程仓库' : editForm.source_type === 'local_directory' ? '本地目录' : 'ZIP上传'}
                 </Badge>
               )}
             </DialogTitle>
@@ -1004,6 +1213,24 @@ export default function Projects() {
             </div>
 
             {/* 仓库信息 - 仅远程仓库类型显示 */}
+            {editForm.source_type === 'local_directory' && (
+              <div className="space-y-4">
+                <h3 className="font-mono font-bold uppercase text-sm text-muted-foreground border-b border-border pb-2 flex items-center gap-2">
+                  <HardDrive className="w-4 h-4" />
+                  本地目录
+                </h3>
+                <div>
+                  <Label htmlFor="edit-local-path" className="font-mono font-bold uppercase text-xs text-muted-foreground">目录路径</Label>
+                  <Input
+                    id="edit-local-path"
+                    value={editForm.local_path || ""}
+                    onChange={(e) => setEditForm({ ...editForm, local_path: e.target.value, workspace_mode: "in_place" })}
+                    className="cyber-input mt-1"
+                  />
+                </div>
+              </div>
+            )}
+
             {editForm.source_type === 'repository' && (
               <div className="space-y-4">
                 <h3 className="font-mono font-bold uppercase text-sm text-muted-foreground border-b border-border pb-2 flex items-center gap-2">

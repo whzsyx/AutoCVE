@@ -68,6 +68,29 @@ class _ToolingProbeAdapter:
         )()
 
 
+class _StreamingProbeAdapter:
+    def __init__(self):
+        self.request = None
+
+    async def stream_complete(self, request):
+        self.request = request
+        yield {"type": "token", "content": "流", "accumulated": "流"}
+        yield {
+            "type": "done",
+            "content": "流式输出",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "name": "Read",
+                    "arguments": "{\"file_path\":\"app.py\"}",
+                }
+            ],
+            "finish_reason": "stop",
+        }
+
+
 @pytest.mark.asyncio
 async def test_llm_service_respects_user_configured_llm_concurrency(monkeypatch):
     adapter = _ConcurrencyProbeAdapter()
@@ -178,3 +201,43 @@ def test_llm_service_uses_runtime_env_fallbacks_for_provider_config():
     assert config.base_url == "https://pureopus.cc"
     assert config.model == "claude-opus-4-6"
     assert config.timeout == 3000
+
+
+@pytest.mark.asyncio
+async def test_llm_service_streams_from_adapter_when_available(monkeypatch):
+    adapter = _StreamingProbeAdapter()
+    service = LLMService(
+        user_config={
+            "llmConfig": {
+                "llmProvider": "openai",
+                "llmApiKey": "test-key",
+                "llmModel": "test-model",
+            }
+        }
+    )
+
+    monkeypatch.setattr("app.services.llm.service.LLMFactory.create_adapter", lambda config: adapter)
+
+    events = []
+    async for event in service.chat_completion_stream(
+        messages=[{"role": "user", "content": "stream this"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        parallel_tool_calls=True,
+    ):
+        events.append(event)
+
+    assert [event["type"] for event in events] == ["token", "done"]
+    assert events[-1]["content"] == "流式输出"
+    assert events[-1]["tool_calls"][0]["name"] == "Read"
+    assert adapter.request is not None
+    assert adapter.request.stream is True
+    assert adapter.request.parallel_tool_calls is True

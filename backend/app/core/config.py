@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     LLM_CONCURRENCY: int = 3
     LLM_GAP_MS: int = 2000
     ZIP_STORAGE_PATH: str = "./uploads/zip_files"
+    MANAGED_PROJECTS_ROOT: str = "./projects"
     OUTPUT_LANGUAGE: str = "zh-CN"
 
     EMBEDDING_PROVIDER: str = "openai"

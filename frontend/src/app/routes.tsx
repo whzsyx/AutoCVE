@@ -3,12 +3,12 @@
 import Account from '@/pages/Account';
 import AdminDashboard from '@/pages/AdminDashboard';
 import AgentAudit from '@/pages/AgentAudit';
+import AgentDirectAudit from '@/pages/AgentDirectAudit';
 import AuditRules from '@/pages/AuditRules';
 import AuditSession from '@/pages/AuditSession';
 import AuditTasks from '@/pages/AuditTasks';
 import Dashboard from '@/pages/Dashboard';
 import FlowDebugger from '@/pages/FlowDebugger';
-import InstantAnalysis from '@/pages/InstantAnalysis';
 import ProjectDetail from '@/pages/ProjectDetail';
 import Projects from '@/pages/Projects';
 import PromptManager from '@/pages/PromptManager';
@@ -32,7 +32,7 @@ const routes: RouteConfig[] = [
   { name: '仪表盘', path: '/dashboard', element: <Dashboard />, visible: true },
   { name: '项目管理', path: '/projects', element: <Projects />, visible: true },
   { name: '项目详情', path: '/projects/:id', element: <ProjectDetail />, visible: false },
-  { name: '即时分析', path: '/instant-analysis', element: <InstantAnalysis />, visible: true },
+  { name: 'Agent直审', path: '/agent-direct-audit', element: <AgentDirectAudit />, visible: true },
   { name: '审计任务', path: '/audit-tasks', element: <AuditTasks />, visible: true },
   { name: '任务详情', path: '/tasks/:id', element: <TaskDetail />, visible: false },
   { name: '审计规则', path: '/audit-rules', element: <AuditRules />, visible: true },

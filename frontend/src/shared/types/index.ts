@@ -21,7 +21,7 @@ export interface Profile {
 }
 
 // 项目来源类型
-export type ProjectSourceType = 'repository' | 'zip';
+export type ProjectSourceType = 'repository' | 'zip' | 'local_directory';
 
 // 仓库平台类型
 export type RepositoryPlatform = 'github' | 'gitlab' | 'gitea' | 'other';
@@ -34,6 +34,8 @@ export interface Project {
   source_type: ProjectSourceType;  // 项目来源: 'repository' (远程仓库) 或 'zip' (ZIP上传)
   repository_url?: string;         // 仅 source_type='repository' 时有效
   repository_type?: RepositoryPlatform;  // 仓库平台: github, gitlab, other
+  local_path?: string;
+  workspace_mode?: string;
   default_branch: string;
   programming_languages: string;
   owner_id: string;
@@ -158,8 +160,22 @@ export interface CreateProjectForm {
   source_type?: ProjectSourceType;  // 项目来源类型
   repository_url?: string;          // 仅 source_type='repository' 时需要
   repository_type?: RepositoryPlatform;  // 仓库平台
+  local_path?: string;
+  workspace_mode?: string;
   default_branch?: string;
   programming_languages: string[];
+}
+
+export interface ManagedLocalDirectory {
+  name: string;
+  path: string;
+}
+
+export interface ProjectFileContent {
+  path: string;
+  content: string;
+  size: number;
+  truncated: boolean;
 }
 
 export interface CreateAuditTaskForm {

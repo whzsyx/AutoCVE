@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import uuid
+from pathlib import Path
 
 from pydantic import BaseModel
 from sqlalchemy import create_engine
@@ -17,6 +20,7 @@ from app.services.runtime_core.tool_runtime import (
     ToolOrchestrator,
     ToolRegistry,
 )
+from app.services.runtime_core.runtime_tool_registry import CanonicalWriteTool
 
 
 class EchoInput(BaseModel):
@@ -67,6 +71,15 @@ def build_store() -> AuditSessionStore:
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
     return AuditSessionStore(session_factory=session_factory)
+
+
+def build_workspace_temp_dir() -> Path:
+    workspace_root = Path(__file__).resolve().parents[3]
+    temp_root = workspace_root / ".pytest-runtime-write"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    project_root = temp_root / f"runtime-write-{uuid.uuid4().hex[:8]}"
+    project_root.mkdir(parents=True, exist_ok=True)
+    return project_root
 
 
 def seed_skill_runtime_state(store: AuditSessionStore, session_id: str) -> None:
@@ -270,3 +283,143 @@ def test_shared_tool_runtime_keeps_skill_tool_available_under_skill_permissions(
 
     assert records[0].status == AuditToolCallStatus.COMPLETED.value
     assert records[0].result.output_payload == {"skill": "code-audit-finding"}
+
+
+def test_canonical_write_tool_writes_artifacts_under_managed_output_dir():
+    store = build_store()
+    session_id = store.create_session(project_id="project-1")
+    turn_id = store.open_turn(session_id, model_name="gpt-test")
+    project_root = build_workspace_temp_dir()
+    registry = ToolRegistry([CanonicalWriteTool()])
+    orchestrator = ToolOrchestrator(session_store=store, tool_registry=registry, agent_type="finding")
+    try:
+        records = asyncio.run(
+            orchestrator.execute_tool_calls(
+                session_id=session_id,
+                turn_id=turn_id,
+                session=type(
+                    "SessionRef",
+                    (),
+                    {
+                        "recon_payload": {
+                            "project_info": {
+                                "workspace_root": str(project_root),
+                                "name": "demo-project",
+                            }
+                        }
+                    },
+                )(),
+                recon_payload={"project_info": {"workspace_root": str(project_root), "name": "demo-project"}},
+                tool_calls=[
+                    ToolCallRequest(
+                        id="tool-1",
+                        name="Write",
+                        input={"path": ".auditai/outputs/report.md", "content": "# report", "overwrite": True},
+                    )
+                ],
+            )
+        )
+        written_file = project_root / ".auditai" / "outputs" / "report.md"
+        snapshot = store.load_session_snapshot(session_id)
+
+        assert records[0].status == AuditToolCallStatus.COMPLETED.value
+        assert written_file.read_text(encoding="utf-8") == "# report"
+        assert snapshot.tool_calls[0].output_payload["artifact_type"] == "managed_output"
+        assert snapshot.tool_calls[0].output_payload["resolved_path"] == str(written_file.resolve())
+    finally:
+        shutil.rmtree(project_root, ignore_errors=True)
+
+
+def test_canonical_write_tool_requires_approval_for_source_tree_writes():
+    store = build_store()
+    session_id = store.create_session(project_id="project-1")
+    turn_id = store.open_turn(session_id, model_name="gpt-test")
+    project_root = build_workspace_temp_dir()
+    registry = ToolRegistry([CanonicalWriteTool()])
+    orchestrator = ToolOrchestrator(session_store=store, tool_registry=registry, agent_type="finding")
+    try:
+        records = asyncio.run(
+            orchestrator.execute_tool_calls(
+                session_id=session_id,
+                turn_id=turn_id,
+                session=type(
+                    "SessionRef",
+                    (),
+                    {
+                        "recon_payload": {
+                            "project_info": {
+                                "workspace_root": str(project_root),
+                                "name": "demo-project",
+                            }
+                        }
+                    },
+                )(),
+                recon_payload={"project_info": {"workspace_root": str(project_root), "name": "demo-project"}},
+                tool_calls=[
+                    ToolCallRequest(
+                        id="tool-1",
+                        name="Write",
+                        input={"path": "src/app.py", "content": "print('mutate')", "overwrite": True},
+                    )
+                ],
+            )
+        )
+        snapshot = store.load_session_snapshot(session_id)
+
+        assert records[0].status == AuditToolCallStatus.DENIED.value
+        assert "approval" in (records[0].error_message or "").lower()
+        assert snapshot.tool_calls[0].output_payload["permission_mode"] == "ask"
+        assert snapshot.tool_calls[0].output_payload["guardrail_code"] == "source_write_requires_approval"
+    finally:
+        shutil.rmtree(project_root, ignore_errors=True)
+
+
+def test_canonical_write_tool_allows_session_approved_source_tree_write():
+    store = build_store()
+    session_id = store.create_session(project_id="project-1")
+    turn_id = store.open_turn(session_id, model_name="gpt-test")
+    runtime_state = store.load_runtime_state(session_id)
+    runtime_state.metadata["write_approvals"] = [
+        {
+            "path": "src/app.py",
+            "guardrail_code": "source_write_requires_approval",
+        }
+    ]
+    store.replace_runtime_state(session_id, runtime_state)
+    project_root = build_workspace_temp_dir()
+    registry = ToolRegistry([CanonicalWriteTool(session_store=store)])
+    orchestrator = ToolOrchestrator(session_store=store, tool_registry=registry, agent_type="finding")
+    try:
+        records = asyncio.run(
+            orchestrator.execute_tool_calls(
+                session_id=session_id,
+                turn_id=turn_id,
+                session=type(
+                    "SessionRef",
+                    (),
+                    {
+                        "recon_payload": {
+                            "project_info": {
+                                "workspace_root": str(project_root),
+                                "name": "demo-project",
+                            }
+                        }
+                    },
+                )(),
+                recon_payload={"project_info": {"workspace_root": str(project_root), "name": "demo-project"}},
+                tool_calls=[
+                    ToolCallRequest(
+                        id="tool-1",
+                        name="Write",
+                        input={"path": "src/app.py", "content": "print('approved')", "overwrite": True},
+                    )
+                ],
+            )
+        )
+        written_file = project_root / "src" / "app.py"
+
+        assert records[0].status == AuditToolCallStatus.COMPLETED.value
+        assert written_file.read_text(encoding="utf-8") == "print('approved')"
+        assert records[0].result.output_payload["resolved_path"] == str(written_file.resolve())
+    finally:
+        shutil.rmtree(project_root, ignore_errors=True)

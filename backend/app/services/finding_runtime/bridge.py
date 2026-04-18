@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import re
 from typing import Any, Callable
 
@@ -73,6 +74,61 @@ class RuntimeLLMModelClient:
             stop_reason=response.get("finish_reason") or "stop",
             recoverable_error_kind=self._classify_recoverable_error_kind(response),
             recoverable_error_message=str(response.get("error_message") or "").strip() or None,
+            usage=dict(response.get("usage") or {}),
+        )
+
+    async def complete_stream(
+        self,
+        *,
+        system_prompt: str | None,
+        recon_payload: dict[str, Any],
+        transcript: list[Any],
+        model_name: str,
+        tool_definitions: list[dict[str, Any]],
+        on_event: Callable[[dict[str, Any]], Any] | None = None,
+        max_output_tokens_override: int | None = None,
+    ) -> RuntimeModelResponse:
+        del model_name
+        messages: list[dict[str, str]] = []
+        effective_system_prompt = (system_prompt or "").strip()
+        if recon_payload:
+            recon_text = "Runtime recon payload:\n" + json.dumps(recon_payload, ensure_ascii=False, indent=2)
+            effective_system_prompt = f"{effective_system_prompt}\n\n{recon_text}".strip() if effective_system_prompt else recon_text
+        if effective_system_prompt:
+            messages.append({"role": "system", "content": effective_system_prompt})
+        messages.extend(mapped for item in transcript if (mapped := self._map_transcript_item(item)) is not None)
+
+        final_event: dict[str, Any] | None = None
+        async for event in self._llm_service.chat_completion_stream(
+            messages=messages,
+            agent_type=self._agent_type,
+            tools=[self._to_llm_tool_schema(item) for item in tool_definitions],
+            parallel_tool_calls=True,
+            max_tokens=max_output_tokens_override,
+        ):
+            if on_event is not None:
+                maybe_awaitable = on_event(event)
+                if inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
+            if event.get("type") == "done":
+                final_event = event
+            if event.get("type") == "error":
+                return RuntimeModelResponse(
+                    content=str(event.get("accumulated") or ""),
+                    tool_calls=[],
+                    stop_reason="error",
+                    recoverable_error_kind=str(event.get("error_type") or "").strip() or None,
+                    recoverable_error_message=str(event.get("error") or event.get("user_message") or "").strip() or None,
+                )
+
+        final_event = final_event or {}
+        return RuntimeModelResponse(
+            content=str(final_event.get("content") or ""),
+            tool_calls=[self._normalize_tool_call(item) for item in final_event.get("tool_calls") or []],
+            stop_reason=str(final_event.get("finish_reason") or "stop"),
+            recoverable_error_kind=self._classify_recoverable_error_kind(final_event),
+            recoverable_error_message=str(final_event.get("error") or final_event.get("user_message") or "").strip() or None,
+            usage=dict(final_event.get("usage") or {}),
         )
 
     @staticmethod
@@ -197,6 +253,84 @@ class FindingRuntimeBridge:
             "tool_call_count": len(snapshot.tool_calls),
         }
 
+    async def run_chat_session(
+        self,
+        *,
+        project_id: str,
+        task_id: str | None,
+        system_prompt: str,
+        recon_payload: dict[str, Any],
+        user_message: str,
+        model_name: str = "finding-runtime",
+        max_turns: int = 8,
+    ) -> dict[str, Any]:
+        model_client = RuntimeLLMModelClient(llm_service=self._llm_service, agent_type="finding")
+        tool_registry = self._build_tool_registry()
+        tool_orchestrator = ToolOrchestrator(session_store=self._session_store, tool_registry=tool_registry)
+        runner = FindingRuntimeRunner(
+            session_store=self._session_store,
+            model_client=model_client,
+            tool_registry=tool_registry,
+            tool_orchestrator=tool_orchestrator,
+            max_turns=max_turns,
+        )
+        adapter = FindingRuntimeAdapter(
+            session_store=self._session_store,
+            runner=runner,
+            skill_catalog=RuntimeSkillCatalog(),
+            memory_manager=RuntimeMemoryManager(session_factory=self._session_store._session_factory),
+        )
+        return await adapter.run(
+            project_id=project_id,
+            task_id=task_id,
+            system_prompt=system_prompt,
+            recon_payload=recon_payload,
+            user_message=user_message,
+            model_name=model_name,
+        )
+
+    async def run_chat_session_stream(
+        self,
+        *,
+        project_id: str,
+        task_id: str | None,
+        system_prompt: str,
+        recon_payload: dict[str, Any],
+        user_message: str,
+        model_name: str = "finding-runtime",
+        max_turns: int = 8,
+        event_sink: Callable[[dict[str, Any]], Any] | None = None,
+        on_session_created: Callable[[str], Any] | None = None,
+        on_user_message_created: Callable[[str], Any] | None = None,
+    ) -> dict[str, Any]:
+        model_client = RuntimeLLMModelClient(llm_service=self._llm_service, agent_type="finding")
+        tool_registry = self._build_tool_registry()
+        tool_orchestrator = ToolOrchestrator(session_store=self._session_store, tool_registry=tool_registry)
+        runner = FindingRuntimeRunner(
+            session_store=self._session_store,
+            model_client=model_client,
+            tool_registry=tool_registry,
+            tool_orchestrator=tool_orchestrator,
+            max_turns=max_turns,
+            event_sink=event_sink,
+        )
+        adapter = FindingRuntimeAdapter(
+            session_store=self._session_store,
+            runner=runner,
+            skill_catalog=RuntimeSkillCatalog(),
+            memory_manager=RuntimeMemoryManager(session_factory=self._session_store._session_factory),
+        )
+        return await adapter.run(
+            project_id=project_id,
+            task_id=task_id,
+            system_prompt=system_prompt,
+            recon_payload=recon_payload,
+            user_message=user_message,
+            model_name=model_name,
+            on_session_created=on_session_created,
+            on_user_message_created=on_user_message_created,
+        )
+
     async def continue_session(
         self,
         *,
@@ -212,6 +346,74 @@ class FindingRuntimeBridge:
             finalizer_prompts=self._default_finalizer_prompts(),
             fallback_payload_builder=self._default_fallback_payload,
         )
+
+    async def continue_chat_session(
+        self,
+        *,
+        session_id: str,
+        model_name: str = "finding-runtime",
+        max_turns: int = 8,
+    ) -> dict[str, Any]:
+        model_client = RuntimeLLMModelClient(llm_service=self._llm_service, agent_type="finding")
+        tool_registry = self._build_tool_registry()
+        tool_orchestrator = ToolOrchestrator(session_store=self._session_store, tool_registry=tool_registry)
+        runner = FindingRuntimeRunner(
+            session_store=self._session_store,
+            model_client=model_client,
+            tool_registry=tool_registry,
+            tool_orchestrator=tool_orchestrator,
+            max_turns=max_turns,
+        )
+        adapter = FindingRuntimeAdapter(
+            session_store=self._session_store,
+            runner=runner,
+            skill_catalog=RuntimeSkillCatalog(),
+            memory_manager=RuntimeMemoryManager(session_factory=self._session_store._session_factory),
+        )
+        await adapter.refresh_session_context(session_id=session_id)
+        runner_result = await runner.run_once(session_id=session_id, model_name=model_name)
+        snapshot = self._session_store.load_session_snapshot(session_id)
+        return {
+            "session_id": session_id,
+            "runner_result": runner_result,
+            "turn_count": len(snapshot.turns),
+            "tool_call_count": len(snapshot.tool_calls),
+        }
+
+    async def continue_chat_session_stream(
+        self,
+        *,
+        session_id: str,
+        model_name: str = "finding-runtime",
+        max_turns: int = 8,
+        event_sink: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> dict[str, Any]:
+        model_client = RuntimeLLMModelClient(llm_service=self._llm_service, agent_type="finding")
+        tool_registry = self._build_tool_registry()
+        tool_orchestrator = ToolOrchestrator(session_store=self._session_store, tool_registry=tool_registry)
+        runner = FindingRuntimeRunner(
+            session_store=self._session_store,
+            model_client=model_client,
+            tool_registry=tool_registry,
+            tool_orchestrator=tool_orchestrator,
+            max_turns=max_turns,
+            event_sink=event_sink,
+        )
+        adapter = FindingRuntimeAdapter(
+            session_store=self._session_store,
+            runner=runner,
+            skill_catalog=RuntimeSkillCatalog(),
+            memory_manager=RuntimeMemoryManager(session_factory=self._session_store._session_factory),
+        )
+        await adapter.refresh_session_context(session_id=session_id)
+        runner_result = await runner.run_once(session_id=session_id, model_name=model_name)
+        snapshot = self._session_store.load_session_snapshot(session_id)
+        return {
+            "session_id": session_id,
+            "runner_result": runner_result,
+            "turn_count": len(snapshot.turns),
+            "tool_call_count": len(snapshot.tool_calls),
+        }
 
     async def continue_session_until_payload(
         self,

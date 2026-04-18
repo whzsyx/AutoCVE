@@ -16,10 +16,19 @@ export function useAuditSessionChatStream({
   sessionId,
   setMessages,
   refresh,
+  streamMessage = streamAuditSessionMessage,
 }: {
   sessionId?: string;
   setMessages: React.Dispatch<React.SetStateAction<AuditSessionMessage[]>>;
   refresh: (options?: { silent?: boolean }) => Promise<void>;
+  streamMessage?: (
+    sessionId: string,
+    content: string,
+    handlers?: {
+      onEvent?: (event: AuditSessionStreamEvent) => void;
+      signal?: AbortSignal;
+    },
+  ) => Promise<void>;
 }) {
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
@@ -84,11 +93,9 @@ export function useAuditSessionChatStream({
     void refresh({ silent: true });
   }, [refresh]);
 
-  const sendMessage = useCallback(async (content: string) => {
-    if (!sessionId) {
-      throw new Error("Missing session id");
-    }
-
+  const runStreamRequest = useCallback(async (
+    runner: (handlers: { onEvent?: (event: AuditSessionStreamEvent) => void; signal?: AbortSignal }) => Promise<void>,
+  ) => {
     abortRef.current?.abort();
     abortRef.current = new AbortController();
     streamingAssistantIdRef.current = null;
@@ -96,7 +103,7 @@ export function useAuditSessionChatStream({
     setStreamError(null);
 
     try {
-      await streamAuditSessionMessage(sessionId, content, {
+      await runner({
         signal: abortRef.current.signal,
         onEvent: handleEvent,
       });
@@ -111,11 +118,19 @@ export function useAuditSessionChatStream({
       setIsStreaming(false);
       abortRef.current = null;
     }
-  }, [handleEvent, refresh, sessionId]);
+  }, [handleEvent, refresh]);
+
+  const sendMessage = useCallback(async (content: string) => {
+    if (!sessionId) {
+      throw new Error("Missing session id");
+    }
+    await runStreamRequest((handlers) => streamMessage(sessionId, content, handlers));
+  }, [runStreamRequest, sessionId, streamMessage]);
 
   return {
     isStreaming,
     streamError,
+    runStreamRequest,
     sendMessage,
     stopStreaming,
     streamingAssistantId: streamingAssistantIdRef.current,

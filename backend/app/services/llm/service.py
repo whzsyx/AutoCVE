@@ -453,6 +453,25 @@ class LLMService:
         tools: Optional[List[Dict[str, Any]]] = None,
         parallel_tool_calls: Optional[bool] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
+        config = self.get_agent_config(agent_type)
+        adapter = LLMFactory.create_adapter(config)
+
+        if hasattr(adapter, "stream_complete"):
+            semaphore = self._get_provider_semaphore(config)
+            async with semaphore:
+                await self._await_provider_gap(config)
+                request = LLMRequest(
+                    messages=[LLMMessage(role=item["role"], content=item["content"]) for item in messages],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    parallel_tool_calls=parallel_tool_calls,
+                    stream=True,
+                )
+                async for event in adapter.stream_complete(request):
+                    yield event
+            return
+
         result = await self.chat_completion(
             messages=messages,
             temperature=temperature,
@@ -472,6 +491,8 @@ class LLMService:
             "type": "done",
             "content": content,
             "usage": result.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "tool_calls": result.get("tool_calls") or [],
+            "finish_reason": result.get("finish_reason"),
         }
 
     def _clean_text(self, text: str) -> str:

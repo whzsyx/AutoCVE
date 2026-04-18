@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
+from datetime import datetime, timezone
 
 from app.models.audit_session import AuditCheckpointType
 from app.services.agent.json_parser import AgentJsonParser
@@ -53,11 +54,12 @@ from app.services.finding_runtime.query_transitions import (
 
 
 class QueryLoop:
-    def __init__(self, *, session_store, model_client, tool_registry=None, tool_orchestrator=None):
+    def __init__(self, *, session_store, model_client, tool_registry=None, tool_orchestrator=None, event_sink=None):
         self._session_store = session_store
         self._model_client = model_client
         self._tool_registry = tool_registry
         self._tool_orchestrator = tool_orchestrator
+        self._event_sink = event_sink
 
     async def run_turn(self, *, session_id: str, model_name: str) -> TurnExecutionResult:
         snapshot = self._session_store.load_session_snapshot(session_id)
@@ -111,17 +113,67 @@ class QueryLoop:
                     },
                 },
             )
+        assistant_stream_started = False
+        assistant_stream_sequence = (snapshot.messages[-1].sequence if snapshot.messages else 0) + 1
+        assistant_stream_placeholder_id = f"streaming-{session_id}-{turn_id}"
+
+        async def handle_model_stream_event(event: dict[str, object]) -> None:
+            nonlocal assistant_stream_started
+            if not self._event_sink:
+                return
+            event_type = str(event.get("type") or "")
+            if event_type == "token":
+                if not assistant_stream_started:
+                    assistant_stream_started = True
+                    await self._emit_event({
+                        "type": "assistant_start",
+                        "message": {
+                            "id": assistant_stream_placeholder_id,
+                            "session_id": session_id,
+                            "sequence": assistant_stream_sequence,
+                            "role": "assistant",
+                            "content": "",
+                            "metadata": {"kind": "direct_audit_assistant_message", "streaming": True},
+                            "payload": {},
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    })
+                await self._emit_event({
+                    "type": "token",
+                    "content": str(event.get("content") or ""),
+                    "accumulated": str(event.get("accumulated") or ""),
+                })
+                return
+            if event_type == "error":
+                await self._emit_event({
+                    "type": "error",
+                    "message_text": str(event.get("user_message") or event.get("error") or "Streaming failed"),
+                })
+
         try:
-            model_response = self._normalize_model_response(
-                await self._model_client.complete(
-                    system_prompt=effective_system_prompt,
-                    recon_payload=snapshot.session.recon_payload or {},
-                    transcript=prepared_messages,
-                    model_name=model_name,
-                    tool_definitions=tool_definitions,
-                    max_output_tokens_override=state.max_output_tokens_override,
+            if self._event_sink is not None:
+                model_response = self._normalize_model_response(
+                    await self._model_client.complete_stream(
+                        system_prompt=effective_system_prompt,
+                        recon_payload=snapshot.session.recon_payload or {},
+                        transcript=prepared_messages,
+                        model_name=model_name,
+                        tool_definitions=tool_definitions,
+                        max_output_tokens_override=state.max_output_tokens_override,
+                        on_event=handle_model_stream_event,
+                    )
                 )
-            )
+            else:
+                model_response = self._normalize_model_response(
+                    await self._model_client.complete(
+                        system_prompt=effective_system_prompt,
+                        recon_payload=snapshot.session.recon_payload or {},
+                        transcript=prepared_messages,
+                        model_name=model_name,
+                        tool_definitions=tool_definitions,
+                        max_output_tokens_override=state.max_output_tokens_override,
+                    )
+                )
         except asyncio.CancelledError:
             return self._finalize_terminal_result(
                 session_id=session_id,
@@ -148,9 +200,47 @@ class QueryLoop:
             assistant_item = TranscriptItem(
                 role=RuntimeMessageRole.ASSISTANT,
                 content=model_response.content,
+                metadata={"streaming": assistant_stream_started} if assistant_stream_started else {},
+                payload={"usage": dict(model_response.usage or {})} if model_response.usage else {},
             )
             assistant_message_id = self._session_store.append_message(session_id, assistant_item)
             working_messages.append(assistant_item)
+            if self._event_sink is not None:
+                assistant_message = self._session_store.get_message(assistant_message_id)
+                if assistant_message is not None:
+                    if not assistant_stream_started:
+                        await self._emit_event({
+                            "type": "assistant_start",
+                            "message": {
+                                "id": assistant_stream_placeholder_id,
+                                "session_id": session_id,
+                                "sequence": assistant_message.sequence,
+                                "role": "assistant",
+                                "content": "",
+                                "metadata": {"kind": "direct_audit_assistant_message", "streaming": True},
+                                "payload": {},
+                                "created_at": assistant_message.created_at.isoformat(),
+                            },
+                        })
+                        await self._emit_event({
+                            "type": "token",
+                            "content": assistant_message.content,
+                            "accumulated": assistant_message.content,
+                        })
+                    await self._emit_event({
+                        "type": "done",
+                        "message": {
+                            "id": assistant_message.id,
+                            "session_id": assistant_message.session_id,
+                            "sequence": assistant_message.sequence,
+                            "role": assistant_message.role,
+                            "content": assistant_message.content,
+                            "metadata": dict(assistant_message.message_metadata or {}),
+                            "payload": dict(assistant_message.payload or {}),
+                            "created_at": assistant_message.created_at.isoformat(),
+                        },
+                        "usage": dict(model_response.usage or {}),
+                    })
 
         raw_tool_calls = list(model_response.tool_calls or [])
         if not raw_tool_calls and model_response.content and tool_definitions and self._tool_orchestrator is not None:
@@ -546,6 +636,7 @@ class QueryLoop:
             stop_reason=str(payload.get("stop_reason")) if payload.get("stop_reason") is not None else None,
             recoverable_error_kind=str(payload.get("recoverable_error_kind")) if payload.get("recoverable_error_kind") else None,
             recoverable_error_message=str(payload.get("recoverable_error_message")) if payload.get("recoverable_error_message") else None,
+            usage=dict(payload.get("usage") or {}),
         )
 
     def _finalize_terminal_result(
@@ -594,6 +685,13 @@ class QueryLoop:
     ) -> None:
         for item in items:
             self._session_store.append_message(session_id, item)
+
+    async def _emit_event(self, event: dict[str, object]) -> None:
+        if self._event_sink is None:
+            return
+        maybe_awaitable = self._event_sink(event)
+        if inspect.isawaitable(maybe_awaitable):
+            await maybe_awaitable
 
     def _persist_runtime_hook_events(
         self,

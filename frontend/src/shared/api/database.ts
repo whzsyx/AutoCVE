@@ -8,7 +8,9 @@ import type {
   InstantAnalysis,
   CreateProjectForm,
   CreateAuditTaskForm,
-  InstantAnalysisForm
+  InstantAnalysisForm,
+  ManagedLocalDirectory,
+  ProjectFileContent,
 } from "../types/index";
 
 // Implement the same interface as the original localDatabase.ts but using backend API
@@ -55,6 +57,11 @@ export const api = {
     return res.data;
   },
 
+  async getManagedLocalDirectories(): Promise<ManagedLocalDirectory[]> {
+    const res = await apiClient.get('/projects/managed-local-directories');
+    return res.data;
+  },
+
   async getProjectById(id: string): Promise<Project | null> {
     try {
       const res = await apiClient.get(`/projects/${id}`);
@@ -76,6 +83,13 @@ export const api = {
     } catch (e) {
       return [];
     }
+  },
+
+  async getProjectFileContent(id: string, path: string, branch?: string): Promise<ProjectFileContent> {
+    const params: Record<string, string> = { path };
+    if (branch) params.branch = branch;
+    const res = await apiClient.get(`/projects/${id}/file-content`, { params });
+    return res.data;
   },
 
   async getProjectBranches(id: string): Promise<{ branches: string[]; default_branch: string; error?: string }> {
@@ -103,6 +117,8 @@ export const api = {
       source_type: project.source_type || 'repository',
       repository_url: project.repository_url,
       repository_type: project.repository_type,
+      local_path: project.local_path,
+      workspace_mode: project.workspace_mode,
       default_branch: project.default_branch,
       programming_languages: project.programming_languages,
     });

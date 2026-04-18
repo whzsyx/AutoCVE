@@ -10,7 +10,7 @@ COMPLETED_SESSION_STOP_REASONS = {
 
 
 class FindingRuntimeRunner:
-    def __init__(self, *, session_store, model_client, tool_registry=None, tool_orchestrator=None, max_turns: int = 8):
+    def __init__(self, *, session_store, model_client, tool_registry=None, tool_orchestrator=None, max_turns: int = 8, event_sink=None):
         self._session_store = session_store
         self._max_turns = max_turns
         self._query_loop = QueryLoop(
@@ -18,6 +18,7 @@ class FindingRuntimeRunner:
             model_client=model_client,
             tool_registry=tool_registry,
             tool_orchestrator=tool_orchestrator,
+            event_sink=event_sink,
         )
 
     async def run_once(self, *, session_id: str, model_name: str) -> TurnExecutionResult:

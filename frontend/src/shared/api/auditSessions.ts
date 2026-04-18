@@ -91,7 +91,9 @@ export interface AuditSessionDetail {
 }
 
 export interface AuditSessionStreamEvent {
-  type: "user_message" | "assistant_start" | "token" | "done" | "error";
+  type: "session_created" | "user_message" | "assistant_start" | "token" | "done" | "error";
+  session_id?: string;
+  project_id?: string;
   message?: AuditSessionMessage;
   content?: string;
   accumulated?: string;

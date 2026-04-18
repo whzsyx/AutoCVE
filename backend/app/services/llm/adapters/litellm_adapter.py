@@ -228,6 +228,10 @@ class LiteLLMAdapter(BaseLLMAdapter):
             kwargs["tools"] = request.tools
         if request.parallel_tool_calls is not None:
             kwargs["parallel_tool_calls"] = request.parallel_tool_calls
+        if request.tools:
+            kwargs["tools"] = request.tools
+        if request.parallel_tool_calls is not None:
+            kwargs["parallel_tool_calls"] = request.parallel_tool_calls
 
         # 设置 API Key
         if self.config.api_key and self.config.api_key != "ollama":

@@ -86,6 +86,7 @@ class RuntimeModelResponse:
     stop_reason: str | None = None
     recoverable_error_kind: str | None = None
     recoverable_error_message: str | None = None
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

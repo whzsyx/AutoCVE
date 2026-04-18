@@ -33,7 +33,14 @@ export function useAuditSession(sessionId?: string) {
 
   const refresh = useCallback(async (options?: { silent?: boolean }) => {
     if (!sessionId) {
-      setError("Missing session id");
+      setSession(null);
+      setMessages([]);
+      setToolCalls([]);
+      setSkills([]);
+      setSkillInvocations([]);
+      setMemories([]);
+      setHandoffs([]);
+      setError(null);
       setLoading(false);
       return;
     }

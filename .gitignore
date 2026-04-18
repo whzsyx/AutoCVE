@@ -190,3 +190,22 @@ examples/
 chroma/
 
 backend/data/vector_db/
+
+# Python 临时文件
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.pytest-runtime-write/
+backend/.pytest_tmp/
+
+# 临时目录
+tmp*/
+backend/tmp*/
+backend/managed-projects-*/
+backend/runtime-write-*/
+backend/pytest-cache-files-*/
+
+# 日志和环境文件
+.env
+*.log

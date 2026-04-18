@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 from app.services.agent.skill_service import SkillService
 from app.services.runtime_core.memory_runtime import RuntimeMemoryManager, build_memory_message
 from app.services.finding_runtime.models import RuntimeMessageRole, TranscriptItem
@@ -36,6 +38,8 @@ class FindingRuntimeAdapter:
         recon_payload: dict,
         user_message: str | None = None,
         model_name: str = "finding-runtime",
+        on_session_created=None,
+        on_user_message_created=None,
     ) -> dict:
         session_id = self._session_store.create_session(
             project_id=project_id,
@@ -44,6 +48,10 @@ class FindingRuntimeAdapter:
             system_prompt=system_prompt,
             recon_payload=recon_payload,
         )
+        if on_session_created is not None:
+            maybe_awaitable = on_session_created(session_id)
+            if inspect.isawaitable(maybe_awaitable):
+                await maybe_awaitable
         effective_user_message = user_message or self.DEFAULT_USER_MESSAGE
         skill_context, skill_bootstrap_text, discovery_snapshot = await self._resolve_skill_context(
             session_id=session_id,
@@ -83,13 +91,17 @@ class FindingRuntimeAdapter:
             discovery_snapshot=discovery_snapshot,
         )
 
-        self._session_store.append_message(
+        user_message_id = self._session_store.append_message(
             session_id,
             TranscriptItem(
                 role=RuntimeMessageRole.USER,
                 content=effective_user_message,
             ),
         )
+        if on_user_message_created is not None:
+            maybe_awaitable = on_user_message_created(user_message_id)
+            if inspect.isawaitable(maybe_awaitable):
+                await maybe_awaitable
         runner_result = await self._runner.run_once(session_id=session_id, model_name=model_name)
         return {
             "session_id": session_id,
