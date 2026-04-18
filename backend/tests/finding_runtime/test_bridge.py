@@ -159,8 +159,37 @@ def test_bridge_exposes_restored_style_runtime_tools():
 
     tool_names = [item["name"] for item in bridge._build_tool_registry().describe_tools()]
 
-    assert tool_names == ["Read", "Glob", "Grep", "Skill", "TodoWrite", "AskUser", "EnterPlanMode", "ExitPlanMode"]
+    assert tool_names == ["Read", "Glob", "Grep", "Skill", "ToolSearch"]
     assert "read_many_files" not in tool_names
+
+
+def test_bridge_exposes_shell_runtime_tools_when_shell_backend_is_available(monkeypatch):
+    read_tool = FakeAgentTool("read_file")
+    read_tool.project_root = "D:/repo"
+    list_tool = FakeAgentTool("list_files")
+    list_tool.project_root = "D:/repo"
+    search_tool = FakeAgentTool("search_code")
+    search_tool.project_root = "D:/repo"
+
+    monkeypatch.setattr("app.services.runtime_core.runtime_tool_registry.detect_bash_executable", lambda: None)
+    monkeypatch.setattr("app.services.runtime_core.runtime_tool_registry.detect_powershell_executable", lambda: "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+    monkeypatch.setattr("app.services.runtime_core.runtime_tool_registry.is_powershell_runtime_tool_enabled", lambda: True)
+
+    bridge = FindingRuntimeBridge(
+        llm_service=FakeLLMService([]),
+        tools={
+            "read_file": read_tool,
+            "list_files": list_tool,
+            "search_code": search_tool,
+            "sandbox_exec": FakeAgentTool("sandbox_exec"),
+        },
+        session_factory=build_session_factory(),
+    )
+
+    tool_names = [item["name"] for item in bridge._build_tool_registry().describe_tools()]
+
+    assert "Bash" in tool_names
+    assert "PowerShell" in tool_names
 
 
 def test_bridge_skips_system_transcript_messages_when_building_model_payload():
@@ -493,3 +522,37 @@ def test_runtime_model_client_passes_max_output_tokens_override_to_llm_service()
     )
 
     assert llm.calls[-1]["max_tokens"] == 64000
+
+
+
+def test_runtime_model_client_stream_complete_emits_tool_call_events_before_done():
+    class StreamingLLMService(FakeLLMService):
+        async def chat_completion_stream(self, *, messages, agent_type, tools, parallel_tool_calls, max_tokens=None):
+            self.calls.append({"messages": messages, "tools": tools, "max_tokens": max_tokens, "streaming": True})
+            yield {"type": "token", "content": "Need ", "accumulated": "Need "}
+            yield {"type": "tool_call", "tool_call": {"id": "tool-1", "name": "Read", "input": {"file_path": "README.md"}}}
+            yield {"type": "done", "content": "Need tool", "finish_reason": "stop"}
+
+    llm = StreamingLLMService([])
+    llm_client = __import__("app.services.finding_runtime.bridge", fromlist=["RuntimeLLMModelClient"]).RuntimeLLMModelClient(
+        llm_service=llm,
+        agent_type="finding",
+    )
+
+    async def collect_events():
+        events = []
+        async for event in llm_client.stream_complete(
+            system_prompt="system",
+            recon_payload={},
+            transcript=[TranscriptItem(role=RuntimeMessageRole.USER, content="inspect")],
+            model_name="finding",
+            tool_definitions=[{"name": "Read", "description": "read", "input_schema": {"type": "object"}}],
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(collect_events())
+
+    assert [event["type"] for event in events] == ["content_delta", "tool_call", "done"]
+    assert events[1]["tool_call"]["name"] == "Read"
+    assert events[2]["content"] == "Need tool"

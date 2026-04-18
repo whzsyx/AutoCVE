@@ -767,6 +767,17 @@ async def _execute_agent_task(task_id: str):
                     return default_value
                 return parsed if parsed > 0 else default_value
 
+            def resolve_runtime_turn_limit(agent_name: str) -> int | None:
+                llm_payload = (user_config or {}).get("llmConfig", {}) or {}
+                agent_configs = llm_payload.get("agentConfigs") or {}
+                override = agent_configs.get(agent_name) or {}
+                raw_value = override.get("maxIterations") if isinstance(override, dict) else None
+                try:
+                    parsed = int(raw_value)
+                except (TypeError, ValueError):
+                    return None
+                return parsed if parsed > 0 else None
+
             orchestrator_llm_service = LLMService(user_config=build_agent_user_config("orchestrator"))
             recon_llm_service = LLMService(user_config=build_agent_user_config("recon"))
             analysis_llm_service = LLMService(user_config=build_agent_user_config("analysis"))
@@ -872,6 +883,7 @@ async def _execute_agent_task(task_id: str):
                     "exclude_patterns": task.exclude_patterns or [],
                     "target_files": task.target_files or [],
                     "max_iterations": task.max_iterations or 50,
+                    "finding_runtime_max_iterations": resolve_runtime_turn_limit("finding"),
                     "user_id": task.created_by,
                     "finding_runtime_stack": finding_runtime_stack,
                     "workflow": workflow_config,
@@ -1192,6 +1204,7 @@ async def _initialize_tools(
         **base_tools,
         **build_agent_skill_tools(user_id=user_id, agent_type="finding"),
         "dataflow_analysis": DataFlowAnalysisTool(llm_service),
+        "sandbox_exec": SandboxTool(sandbox_manager),
     }
     if retriever:
         finding_tools["rag_query"] = RAGQueryTool(retriever)

@@ -16,6 +16,7 @@ from app.services.finding_runtime.models import (
     TranscriptItem,
 )
 from app.services.finding_runtime.query_loop import QueryLoop
+from app.services.runtime_core.tool_search_runtime import ToolSearchRuntimeTool
 from app.services.finding_runtime.query_state import QueryLoopState
 from app.services.finding_runtime.runner import FindingRuntimeRunner
 from app.services.finding_runtime.session_store import AuditSessionStore
@@ -46,6 +47,27 @@ class FakeModelClient:
             "content": self.content,
             "stop_reason": RuntimeStopReason.COMPLETED.value,
         }
+
+
+class StreamingFakeModelClient(FakeModelClient):
+    def __init__(self, stream_events: list[dict[str, object]]):
+        super().__init__(responses=[])
+        self._stream_events = list(stream_events)
+
+    async def stream_complete(self, *, system_prompt, recon_payload, transcript, model_name, tool_definitions, max_output_tokens_override=None):
+        self.calls.append(
+            {
+                "system_prompt": system_prompt,
+                "recon_payload": recon_payload,
+                "transcript": transcript,
+                "model_name": model_name,
+                "tool_definitions": tool_definitions,
+                "max_output_tokens_override": max_output_tokens_override,
+                "streaming": True,
+            }
+        )
+        for event in self._stream_events:
+            yield dict(event)
 
 
 class EchoInput(BaseModel):
@@ -86,6 +108,10 @@ def build_store() -> AuditSessionStore:
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
     return AuditSessionStore(session_factory=session_factory)
+
+
+def _messages_without_system(snapshot):
+    return [message for message in snapshot.messages if message.role != RuntimeMessageRole.SYSTEM.value]
 
 
 def test_query_loop_run_turn_persists_assistant_reply_and_turn():
@@ -152,15 +178,16 @@ def test_runner_executes_tool_calls_and_loops_until_final_answer():
     assert result.stop_reason is RuntimeStopReason.COMPLETED
     assert result.transition is None
     assert snapshot.session.state == "completed"
-    assert [message.role for message in snapshot.messages] == [
+    visible_messages = _messages_without_system(snapshot)
+    assert [message.role for message in visible_messages] == [
         RuntimeMessageRole.USER.value,
         RuntimeMessageRole.ASSISTANT.value,
         RuntimeMessageRole.TOOL_USE.value,
         RuntimeMessageRole.TOOL_RESULT.value,
         RuntimeMessageRole.ASSISTANT.value,
     ]
-    assert snapshot.messages[2].payload["tool_name"] == "echo"
-    assert snapshot.messages[3].payload["output"] == {"echo": "repo summary"}
+    assert visible_messages[2].payload["tool_name"] == "echo"
+    assert visible_messages[3].payload["output"] == {"echo": "repo summary"}
     assert len(snapshot.tool_calls) == 1
     assert snapshot.tool_calls[0].status == AuditToolCallStatus.COMPLETED.value
     assert client.calls[0]["tool_definitions"][0]["name"] == "echo"
@@ -195,8 +222,9 @@ def test_runner_continues_when_transition_requests_next_turn():
     snapshot = store.load_session_snapshot(session_id)
 
     assert result.stop_reason is RuntimeStopReason.COMPLETED
-    assert snapshot.checkpoints[0].state_payload["transition"] == RuntimeContinueReason.NEXT_TURN.value
-    assert snapshot.checkpoints[1].state_payload["transition"] is None
+    transition_checkpoints = [checkpoint.state_payload for checkpoint in snapshot.checkpoints if checkpoint.state_payload.get("transition") is not None or "transition" in checkpoint.state_payload]
+    assert transition_checkpoints[0]["transition"] == RuntimeContinueReason.NEXT_TURN.value
+    assert transition_checkpoints[1]["transition"] is None
 
 
 def test_runner_executes_skill_tool_and_persists_skill_invocation():
@@ -236,8 +264,9 @@ def test_runner_executes_skill_tool_and_persists_skill_invocation():
     assert len(snapshot.skill_invocations) == 1
     assert snapshot.skill_invocations[0].skill_ref == "code-audit-finding"
     assert snapshot.skill_invocations[0].status == AuditSkillInvocationStatus.COMPLETED.value
-    assert snapshot.messages[2].payload["tool_name"] == "Skill"
-    assert snapshot.messages[3].payload["output"] == {"skill": "code-audit-finding", "content": "body"}
+    visible_messages = _messages_without_system(snapshot)
+    assert visible_messages[2].payload["tool_name"] == "Skill"
+    assert visible_messages[3].payload["output"] == {"skill": "code-audit-finding", "content": "body"}
 
 
 def test_query_loop_defaults_stop_reason_when_model_omits_it():
@@ -282,10 +311,14 @@ def test_query_loop_executes_textual_tool_call_fallback():
     snapshot = store.load_session_snapshot(session_id)
 
     assert result.stop_reason is RuntimeStopReason.COMPLETED
-    assert snapshot.messages[2].role == RuntimeMessageRole.TOOL_USE.value
-    assert snapshot.messages[2].payload["tool_name"] == "echo"
-    assert snapshot.messages[3].payload["output"] == {"echo": "repo summary"}
-    assert snapshot.checkpoints[0].state_payload["transition"] == RuntimeContinueReason.NEXT_TURN.value
+    visible_messages = _messages_without_system(snapshot)
+    assert visible_messages[2].role == RuntimeMessageRole.TOOL_USE.value
+    assert visible_messages[2].payload["tool_name"] == "echo"
+    assert visible_messages[3].payload["output"] == {"echo": "repo summary"}
+    assert any(
+        checkpoint.state_payload.get("transition") == RuntimeContinueReason.NEXT_TURN.value
+        for checkpoint in snapshot.checkpoints
+    )
 
 
 def test_query_loop_ignores_textual_tool_calls_without_orchestrator_when_no_tools_are_exposed():
@@ -1191,3 +1224,136 @@ def test_query_loop_uses_auto_compact_orchestrator_output_as_model_transcript(mo
     assert client.calls[0]["transcript"][-1].content == "tail"
     assert saved_state.messages[0].name == "auto_compact_boundary"
     assert saved_state.messages[1].name == "auto_compact_summary"
+
+
+def test_runner_with_unbounded_max_turns_runs_until_terminal_result():
+    store = build_store()
+    session_id = store.create_session(project_id="project-1", system_prompt="system")
+    store.append_message(session_id, TranscriptItem(role=RuntimeMessageRole.USER, content="inspect code"))
+    client = FakeModelClient(
+        responses=[
+            {
+                "content": "Need tool 1",
+                "tool_calls": [{"id": "tool-1", "name": "echo", "input": {"text": "first"}}],
+            },
+            {
+                "content": "Need tool 2",
+                "tool_calls": [{"id": "tool-2", "name": "echo", "input": {"text": "second"}}],
+            },
+            {
+                "content": "Final answer",
+                "stop_reason": RuntimeStopReason.COMPLETED.value,
+            },
+        ]
+    )
+    registry = ToolRegistry([EchoTool()])
+    orchestrator = ToolOrchestrator(session_store=store, tool_registry=registry)
+    runner = FindingRuntimeRunner(
+        session_store=store,
+        model_client=client,
+        tool_registry=registry,
+        tool_orchestrator=orchestrator,
+        max_turns=None,
+    )
+
+    result = asyncio.run(runner.run_once(session_id=session_id, model_name="gpt-test"))
+    snapshot = store.load_session_snapshot(session_id)
+
+    assert result.stop_reason is RuntimeStopReason.COMPLETED
+    assert snapshot.session.state == "completed"
+    assert len(snapshot.turns) == 3
+
+
+
+class DeferredEchoTool(RuntimeTool):
+    name = "DeferredEcho"
+    description = "Echo text after ToolSearch loads the schema"
+    input_model = EchoInput
+    should_defer = True
+    search_hint = "echo deferred text"
+
+    def is_concurrency_safe(self, parsed_input: EchoInput) -> bool:
+        return True
+
+    async def execute(self, parsed_input: EchoInput, context: ToolExecutionContext) -> ToolExecutionPayload:
+        del context
+        return ToolExecutionPayload(
+            content=f"deferred:{parsed_input.text}",
+            output_payload={"echo": parsed_input.text},
+        )
+
+
+def test_runner_activates_deferred_tools_after_tool_search_selection():
+    store = build_store()
+    session_id = store.create_session(project_id="project-1", system_prompt="system")
+    store.append_message(session_id, TranscriptItem(role=RuntimeMessageRole.USER, content="inspect code"))
+    registry = ToolRegistry()
+    deferred_echo = DeferredEchoTool()
+    registry.register(deferred_echo)
+    registry.register(ToolSearchRuntimeTool(session_store=store, registry_getter=lambda: registry))
+    client = FakeModelClient(
+        responses=[
+            {
+                "content": "Search for the deferred tool",
+                "tool_calls": [{"id": "tool-1", "name": "ToolSearch", "input": {"query": "select:DeferredEcho"}}],
+            },
+            {
+                "content": "Use the deferred tool",
+                "tool_calls": [{"id": "tool-2", "name": "DeferredEcho", "input": {"text": "repo summary"}}],
+            },
+            {
+                "content": "Final answer",
+                "stop_reason": RuntimeStopReason.COMPLETED.value,
+            },
+        ]
+    )
+    orchestrator = ToolOrchestrator(session_store=store, tool_registry=registry)
+    runner = FindingRuntimeRunner(
+        session_store=store,
+        model_client=client,
+        tool_registry=registry,
+        tool_orchestrator=orchestrator,
+        max_turns=None,
+    )
+
+    result = asyncio.run(runner.run_once(session_id=session_id, model_name="gpt-test"))
+    state = store.load_query_loop_state(session_id)
+
+    assert result.stop_reason is RuntimeStopReason.COMPLETED
+    assert [tool["name"] for tool in client.calls[0]["tool_definitions"]] == ["ToolSearch"]
+    assert [tool["name"] for tool in client.calls[1]["tool_definitions"]] == ["DeferredEcho", "ToolSearch"]
+    assert state.tool_use_context["active_tool_names"] == ["DeferredEcho", "ToolSearch"]
+
+
+def test_query_loop_streams_tool_calls_into_executor_before_done():
+    store = build_store()
+    session_id = store.create_session(project_id="project-1", system_prompt="system")
+    store.append_message(session_id, TranscriptItem(role=RuntimeMessageRole.USER, content="inspect code"))
+    client = StreamingFakeModelClient(
+        stream_events=[
+            {"type": "content_delta", "content": "Need ", "accumulated": "Need "},
+            {"type": "content_delta", "content": "tool", "accumulated": "Need tool"},
+            {"type": "tool_call", "tool_call": {"id": "tool-1", "name": "echo", "input": {"text": "repo summary"}}},
+            {"type": "done", "content": "Need tool", "stop_reason": RuntimeStopReason.COMPLETED.value},
+        ]
+    )
+    registry = ToolRegistry([EchoTool()])
+    orchestrator = ToolOrchestrator(session_store=store, tool_registry=registry)
+    loop = QueryLoop(session_store=store, model_client=client, tool_registry=registry, tool_orchestrator=orchestrator)
+
+    result = asyncio.run(loop.run_turn(session_id=session_id, model_name="gpt-test"))
+    snapshot = store.load_session_snapshot(session_id)
+    visible_messages = _messages_without_system(snapshot)
+    system_messages = [message for message in snapshot.messages if message.role == RuntimeMessageRole.SYSTEM.value]
+
+    assert result.transition is RuntimeContinueReason.NEXT_TURN
+    assert [message.role for message in visible_messages] == [
+        RuntimeMessageRole.USER.value,
+        RuntimeMessageRole.ASSISTANT.value,
+        RuntimeMessageRole.TOOL_USE.value,
+        RuntimeMessageRole.TOOL_RESULT.value,
+    ]
+    assert visible_messages[1].content == "Need tool"
+    assert visible_messages[3].payload["output"] == {"echo": "repo summary"}
+    assert [message.name for message in system_messages] == ["tool_progress", "tool_progress"]
+    assert client.calls[0]["streaming"] is True

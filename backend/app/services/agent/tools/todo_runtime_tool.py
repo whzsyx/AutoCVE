@@ -16,6 +16,8 @@ class TodoWriteRuntimeTool(RuntimeTool):
     name = "TodoWrite"
     description = "Create a runtime todo item for the current agent"
     input_model = TodoWriteInput
+    should_defer = True
+    search_hint = "record a todo or plan step"
 
     def __init__(self, session_store):
         super().__init__()

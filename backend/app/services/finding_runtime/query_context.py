@@ -6,7 +6,6 @@ from uuid import uuid4
 
 from app.services.finding_runtime.compaction.auto_compact import (
     calculate_token_warning_state,
-    get_auto_compact_threshold,
     get_effective_context_window_size,
 )
 from app.services.finding_runtime.models import RuntimeMessageRole, TranscriptItem
@@ -99,21 +98,6 @@ def apply_microcompact(messages: list[TranscriptItem], state: QueryLoopState) ->
     return result
 
 
-def project_context_collapse(messages: list[TranscriptItem], state: QueryLoopState) -> list[TranscriptItem]:
-    tracking = dict(state.auto_compact_tracking or {})
-    summary = str(tracking.get("projected_summary") or "").strip()
-    drop_count = int(tracking.get("projected_drop_count") or 0)
-    if not summary or drop_count <= 0 or drop_count >= len(messages) + 1:
-        return list(messages)
-    collapsed_summary = TranscriptItem(
-        role=RuntimeMessageRole.USER,
-        content=summary,
-        name="context_collapse_summary",
-        metadata={"synthetic": True, "kind": "context_collapse_summary", "dropped_messages": drop_count},
-    )
-    return [collapsed_summary, *[deepcopy(item) for item in messages[drop_count:]]]
-
-
 def apply_context_collapse_if_needed(messages: list[TranscriptItem], state: QueryLoopState) -> tuple[list[TranscriptItem], QueryLoopState]:
     prepared_messages = _ensure_collapse_uuids(messages)
     collapse_state = _normalize_context_collapse_state(state.context_collapse_state)
@@ -184,134 +168,6 @@ def recover_context_collapse_from_overflow(messages: list[TranscriptItem], state
         auto_compact_tracking=next_tracking,
     )
     return projected_messages, next_state, committed_count
-
-
-def run_proactive_autocompact(messages: list[TranscriptItem], state: QueryLoopState) -> tuple[list[TranscriptItem], QueryLoopState]:
-    config = _pipeline_config(state).get("autocompact") or {}
-    preserve_tail_messages = max(0, int(config.get("preserve_tail_messages") or 0))
-    total_chars = sum(len(item.content or "") for item in messages)
-    controller = dict(_pipeline_config(state).get("autocompact_controller") or state.tool_use_context.get("autocompact_controller") or {})
-    threshold = 0
-    effective_context_window = 0
-    if controller:
-        context_window = int(controller.get("context_window") or 0)
-        max_output_tokens = int(controller.get("max_output_tokens") or 0)
-        if context_window > 0 and max_output_tokens > 0:
-            threshold = get_auto_compact_threshold(
-                model=str(controller.get("model") or "claude-sonnet-4-5"),
-                context_window=context_window,
-                max_output_tokens=max_output_tokens,
-            )
-            effective_context_window = get_effective_context_window_size(
-                model=str(controller.get("model") or "claude-sonnet-4-5"),
-                context_window=context_window,
-                max_output_tokens=max_output_tokens,
-            )
-    max_chars = int(config.get("max_chars") or 0)
-    should_compact = False
-    if threshold > 0:
-        should_compact = total_chars >= threshold and len(messages) > preserve_tail_messages
-    elif max_chars > 0:
-        should_compact = total_chars > max_chars and len(messages) > preserve_tail_messages
-    if not should_compact:
-        return list(messages), state
-
-    tail = [deepcopy(item) for item in messages[-preserve_tail_messages:]] if preserve_tail_messages else []
-    compacted_prefix = list(messages[:-preserve_tail_messages]) if preserve_tail_messages else list(messages)
-    summary = _build_autocompact_summary(compacted_prefix)
-    tracking = {
-        **dict(state.auto_compact_tracking or {}),
-        "compacted": True,
-        "summary_message_name": "auto_compact_summary",
-        "compacted_messages": len(compacted_prefix),
-    }
-    if threshold > 0:
-        tracking["auto_compact_threshold"] = threshold
-        tracking["effective_context_window"] = effective_context_window
-    summary_message = TranscriptItem(
-        role=RuntimeMessageRole.USER,
-        content=summary,
-        name="auto_compact_summary",
-        metadata={"synthetic": True, "kind": "auto_compact_summary", "compacted_messages": len(compacted_prefix)},
-    )
-    next_state = _copy_state(
-        state,
-        messages=[summary_message, *tail],
-        auto_compact_tracking=tracking,
-    )
-    return list(next_state.messages), next_state
-
-
-def run_reactive_compact(
-    messages: list[TranscriptItem],
-    state: QueryLoopState,
-    *,
-    recoverable_error_kind: str,
-) -> tuple[list[TranscriptItem], QueryLoopState]:
-    pipeline = _pipeline_config(state)
-    reactive_config = dict(pipeline.get("reactive_compact") or {})
-    autocompact_config = dict(pipeline.get("autocompact") or {})
-    default_tail = int(autocompact_config.get("preserve_tail_messages") or 2)
-    preserve_tail_messages = max(0, int(reactive_config.get("preserve_tail_messages") or default_tail))
-    max_summary_messages = max(1, int(reactive_config.get("max_summary_messages") or 6))
-
-    prepared_messages, media_stats = _strip_media_from_messages(
-        messages,
-        enabled=recoverable_error_kind in {"media_size", "image_error"},
-    )
-    tail_count = _resolve_reactive_tail_count(len(prepared_messages), preserve_tail_messages)
-    if tail_count > 0:
-        compacted_prefix = prepared_messages[:-tail_count]
-        preserved_tail = [deepcopy(item) for item in prepared_messages[-tail_count:]]
-    else:
-        compacted_prefix = prepared_messages
-        preserved_tail = []
-
-    boundary_message = TranscriptItem(
-        role=RuntimeMessageRole.SYSTEM,
-        content="Reactive compact boundary.",
-        name="reactive_compact_boundary",
-        metadata={
-            "synthetic": True,
-            "kind": "compact_boundary",
-            "strategy": "reactive_compact",
-            "recoverable_error_kind": recoverable_error_kind,
-            "preserved_tail_messages": len(preserved_tail),
-        },
-    )
-    summary_message = TranscriptItem(
-        role=RuntimeMessageRole.USER,
-        content=_build_reactive_compact_summary(
-            compacted_prefix,
-            media_stripped_count=media_stats["media_stripped_count"],
-            max_summary_messages=max_summary_messages,
-        ),
-        name="reactive_compact_summary",
-        metadata={
-            "synthetic": True,
-            "kind": "reactive_compact_summary",
-            "strategy": "reactive_compact",
-            "compacted_messages": len(compacted_prefix),
-            "media_stripped_count": media_stats["media_stripped_count"],
-        },
-    )
-
-    next_messages = [boundary_message, summary_message, *preserved_tail]
-    next_tracking = {
-        **dict(state.auto_compact_tracking or {}),
-        "compacted": True,
-        "summary_message_name": "reactive_compact_summary",
-        "boundary_name": "reactive_compact_boundary",
-        "compacted_messages": len(compacted_prefix),
-        "preserved_tail_messages": len(preserved_tail),
-        "media_stripped_count": media_stats["media_stripped_count"],
-    }
-    next_state = _copy_state(
-        state,
-        messages=next_messages,
-        auto_compact_tracking=next_tracking,
-    )
-    return list(next_state.messages), next_state
 
 
 def append_system_context(system_prompt: str | None, runtime_state: Any) -> str:
@@ -530,16 +386,6 @@ def _collapse_tracking_payload(collapse_state: dict[str, Any], projected_message
     return tracking
 
 
-def _build_autocompact_summary(messages: list[TranscriptItem]) -> str:
-    parts: list[str] = []
-    for item in messages[:6]:
-        role = item.role.value
-        excerpt = (item.content or "").strip().replace("\n", " ")[:80]
-        parts.append(f"[{role}] {excerpt}")
-    joined = " | ".join(part for part in parts if part)
-    return f"Auto-compact summary of earlier context: {joined}" if joined else "Auto-compact summary of earlier context."
-
-
 def _build_collapse_summary(messages: list[TranscriptItem]) -> str:
     parts: list[str] = []
     for item in messages[:4]:
@@ -549,106 +395,6 @@ def _build_collapse_summary(messages: list[TranscriptItem]) -> str:
             parts.append(f"[{role}] {excerpt}")
     joined = " | ".join(parts)
     return f"Collapsed earlier context: {joined}" if joined else "Collapsed earlier context."
-
-
-def _build_reactive_compact_summary(
-    messages: list[TranscriptItem],
-    *,
-    media_stripped_count: int,
-    max_summary_messages: int,
-) -> str:
-    parts: list[str] = []
-    for item in messages[:max_summary_messages]:
-        role = item.role.value
-        excerpt = (item.content or "").strip().replace("\n", " ")[:80]
-        if excerpt:
-            parts.append(f"[{role}] {excerpt}")
-    prefix = f"Reactive compact summary of {len(messages)} earlier messages."
-    if media_stripped_count > 0:
-        prefix += f" Media stripped: {media_stripped_count}."
-    joined = " | ".join(parts)
-    return f"{prefix} {joined}".strip() if joined else prefix
-
-
-def _resolve_reactive_tail_count(message_count: int, preserve_tail_messages: int) -> int:
-    if message_count <= 1:
-        return 0
-    return min(max(0, preserve_tail_messages), message_count - 1)
-
-
-def _strip_media_from_messages(
-    messages: list[TranscriptItem],
-    *,
-    enabled: bool,
-) -> tuple[list[TranscriptItem], dict[str, int]]:
-    if not enabled:
-        return [deepcopy(item) for item in messages], {"media_stripped_count": 0}
-
-    total_stripped = 0
-    result: list[TranscriptItem] = []
-    for item in messages:
-        clone = deepcopy(item)
-        markers: list[str] = []
-        payload = dict(clone.payload or {})
-        content_blocks = payload.get("content_blocks")
-        if isinstance(content_blocks, list):
-            new_blocks = []
-            for block in content_blocks:
-                if not isinstance(block, dict):
-                    new_blocks.append(block)
-                    continue
-                block_type = str(block.get("type") or "").lower()
-                if block_type == "image":
-                    total_stripped += 1
-                    markers.append("[image]")
-                    new_blocks.append({"type": "text", "text": "[image]"})
-                    continue
-                if block_type == "document":
-                    total_stripped += 1
-                    markers.append("[document]")
-                    new_blocks.append({"type": "text", "text": "[document]"})
-                    continue
-                if block_type == "tool_result" and isinstance(block.get("content"), list):
-                    nested_content = []
-                    nested_changed = False
-                    for nested in block.get("content") or []:
-                        if not isinstance(nested, dict):
-                            nested_content.append(nested)
-                            continue
-                        nested_type = str(nested.get("type") or "").lower()
-                        if nested_type == "image":
-                            total_stripped += 1
-                            markers.append("[image]")
-                            nested_content.append({"type": "text", "text": "[image]"})
-                            nested_changed = True
-                            continue
-                        if nested_type == "document":
-                            total_stripped += 1
-                            markers.append("[document]")
-                            nested_content.append({"type": "text", "text": "[document]"})
-                            nested_changed = True
-                            continue
-                        nested_content.append(nested)
-                    if nested_changed:
-                        new_blocks.append({**block, "content": nested_content})
-                        continue
-                new_blocks.append(block)
-            payload["content_blocks"] = new_blocks
-        media_entries = payload.get("media")
-        if isinstance(media_entries, list) and media_entries:
-            for entry in media_entries:
-                marker = "[document]" if isinstance(entry, dict) and str(entry.get("type") or "").lower() == "document" else "[image]"
-                markers.append(marker)
-                total_stripped += 1
-            payload["media"] = []
-        if markers:
-            clone.payload = payload
-            clone.metadata["media_stripped"] = True
-            marker_prefix = " ".join(dict.fromkeys(markers))
-            content = str(clone.content or "").strip()
-            clone.content = f"{marker_prefix} {content}".strip() if content else marker_prefix
-        result.append(clone)
-    return result, {"media_stripped_count": total_stripped}
 
 
 def evaluate_blocking_limit(messages: list[TranscriptItem], state: QueryLoopState) -> dict[str, int | bool]:
@@ -682,8 +428,5 @@ def evaluate_blocking_limit(messages: list[TranscriptItem], state: QueryLoopStat
         "max_chars": max_chars,
         "current_chars": current_chars,
     }
-
-
-
 
 

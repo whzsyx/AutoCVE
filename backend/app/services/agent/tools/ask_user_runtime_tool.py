@@ -16,6 +16,11 @@ class AskUserRuntimeTool(RuntimeTool):
     name = "AskUser"
     description = "Record a runtime question that requires human input"
     input_model = AskUserInput
+    should_defer = True
+    search_hint = "ask the user a question"
+
+    def requires_user_interaction(self) -> bool:
+        return True
 
     def __init__(self, session_store):
         super().__init__()

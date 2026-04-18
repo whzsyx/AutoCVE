@@ -10,7 +10,15 @@ from app.services.agent.tools.plan_mode_runtime_tool import EnterPlanModeRuntime
 from app.services.agent.tools.todo_runtime_tool import TodoWriteRuntimeTool
 from app.services.finding_runtime.models import ToolExecutionPayload
 from app.services.finding_runtime.skills import RuntimeSkillTool
+from app.services.runtime_core.shell_runtime_tools import (
+    BashRuntimeTool,
+    PowerShellRuntimeTool,
+    detect_bash_executable,
+    detect_powershell_executable,
+    is_powershell_runtime_tool_enabled,
+)
 from app.services.runtime_core.tool_runtime import RuntimeTool, ToolExecutionContext, ToolRegistry
+from app.services.runtime_core.tool_search_runtime import ToolSearchRuntimeTool
 
 
 class ReadToolInput(BaseModel):
@@ -171,6 +179,15 @@ class CanonicalGrepTool(RuntimeTool):
         return _result_to_payload(result)
 
 
+def _infer_project_root(agent_tools: dict[str, AgentTool]) -> str | None:
+    for key in ("read_file", "list_files", "search_code"):
+        tool = agent_tools.get(key)
+        project_root = getattr(tool, "project_root", None)
+        if isinstance(project_root, str) and project_root.strip():
+            return project_root
+    return None
+
+
 def build_runtime_tool_registry(*, session_store, agent_tools: dict[str, AgentTool], agent_type: str, user_id: str | None = None) -> ToolRegistry:
     tools: list[RuntimeTool] = []
 
@@ -192,6 +209,17 @@ def build_runtime_tool_registry(*, session_store, agent_tools: dict[str, AgentTo
     if isinstance(search_tool, AgentTool):
         tools.append(CanonicalGrepTool(search_tool=search_tool))
 
+    project_root = _infer_project_root(agent_tools)
+    shell_backend = agent_tools.get("sandbox_exec") if isinstance(agent_tools.get("sandbox_exec"), AgentTool) else None
+    if project_root:
+        bash_executable = detect_bash_executable()
+        if bash_executable or shell_backend is not None:
+            tools.append(BashRuntimeTool(project_root=project_root, backend_tool=shell_backend, executable=bash_executable))
+        if is_powershell_runtime_tool_enabled():
+            powershell_executable = detect_powershell_executable()
+            if powershell_executable or shell_backend is not None:
+                tools.append(PowerShellRuntimeTool(project_root=project_root, backend_tool=shell_backend, executable=powershell_executable))
+
     tools.append(
         RuntimeSkillTool(
             session_store=session_store,
@@ -207,4 +235,8 @@ def build_runtime_tool_registry(*, session_store, agent_tools: dict[str, AgentTo
             ExitPlanModeRuntimeTool(session_store),
         ]
     )
-    return ToolRegistry(tools)
+
+    registry = ToolRegistry(tools)
+    if registry.has_deferred_tools():
+        registry.register(ToolSearchRuntimeTool(session_store=session_store, registry_getter=lambda: registry))
+    return registry

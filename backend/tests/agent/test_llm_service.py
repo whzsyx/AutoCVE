@@ -68,6 +68,36 @@ class _ToolingProbeAdapter:
         )()
 
 
+
+class _StreamingProbeAdapter:
+    def __init__(self):
+        self.request = None
+        self.complete_called = False
+
+    async def complete(self, request):
+        self.complete_called = True
+        raise AssertionError("chat_completion_stream should use adapter.stream_complete")
+
+    async def stream_complete(self, request):
+        self.request = request
+        yield {"type": "token", "content": "Need ", "accumulated": "Need "}
+        yield {
+            "type": "tool_call",
+            "tool_call": {
+                "id": "call_1",
+                "type": "function",
+                "name": "Read",
+                "arguments": "{\"file_path\":\"README.md\"}",
+            },
+        }
+        yield {
+            "type": "done",
+            "content": "Need tool",
+            "finish_reason": "tool_calls",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19},
+        }
+
+
 @pytest.mark.asyncio
 async def test_llm_service_respects_user_configured_llm_concurrency(monkeypatch):
     adapter = _ConcurrencyProbeAdapter()
@@ -178,3 +208,44 @@ def test_llm_service_uses_runtime_env_fallbacks_for_provider_config():
     assert config.base_url == "https://pureopus.cc"
     assert config.model == "claude-opus-4-6"
     assert config.timeout == 3000
+
+
+
+@pytest.mark.asyncio
+async def test_llm_service_chat_completion_stream_preserves_provider_tool_call_events(monkeypatch):
+    adapter = _StreamingProbeAdapter()
+    service = LLMService(
+        user_config={
+            "llmConfig": {
+                "llmProvider": "openai",
+                "llmApiKey": "test-key",
+                "llmModel": "test-model",
+            }
+        }
+    )
+
+    monkeypatch.setattr("app.services.llm.service.LLMFactory.create_adapter", lambda config: adapter)
+
+    events = []
+    async for event in service.chat_completion_stream(
+        messages=[{"role": "user", "content": "use tools"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        parallel_tool_calls=True,
+    ):
+        events.append(event)
+
+    assert [event["type"] for event in events] == ["token", "tool_call", "done"]
+    assert events[1]["tool_call"]["name"] == "Read"
+    assert events[2]["finish_reason"] == "tool_calls"
+    assert adapter.request is not None
+    assert adapter.request.parallel_tool_calls is True
+    assert adapter.complete_called is False

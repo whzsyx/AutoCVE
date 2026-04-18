@@ -201,11 +201,23 @@ def _build_agent_user_config(user_config: dict[str, Any] | None, agent_name: str
     return merged
 
 
+def _resolve_runtime_turn_limit(user_config: dict[str, Any] | None, agent_name: str) -> int | None:
+    llm_payload = copy.deepcopy((user_config or {}).get("llmConfig", {}) or {})
+    agent_configs = llm_payload.get("agentConfigs") or {}
+    override = agent_configs.get(agent_name) or {}
+    raw_value = override.get("maxIterations") if isinstance(override, dict) else None
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 async def _build_runtime_follow_up_context(
     *,
     session: AuditSession,
     db: AsyncSession,
-) -> tuple[FindingRuntimeBridge, SandboxManager, str, int]:
+) -> tuple[FindingRuntimeBridge, SandboxManager, str, int | None]:
     from app.api.v1.endpoints.agent_tasks import _get_project_root, _get_user_config, _initialize_tools
 
     task = await db.get(AgentTask, session.task_id) if session.task_id else None
@@ -270,7 +282,7 @@ async def _build_runtime_follow_up_context(
         .limit(1)
     )
     model_name = str(latest_turn_model or "finding")
-    max_turns = int(task.max_iterations or 8)
+    max_turns = _resolve_runtime_turn_limit(user_config, "finding")
     return bridge, sandbox_manager, model_name, max_turns
 
 

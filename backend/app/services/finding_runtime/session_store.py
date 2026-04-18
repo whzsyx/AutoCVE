@@ -110,6 +110,14 @@ class AuditSessionStore:
             db.refresh(message)
             return message.id
 
+    def update_message_content(self, message_id: str, *, content: str) -> None:
+        with self._session_factory() as db:
+            message = db.get(AuditSessionMessage, message_id)
+            if message is None:
+                raise LookupError(f"Unknown audit session message: {message_id}")
+            message.content = content
+            db.commit()
+
     def open_turn(self, session_id: str, *, model_name: str | None = None) -> str:
         with self._session_factory() as db:
             sequence = self._next_sequence(db, AuditSessionTurn, AuditSessionTurn.session_id, session_id)

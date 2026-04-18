@@ -37,6 +37,7 @@ from app.services.finding_runtime.query_context import (
 from app.services.finding_runtime.query_degradation import handle_recoverable_response
 from app.services.finding_runtime.query_messages import normalize_messages_for_model
 from app.services.finding_runtime.query_state import QueryLoopState
+from app.services.runtime_core.tool_search_runtime import TOOL_SEARCH_TOOL_NAME
 from app.services.finding_runtime.query_stop_hooks import (
     build_stop_hook_artifact_messages,
     build_stop_hook_messages,
@@ -66,7 +67,7 @@ class QueryLoop:
         state = self._merge_runtime_query_context_pipeline(state, runtime_state)
         state = materialize_pending_tool_use_summary(state)
         turn_id = self._session_store.open_turn(session_id, model_name=model_name)
-        tool_definitions = self._tool_registry.describe_tools() if self._tool_registry is not None else []
+        tool_definitions = self._tool_registry.describe_tools(active_tool_names=self._state_active_tool_names(state)) if self._tool_registry is not None else []
         transcript = list(state.messages)
         prepared_messages = get_messages_after_compact_boundary(transcript, state)
         prepared_messages = apply_tool_result_budget(prepared_messages, state)
@@ -112,15 +113,15 @@ class QueryLoop:
                 },
             )
         try:
-            model_response = self._normalize_model_response(
-                await self._model_client.complete(
-                    system_prompt=effective_system_prompt,
-                    recon_payload=snapshot.session.recon_payload or {},
-                    transcript=prepared_messages,
-                    model_name=model_name,
-                    tool_definitions=tool_definitions,
-                    max_output_tokens_override=state.max_output_tokens_override,
-                )
+            collected = await self._collect_model_turn(
+                session_id=session_id,
+                turn_id=turn_id,
+                state=state,
+                snapshot=snapshot,
+                effective_system_prompt=effective_system_prompt,
+                prepared_messages=prepared_messages,
+                model_name=model_name,
+                tool_definitions=tool_definitions,
             )
         except asyncio.CancelledError:
             return self._finalize_terminal_result(
@@ -142,48 +143,34 @@ class QueryLoop:
                 checkpoint_extra={"phase": "model", "error": str(exc)},
             )
 
-        assistant_message_id = None
-        working_messages = list(state.messages)
-        if model_response.content:
-            assistant_item = TranscriptItem(
-                role=RuntimeMessageRole.ASSISTANT,
-                content=model_response.content,
-            )
-            assistant_message_id = self._session_store.append_message(session_id, assistant_item)
-            working_messages.append(assistant_item)
-
-        raw_tool_calls = list(model_response.tool_calls or [])
-        if not raw_tool_calls and model_response.content and tool_definitions and self._tool_orchestrator is not None:
-            raw_tool_calls = self._extract_text_tool_calls(model_response.content)
-
-        tool_requests = [
-            ToolCallRequest(
-                id=item.get("id") or f"tool-use-{index + 1}",
-                name=item["name"],
-                input=dict(item.get("input") or {}),
-            )
-            for index, item in enumerate(raw_tool_calls)
-        ]
-        tool_result_message_ids: list[str] = []
-        tool_call_ids: list[str] = []
+        model_response = collected["model_response"]
+        assistant_message_id = collected["assistant_message_id"]
+        working_messages = collected["working_messages"]
+        tool_requests = collected["tool_requests"]
+        tool_result_message_ids = collected["tool_result_message_ids"]
+        tool_call_ids = collected["tool_call_ids"]
+        streamed_records = collected["records"]
+        tool_use_context = collected["tool_use_context"]
+        streamed_tool_uses = bool(collected.get("tool_uses_appended"))
         stop_reason: RuntimeStopReason | None = None
         transition: RuntimeContinueReason | None = None
         checkpoint_extra: dict[str, object] | None = None
 
         if tool_requests:
-            for request in tool_requests:
-                tool_use_item = TranscriptItem(
-                    role=RuntimeMessageRole.TOOL_USE,
-                    content=request.name,
-                    name=request.name,
-                    payload={
-                        "tool_use_id": request.id,
-                        "tool_name": request.name,
-                        "input": request.input,
-                    },
-                )
-                self._session_store.append_message(session_id, tool_use_item)
-                working_messages.append(tool_use_item)
+            if not streamed_tool_uses:
+                for request in tool_requests:
+                    tool_use_item = TranscriptItem(
+                        role=RuntimeMessageRole.TOOL_USE,
+                        content=request.name,
+                        name=request.name,
+                        payload={
+                            "tool_use_id": request.id,
+                            "tool_name": request.name,
+                            "input": request.input,
+                        },
+                    )
+                    self._session_store.append_message(session_id, tool_use_item)
+                    working_messages.append(tool_use_item)
 
             if self._tool_orchestrator is None:
                 if tool_definitions:
@@ -199,58 +186,70 @@ class QueryLoop:
                     ignored_tool_calls=[request.name for request in tool_requests],
                 )
 
-            try:
-                records = await self._tool_orchestrator.execute_tool_calls(
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    tool_calls=tool_requests,
-                    session=snapshot.session,
-                    recon_payload=snapshot.session.recon_payload or {},
-                )
-            except asyncio.CancelledError:
-                return self._finalize_terminal_result(
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    state=state,
-                    messages=working_messages,
-                    stop_reason=RuntimeStopReason.ABORTED_TOOLS,
-                    status="aborted_tools",
-                    assistant_message_id=assistant_message_id,
-                    checkpoint_extra={"phase": "tool_execution"},
-                )
-            except Exception as exc:
-                return self._finalize_terminal_result(
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    state=state,
-                    messages=working_messages,
-                    stop_reason=RuntimeStopReason.MODEL_ERROR,
-                    status="tool_execution_failed",
-                    assistant_message_id=assistant_message_id,
-                    checkpoint_extra={"phase": "tool_execution", "error": str(exc)},
-                )
-            for record in records:
-                tool_call_ids.append(record.tool_call_id)
-                tool_result_item = TranscriptItem(
-                    role=RuntimeMessageRole.TOOL_RESULT,
-                    content=record.result.content,
-                    name=record.request.name,
-                    metadata={
-                        "status": record.status,
-                        "is_error": record.result.is_error,
-                        "duration_ms": record.duration_ms,
-                    },
-                    payload={
-                        "tool_use_id": record.request.id,
-                        "tool_call_id": record.tool_call_id,
-                        "tool_name": record.request.name,
-                        "input": record.request.input,
-                        "output": record.result.output_payload,
-                        "error_message": record.error_message,
-                    },
-                )
-                tool_result_message_ids.append(self._session_store.append_message(session_id, tool_result_item))
-                working_messages.append(tool_result_item)
+            records = list(streamed_records)
+            if not records:
+                executor_builder = getattr(self._tool_orchestrator, "build_streaming_executor", None)
+                try:
+                    if callable(executor_builder):
+                        executor = executor_builder(
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            tool_calls=tool_requests,
+                            session=snapshot.session,
+                            recon_payload=snapshot.session.recon_payload or {},
+                            initial_context=tool_use_context,
+                        )
+                        async for update in executor.get_remaining_updates():
+                            tool_use_context = self._consume_executor_update(
+                                session_id=session_id,
+                                update=update,
+                                working_messages=working_messages,
+                                records=records,
+                                tool_call_ids=tool_call_ids,
+                                tool_result_message_ids=tool_result_message_ids,
+                                tool_use_context=tool_use_context,
+                            )
+                        tool_use_context = executor.get_updated_context()
+                    else:
+                        fallback_records = await self._tool_orchestrator.execute_tool_calls(
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            tool_calls=tool_requests,
+                            session=snapshot.session,
+                            recon_payload=snapshot.session.recon_payload or {},
+                        )
+                        for record in fallback_records:
+                            tool_use_context = self._consume_executor_update(
+                                session_id=session_id,
+                                update=type("Update", (), {"kind": "record", "record": record, "progress_payload": None, "new_context": None})(),
+                                working_messages=working_messages,
+                                records=records,
+                                tool_call_ids=tool_call_ids,
+                                tool_result_message_ids=tool_result_message_ids,
+                                tool_use_context=tool_use_context,
+                            )
+                except asyncio.CancelledError:
+                    return self._finalize_terminal_result(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        state=state,
+                        messages=working_messages,
+                        stop_reason=RuntimeStopReason.ABORTED_TOOLS,
+                        status="aborted_tools",
+                        assistant_message_id=assistant_message_id,
+                        checkpoint_extra={"phase": "tool_execution"},
+                    )
+                except Exception as exc:
+                    return self._finalize_terminal_result(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        state=state,
+                        messages=working_messages,
+                        stop_reason=RuntimeStopReason.MODEL_ERROR,
+                        status="tool_execution_failed",
+                        assistant_message_id=assistant_message_id,
+                        checkpoint_extra={"phase": "tool_execution", "error": str(exc)},
+                    )
 
             post_tool_snapshot = self._session_store.load_session_snapshot(session_id)
             turn_hook_events = collect_turn_hook_events(checkpoints=post_tool_snapshot.checkpoints, turn_id=turn_id)
@@ -299,6 +298,8 @@ class QueryLoop:
             transition = RuntimeContinueReason.NEXT_TURN
             next_messages = [*working_messages, *list(attachment_messages or [])]
             next_state = build_continue_state(state, messages=next_messages, transition=transition)
+            streaming_state = QueryLoopState(tool_use_context=tool_use_context)
+            next_state.tool_use_context = self._apply_tool_search_activations(state=streaming_state, records=records)
             next_state.pending_tool_use_summary = pending_tool_use_summary
             self._session_store.save_query_loop_state(session_id, next_state)
             self._session_store.close_turn(turn_id, status="tool_results_ready")
@@ -517,6 +518,37 @@ class QueryLoop:
         return hydrate_query_loop_state(state, messages=transcript)
 
 
+    def _state_active_tool_names(self, state: QueryLoopState) -> list[str] | None:
+        active = (state.tool_use_context or {}).get("active_tool_names")
+        if not isinstance(active, list):
+            return None
+        return [str(name) for name in active if str(name or "").strip()]
+
+    def _apply_tool_search_activations(self, *, state: QueryLoopState, records) -> dict[str, object]:
+        tool_use_context = dict(state.tool_use_context or {})
+        if self._tool_registry is None:
+            return tool_use_context
+        active_names = self._tool_registry.resolve_active_tool_names(self._state_active_tool_names(state))
+        activated: list[str] = []
+        for record in records:
+            if record.request.name != TOOL_SEARCH_TOOL_NAME or record.result.is_error:
+                continue
+            matches = record.result.output_payload.get("matches") if isinstance(record.result.output_payload, dict) else None
+            for match in matches or []:
+                tool = self._tool_registry.get(str(match))
+                if tool is None:
+                    continue
+                if tool.name not in active_names:
+                    active_names.append(tool.name)
+                if tool.name not in activated:
+                    activated.append(tool.name)
+        if active_names:
+            tool_use_context["active_tool_names"] = active_names
+        if activated:
+            tool_use_context["last_tool_search"] = {"selected_tools": activated}
+        return tool_use_context
+
+
     @staticmethod
     def _merge_runtime_query_context_pipeline(state: QueryLoopState, runtime_state) -> QueryLoopState:
         query_context = dict(getattr(runtime_state, "metadata", {}).get("query_context") or {})
@@ -594,6 +626,284 @@ class QueryLoop:
     ) -> None:
         for item in items:
             self._session_store.append_message(session_id, item)
+
+    async def _collect_model_turn(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        state: QueryLoopState,
+        snapshot,
+        effective_system_prompt: str,
+        prepared_messages: list[TranscriptItem],
+        model_name: str,
+        tool_definitions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        stream_fn = getattr(self._model_client, "stream_complete", None)
+        if not callable(stream_fn):
+            model_response = self._normalize_model_response(
+                await self._model_client.complete(
+                    system_prompt=effective_system_prompt,
+                    recon_payload=snapshot.session.recon_payload or {},
+                    transcript=prepared_messages,
+                    model_name=model_name,
+                    tool_definitions=tool_definitions,
+                    max_output_tokens_override=state.max_output_tokens_override,
+                )
+            )
+            assistant_message_id = None
+            working_messages = list(state.messages)
+            if model_response.content:
+                assistant_item = TranscriptItem(role=RuntimeMessageRole.ASSISTANT, content=model_response.content)
+                assistant_message_id = self._session_store.append_message(session_id, assistant_item)
+                working_messages.append(assistant_item)
+            raw_tool_calls = list(model_response.tool_calls or [])
+            if not raw_tool_calls and model_response.content and tool_definitions and self._tool_orchestrator is not None:
+                raw_tool_calls = self._extract_text_tool_calls(model_response.content)
+            return {
+                "model_response": model_response,
+                "assistant_message_id": assistant_message_id,
+                "working_messages": working_messages,
+                "tool_requests": [
+                    ToolCallRequest(
+                        id=item.get("id") or f"tool-use-{index + 1}",
+                        name=item["name"],
+                        input=dict(item.get("input") or {}),
+                    )
+                    for index, item in enumerate(raw_tool_calls)
+                ],
+                "tool_result_message_ids": [],
+                "tool_call_ids": [],
+                "records": [],
+                "tool_use_context": dict(state.tool_use_context or {}),
+                "tool_uses_appended": False,
+            }
+
+        working_messages = list(state.messages)
+        tool_requests: list[ToolCallRequest] = []
+        tool_result_message_ids: list[str] = []
+        tool_call_ids: list[str] = []
+        records = []
+        tool_use_context = dict(state.tool_use_context or {})
+        assistant_message_id: str | None = None
+        assistant_content = ""
+        stream_done: dict[str, Any] | None = None
+        executor = None
+        if self._tool_orchestrator is not None:
+            executor = self._tool_orchestrator.build_streaming_executor(
+                session_id=session_id,
+                turn_id=turn_id,
+                tool_calls=[],
+                session=snapshot.session,
+                recon_payload=snapshot.session.recon_payload or {},
+                initial_context=tool_use_context,
+            )
+        async for event in stream_fn(
+            system_prompt=effective_system_prompt,
+            recon_payload=snapshot.session.recon_payload or {},
+            transcript=prepared_messages,
+            model_name=model_name,
+            tool_definitions=tool_definitions,
+            max_output_tokens_override=state.max_output_tokens_override,
+        ):
+            event_type = str((event or {}).get("type") or "").strip().lower()
+            if event_type == "content_delta":
+                assistant_content = str((event or {}).get("accumulated") or (assistant_content + str((event or {}).get("content") or "")))
+                if assistant_message_id is not None:
+                    self._session_store.update_message_content(assistant_message_id, content=assistant_content)
+                    self._update_working_message_content(working_messages, assistant_message_id, assistant_content)
+            elif event_type == "tool_call":
+                request = self._tool_request_from_event(event, fallback_index=len(tool_requests) + 1)
+                if request is None:
+                    continue
+                if assistant_message_id is None:
+                    assistant_message_id = self._append_streaming_assistant_message(
+                        session_id=session_id,
+                        working_messages=working_messages,
+                        content=assistant_content,
+                    )
+                self._append_tool_use_message(session_id=session_id, working_messages=working_messages, request=request)
+                tool_requests.append(request)
+                if executor is not None:
+                    executor.add_tool_call_request(request)
+                    await executor.process_queue()
+                    for update in executor.get_completed_updates():
+                        tool_use_context = self._consume_executor_update(
+                            session_id=session_id,
+                            update=update,
+                            working_messages=working_messages,
+                            records=records,
+                            tool_call_ids=tool_call_ids,
+                            tool_result_message_ids=tool_result_message_ids,
+                            tool_use_context=tool_use_context,
+                        )
+            elif event_type == "done":
+                stream_done = dict(event or {})
+                assistant_content = str(stream_done.get("content") or assistant_content)
+                if assistant_message_id is None and assistant_content:
+                    assistant_message_id = self._append_streaming_assistant_message(
+                        session_id=session_id,
+                        working_messages=working_messages,
+                        content=assistant_content,
+                    )
+                elif assistant_message_id is not None:
+                    self._session_store.update_message_content(assistant_message_id, content=assistant_content)
+                    self._update_working_message_content(working_messages, assistant_message_id, assistant_content)
+                for item in stream_done.get("tool_calls") or []:
+                    request = ToolCallRequest(
+                        id=item.get("id") or f"tool-use-{len(tool_requests) + 1}",
+                        name=item["name"],
+                        input=dict(item.get("input") or {}),
+                    )
+                    if any(existing.id == request.id for existing in tool_requests):
+                        continue
+                    self._append_tool_use_message(session_id=session_id, working_messages=working_messages, request=request)
+                    tool_requests.append(request)
+                    if executor is not None:
+                        executor.add_tool_call_request(request)
+                        await executor.process_queue()
+                        for update in executor.get_completed_updates():
+                            tool_use_context = self._consume_executor_update(
+                                session_id=session_id,
+                                update=update,
+                                working_messages=working_messages,
+                                records=records,
+                                tool_call_ids=tool_call_ids,
+                                tool_result_message_ids=tool_result_message_ids,
+                                tool_use_context=tool_use_context,
+                            )
+        if executor is not None:
+            async for update in executor.get_remaining_updates():
+                tool_use_context = self._consume_executor_update(
+                    session_id=session_id,
+                    update=update,
+                    working_messages=working_messages,
+                    records=records,
+                    tool_call_ids=tool_call_ids,
+                    tool_result_message_ids=tool_result_message_ids,
+                    tool_use_context=tool_use_context,
+                )
+            tool_use_context = executor.get_updated_context()
+        model_response = self._normalize_model_response(
+            {
+                "content": assistant_content,
+                "tool_calls": [
+                    {"id": request.id, "name": request.name, "input": request.input}
+                    for request in tool_requests
+                ],
+                "stop_reason": (stream_done or {}).get("stop_reason") or RuntimeStopReason.COMPLETED.value,
+                "recoverable_error_kind": (stream_done or {}).get("recoverable_error_kind"),
+                "recoverable_error_message": (stream_done or {}).get("recoverable_error_message"),
+            }
+        )
+        if not tool_requests and model_response.content and tool_definitions and self._tool_orchestrator is not None:
+            raw_tool_calls = self._extract_text_tool_calls(model_response.content)
+            for index, item in enumerate(raw_tool_calls, start=1):
+                tool_requests.append(ToolCallRequest(id=item.get("id") or f"tool-use-{index}", name=item["name"], input=dict(item.get("input") or {})))
+        return {
+            "model_response": model_response,
+            "assistant_message_id": assistant_message_id,
+            "working_messages": working_messages,
+            "tool_requests": tool_requests,
+            "tool_result_message_ids": tool_result_message_ids,
+            "tool_call_ids": tool_call_ids,
+            "records": records,
+            "tool_use_context": tool_use_context,
+            "tool_uses_appended": bool(tool_requests and assistant_message_id is not None),
+        }
+
+    def _consume_executor_update(
+        self,
+        *,
+        session_id: str,
+        update,
+        working_messages: list[TranscriptItem],
+        records: list,
+        tool_call_ids: list[str],
+        tool_result_message_ids: list[str],
+        tool_use_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        if update.kind == "progress" and update.progress_payload is not None:
+            progress_item = self._build_tool_progress_item(update)
+            self._session_store.append_message(session_id, progress_item)
+            working_messages.append(progress_item)
+            return tool_use_context
+        if update.kind == "context" and update.new_context is not None:
+            return dict(update.new_context)
+        if update.kind != "record" or update.record is None:
+            return tool_use_context
+        record = update.record
+        records.append(record)
+        tool_call_ids.append(record.tool_call_id)
+        tool_result_item = TranscriptItem(
+            role=RuntimeMessageRole.TOOL_RESULT,
+            content=record.result.content,
+            name=record.request.name,
+            metadata={
+                "status": record.status,
+                "is_error": record.result.is_error,
+                "duration_ms": record.duration_ms,
+            },
+            payload={
+                "tool_use_id": record.request.id,
+                "tool_call_id": record.tool_call_id,
+                "tool_name": record.request.name,
+                "input": record.request.input,
+                "output": record.result.output_payload,
+                "error_message": record.error_message,
+            },
+        )
+        tool_result_message_ids.append(self._session_store.append_message(session_id, tool_result_item))
+        working_messages.append(tool_result_item)
+        return tool_use_context
+
+    def _append_streaming_assistant_message(self, *, session_id: str, working_messages: list[TranscriptItem], content: str) -> str:
+        assistant_item = TranscriptItem(role=RuntimeMessageRole.ASSISTANT, content=content)
+        message_id = self._session_store.append_message(session_id, assistant_item)
+        assistant_item.payload = {"message_id": message_id}
+        working_messages.append(assistant_item)
+        return message_id
+
+    @staticmethod
+    def _update_working_message_content(working_messages: list[TranscriptItem], message_id: str, content: str) -> None:
+        for item in reversed(working_messages):
+            if item.role is RuntimeMessageRole.ASSISTANT and item.payload.get("message_id") == message_id:
+                item.content = content
+                return
+
+    def _append_tool_use_message(self, *, session_id: str, working_messages: list[TranscriptItem], request: ToolCallRequest) -> None:
+        tool_use_item = TranscriptItem(
+            role=RuntimeMessageRole.TOOL_USE,
+            content=request.name,
+            name=request.name,
+            payload={"tool_use_id": request.id, "tool_name": request.name, "input": request.input},
+        )
+        self._session_store.append_message(session_id, tool_use_item)
+        working_messages.append(tool_use_item)
+
+    @staticmethod
+    def _tool_request_from_event(event: dict[str, Any], *, fallback_index: int) -> ToolCallRequest | None:
+        tool_call = dict((event or {}).get("tool_call") or {})
+        name = str(tool_call.get("name") or "").strip()
+        if not name:
+            return None
+        return ToolCallRequest(
+            id=str(tool_call.get("id") or f"tool-use-{fallback_index}"),
+            name=name,
+            input=dict(tool_call.get("input") or {}),
+        )
+
+    @staticmethod
+    def _build_tool_progress_item(update) -> TranscriptItem:
+        payload = dict(update.progress_payload or {})
+        message = str(payload.get("message") or payload.get("event") or "Tool progress")
+        return TranscriptItem(
+            role=RuntimeMessageRole.SYSTEM,
+            content=message,
+            name="tool_progress",
+            metadata={"synthetic": True, "kind": "tool_progress", "hidden_from_model": True},
+            payload=payload,
+        )
 
     def _persist_runtime_hook_events(
         self,
