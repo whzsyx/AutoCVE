@@ -4,6 +4,7 @@ import type { AuditSessionDetail, AuditSessionMessage, AuditSessionStreamEvent }
 export interface CreateDirectAuditSessionRequest {
   project_id: string;
   content: string;
+  guardrails_enabled?: boolean;
 }
 
 export async function listDirectAuditSessions(projectId: string): Promise<AuditSessionDetail[]> {
@@ -76,6 +77,14 @@ export async function streamCreateDirectAuditSession(
 
 export async function getDirectAuditSession(sessionId: string): Promise<AuditSessionDetail> {
   const response = await apiClient.get(`/agent-direct-audit/sessions/${sessionId}`);
+  return response.data;
+}
+
+export async function updateDirectAuditGuardrails(
+  sessionId: string,
+  enabled: boolean,
+): Promise<AuditSessionDetail> {
+  const response = await apiClient.patch(`/agent-direct-audit/sessions/${sessionId}/guardrails`, { enabled });
   return response.data;
 }
 

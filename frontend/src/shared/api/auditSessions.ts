@@ -86,6 +86,7 @@ export interface AuditSessionDetail {
   state: string;
   system_prompt?: string | null;
   recon_payload?: Record<string, unknown> | null;
+  guardrails_enabled?: boolean;
   created_at: string;
   updated_at: string;
 }

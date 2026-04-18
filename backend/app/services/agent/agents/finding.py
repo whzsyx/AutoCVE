@@ -427,6 +427,15 @@ class FindingAgent(AnalysisWorkflowAgent):
             user_id=user_id,
         )
 
+    def _resolve_runtime_max_turns(self, context: Dict[str, Any]) -> Optional[int]:
+        config = context.get("config", {}) or {}
+        raw_value = config.get("finding_runtime_max_iterations")
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
     async def _run_runtime_stack(self, input_data: Dict[str, Any]):
         start_time = time.time()
         context = self._get_project_context(input_data)
@@ -463,7 +472,7 @@ class FindingAgent(AnalysisWorkflowAgent):
             recon_payload=context.get("recon_data", {}) or {},
             user_message=initial_message,
             model_name=self.agent_type.value,
-            max_turns=self.config.max_iterations,
+            max_turns=self._resolve_runtime_max_turns(context),
         )
         final_payload = bridge_result.get("final_payload") or {
             "findings": [],

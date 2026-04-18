@@ -15,6 +15,9 @@ class EnterPlanModeRuntimeTool(RuntimeTool):
     name = "EnterPlanMode"
     description = "Enter shared plan mode for the current session"
     input_model = PlanModeInput
+    should_defer = True
+    always_load = True
+    search_hint = "enter plan mode"
 
     def __init__(self, session_store):
         super().__init__()
@@ -40,6 +43,9 @@ class ExitPlanModeRuntimeTool(RuntimeTool):
     name = "ExitPlanMode"
     description = "Exit shared plan mode for the current session"
     input_model = PlanModeInput
+    should_defer = True
+    always_load = True
+    search_hint = "exit plan mode"
 
     def __init__(self, session_store):
         super().__init__()

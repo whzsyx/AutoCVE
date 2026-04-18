@@ -35,6 +35,19 @@ function getApprovalState(toolCall: AuditSessionToolCall) {
   };
 }
 
+function getApprovalLabel(toolCall: AuditSessionToolCall, approvalState: ReturnType<typeof getApprovalState>) {
+  if (!approvalState) {
+    return null;
+  }
+  if (toolCall.tool_name === "Write") {
+    return "批准写入此文件";
+  }
+  if (toolCall.tool_name === "Bash" || toolCall.tool_name === "PowerShell") {
+    return `批准运行${toolCall.tool_name}`;
+  }
+  return "批准此次操作";
+}
+
 function ToolTraceCard({
   toolCall,
   onApproveToolCall,
@@ -47,11 +60,17 @@ function ToolTraceCard({
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const approvalState = getApprovalState(toolCall);
-  const canApprove =
-    Boolean(approvalState && onApproveToolCall) &&
-    toolCall.tool_name === "Write" &&
-    approvalState.guardrailCode === "source_write_requires_approval";
+  const canApprove = Boolean(
+    approvalState &&
+      onApproveToolCall &&
+      (
+        (toolCall.tool_name === "Write" && approvalState.guardrailCode !== "artifact_exists_requires_overwrite") ||
+        ((toolCall.tool_name === "Bash" || toolCall.tool_name === "PowerShell") &&
+          approvalState.guardrailCode === "shell_command_requires_approval")
+      ),
+  );
   const approvalLoading = approvalLoadingToolCallId === toolCall.id;
+  const approvalLabel = getApprovalLabel(toolCall, approvalState);
 
   const detailJson = useMemo(
     () => ({
@@ -125,7 +144,7 @@ function ToolTraceCard({
                 onClick={() => void onApproveToolCall?.(toolCall)}
               >
                 {approvalLoading ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="mr-1.5 h-3.5 w-3.5" />}
-                {approvalLoading ? "批准中..." : "批准写入此文件"}
+                {approvalLoading ? "批准中..." : approvalLabel}
               </Button>
             </div>
           ) : null}

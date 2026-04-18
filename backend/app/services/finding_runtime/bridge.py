@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import inspect
 import re
-from typing import Any, Callable
+from typing import Any, AsyncGenerator, Callable
 
 from app.db.session import get_sync_session_factory
 from app.services.agent.json_parser import AgentJsonParser
@@ -53,14 +53,7 @@ class RuntimeLLMModelClient:
         max_output_tokens_override: int | None = None,
     ) -> RuntimeModelResponse:
         del model_name
-        messages: list[dict[str, str]] = []
-        effective_system_prompt = (system_prompt or "").strip()
-        if recon_payload:
-            recon_text = "Runtime recon payload:\n" + json.dumps(recon_payload, ensure_ascii=False, indent=2)
-            effective_system_prompt = f"{effective_system_prompt}\n\n{recon_text}".strip() if effective_system_prompt else recon_text
-        if effective_system_prompt:
-            messages.append({"role": "system", "content": effective_system_prompt})
-        messages.extend(mapped for item in transcript if (mapped := self._map_transcript_item(item)) is not None)
+        messages = self._build_messages(system_prompt=system_prompt, recon_payload=recon_payload, transcript=transcript)
         response = await self._llm_service.chat_completion(
             messages=messages,
             agent_type=self._agent_type,
@@ -131,6 +124,73 @@ class RuntimeLLMModelClient:
             usage=dict(final_event.get("usage") or {}),
         )
 
+    async def stream_complete(
+        self,
+        *,
+        system_prompt: str | None,
+        recon_payload: dict[str, Any],
+        transcript: list[Any],
+        model_name: str,
+        tool_definitions: list[dict[str, Any]],
+        max_output_tokens_override: int | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        del model_name
+        messages = self._build_messages(system_prompt=system_prompt, recon_payload=recon_payload, transcript=transcript)
+        stream_fn = getattr(self._llm_service, "chat_completion_stream", None)
+        if callable(stream_fn):
+            accumulated = ""
+            async for event in stream_fn(
+                messages=messages,
+                agent_type=self._agent_type,
+                tools=[self._to_llm_tool_schema(item) for item in tool_definitions],
+                parallel_tool_calls=True,
+                max_tokens=max_output_tokens_override,
+            ):
+                normalized = self._normalize_stream_event(event, accumulated=accumulated)
+                if normalized is None:
+                    continue
+                if normalized.get("type") == "content_delta":
+                    accumulated = normalized.get("accumulated") or accumulated
+                if normalized.get("type") == "done":
+                    for tool_call in list(normalized.get("tool_calls") or []):
+                        yield {"type": "tool_call", "tool_call": tool_call}
+                yield normalized
+                if normalized.get("type") == "done":
+                    return
+
+        response = await self.complete(
+            system_prompt=system_prompt,
+            recon_payload=recon_payload,
+            transcript=transcript,
+            model_name="finding",
+            tool_definitions=tool_definitions,
+            max_output_tokens_override=max_output_tokens_override,
+        )
+        if response.content:
+            yield {"type": "content_delta", "content": response.content, "accumulated": response.content}
+        for tool_call in response.tool_calls:
+            yield {"type": "tool_call", "tool_call": tool_call}
+        yield {
+            "type": "done",
+            "content": response.content,
+            "stop_reason": response.stop_reason,
+            "recoverable_error_kind": response.recoverable_error_kind,
+            "recoverable_error_message": response.recoverable_error_message,
+            "tool_calls": [],
+        }
+
+    @staticmethod
+    def _build_messages(*, system_prompt: str | None, recon_payload: dict[str, Any], transcript: list[Any]) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        effective_system_prompt = (system_prompt or "").strip()
+        if recon_payload:
+            recon_text = "Runtime recon payload:\n" + json.dumps(recon_payload, ensure_ascii=False, indent=2)
+            effective_system_prompt = f"{effective_system_prompt}\n\n{recon_text}".strip() if effective_system_prompt else recon_text
+        if effective_system_prompt:
+            messages.append({"role": "system", "content": effective_system_prompt})
+        messages.extend(mapped for item in transcript if (mapped := RuntimeLLMModelClient._map_transcript_item(item)) is not None)
+        return messages
+
     @staticmethod
     def _classify_recoverable_error_kind(response: dict[str, Any]) -> str | None:
         finish_reason = str(response.get("finish_reason") or "").strip().lower()
@@ -139,6 +199,36 @@ class RuntimeLLMModelClient:
         error_type = str(response.get("error_type") or "").strip().lower()
         if error_type in {"prompt_too_long", "image_error", "media_size", "max_output_tokens"}:
             return error_type
+        return None
+
+    @staticmethod
+    def _normalize_stream_event(event: dict[str, Any], *, accumulated: str) -> dict[str, Any] | None:
+        payload = dict(event or {})
+        event_type = str(payload.get("type") or "").strip().lower()
+        if event_type == "token":
+            content = str(payload.get("content") or "")
+            next_accumulated = str(payload.get("accumulated") or (accumulated + content))
+            if not content:
+                return None
+            return {"type": "content_delta", "content": content, "accumulated": next_accumulated}
+        if event_type == "tool_call":
+            raw_tool_call = payload.get("tool_call") or payload
+            return {"type": "tool_call", "tool_call": RuntimeLLMModelClient._normalize_tool_call(raw_tool_call)}
+        if event_type == "done":
+            tool_calls = [RuntimeLLMModelClient._normalize_tool_call(item) for item in payload.get("tool_calls") or []]
+            response_payload = {
+                "finish_reason": payload.get("stop_reason") or payload.get("finish_reason") or "stop",
+                "error_type": payload.get("recoverable_error_kind"),
+                "error_message": payload.get("recoverable_error_message") or payload.get("error_message"),
+            }
+            return {
+                "type": "done",
+                "content": str(payload.get("content") or payload.get("accumulated") or accumulated),
+                "stop_reason": payload.get("stop_reason") or payload.get("finish_reason") or "stop",
+                "recoverable_error_kind": RuntimeLLMModelClient._classify_recoverable_error_kind(response_payload),
+                "recoverable_error_message": str(payload.get("recoverable_error_message") or payload.get("error_message") or "").strip() or None,
+                "tool_calls": tool_calls,
+            }
         return None
 
     @staticmethod
@@ -210,7 +300,7 @@ class FindingRuntimeBridge:
         recon_payload: dict[str, Any],
         user_message: str,
         model_name: str = "finding-runtime",
-        max_turns: int = 8,
+        max_turns: int | None = None,
     ) -> dict[str, Any]:
         model_client = RuntimeLLMModelClient(llm_service=self._llm_service, agent_type="finding")
         tool_registry = self._build_tool_registry()
@@ -263,6 +353,7 @@ class FindingRuntimeBridge:
         user_message: str,
         model_name: str = "finding-runtime",
         max_turns: int = 8,
+        on_session_created: Callable[[str], Any] | None = None,
     ) -> dict[str, Any]:
         model_client = RuntimeLLMModelClient(llm_service=self._llm_service, agent_type="finding")
         tool_registry = self._build_tool_registry()
@@ -287,6 +378,7 @@ class FindingRuntimeBridge:
             recon_payload=recon_payload,
             user_message=user_message,
             model_name=model_name,
+            on_session_created=on_session_created,
         )
 
     async def run_chat_session_stream(
@@ -336,7 +428,7 @@ class FindingRuntimeBridge:
         *,
         session_id: str,
         model_name: str = "finding-runtime",
-        max_turns: int = 8,
+        max_turns: int | None = None,
     ) -> dict[str, Any]:
         return await self.continue_session_until_payload(
             session_id=session_id,
@@ -422,7 +514,7 @@ class FindingRuntimeBridge:
         payload_extractor: Callable[[Any], Any | None],
         finalizer_prompts: list[str],
         model_name: str = "finding-runtime",
-        max_turns: int = 8,
+        max_turns: int | None = None,
         fallback_payload_builder: Callable[[Any], Any] | None = None,
     ) -> dict[str, Any]:
         model_client = RuntimeLLMModelClient(llm_service=self._llm_service, agent_type="finding")
@@ -474,7 +566,7 @@ class FindingRuntimeBridge:
         *,
         session_id: str,
         model_name: str,
-        max_turns: int,
+        max_turns: int | None,
         model_client: RuntimeLLMModelClient,
         runner_result: TurnExecutionResult | dict[str, Any] | None,
         payload_extractor: Callable[[Any], Any | None],
@@ -507,7 +599,7 @@ class FindingRuntimeBridge:
                 model_client=model_client,
                 tool_registry=finalizer_registry,
                 tool_orchestrator=None,
-                max_turns=max(1, min(2, max_turns)),
+                max_turns=2 if max_turns is None else max(1, min(2, max_turns)),
             )
             await runner.run_once(session_id=session_id, model_name=model_name)
             snapshot = self._session_store.load_session_snapshot(session_id)

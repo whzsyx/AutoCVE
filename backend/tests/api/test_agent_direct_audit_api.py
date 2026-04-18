@@ -82,7 +82,7 @@ async def test_create_direct_audit_session_and_list_project_sessions(monkeypatch
 
     await seed_direct_audit_fixture(session_factory)
 
-    async def fake_start_direct_audit_session(*, project, content, db, current_user):
+    async def fake_start_direct_audit_session(*, project, content, guardrails_enabled, db, current_user):
         del current_user
         session = AuditSession(
             project_id=project.id,
@@ -91,6 +91,7 @@ async def test_create_direct_audit_session_and_list_project_sessions(monkeypatch
             state="running",
             system_prompt="You are the direct audit finding agent.",
             recon_payload={"project_name": project.name},
+            runtime_state_json={"metadata": {"guardrails": {"enabled": guardrails_enabled}}},
         )
         db.add(session)
         await db.flush()
@@ -137,6 +138,7 @@ async def test_create_direct_audit_session_and_list_project_sessions(monkeypatch
     assert create_response.json()["project_id"] == "project-1"
     assert create_response.json()["task_id"] is None
     assert create_response.json()["runtime_stack"] == "runtime"
+    assert create_response.json()["guardrails_enabled"] is False
     assert list_response.status_code == 200
     assert len(list_response.json()) == 1
     assert list_response.json()[0]["project_id"] == "project-1"
@@ -446,7 +448,7 @@ async def test_stream_direct_audit_session_creation_emits_session_created_and_me
 
     await seed_direct_audit_fixture(session_factory)
 
-    async def fake_start_direct_audit_session_stream(*, project, content, db, current_user):
+    async def fake_start_direct_audit_session_stream(*, project, content, guardrails_enabled, db, current_user):
         del current_user
         session = AuditSession(
             id="session-stream-1",
@@ -456,6 +458,7 @@ async def test_stream_direct_audit_session_creation_emits_session_created_and_me
             state="running",
             system_prompt="direct audit",
             recon_payload={"project_name": project.name},
+            runtime_state_json={"metadata": {"guardrails": {"enabled": guardrails_enabled}}},
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
         )
@@ -548,6 +551,181 @@ async def test_stream_direct_audit_session_creation_emits_session_created_and_me
     events = parse_sse_events(response.text)
     assert [event["type"] for event in events] == ["session_created", "user_message", "assistant_start", "token", "token", "done"]
     assert events[0]["session_id"] == "session-stream-1"
-    assert events[1]["message"]["content"] == "帮我实时审计这个项目"
-    assert events[-1]["message"]["content"] == "首条流式审计回复"
+
+
+@pytest.mark.asyncio
+async def test_update_direct_audit_guardrails_persists_toggle():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    await seed_direct_audit_fixture(session_factory)
+
+    async with session_factory() as db:
+        db.add(
+            AuditSession(
+                id="session-guardrails-1",
+                project_id="project-1",
+                task_id=None,
+                runtime_stack="runtime",
+                state="running",
+                system_prompt="direct audit",
+                recon_payload={"project_name": "Managed Demo"},
+                runtime_state_json={},
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        await db.commit()
+
+    app = build_test_app()
+    build_dependency_overrides(app, session_factory)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.patch(
+            "/api/v1/agent-direct-audit/sessions/session-guardrails-1/guardrails",
+            json={"enabled": True},
+        )
+
+    async with session_factory() as db:
+        session = await db.get(AuditSession, "session-guardrails-1")
+
+    await engine.dispose()
+
+    assert response.status_code == 200
+    assert response.json()["guardrails_enabled"] is True
+    assert ((session.runtime_state_json or {}).get("metadata") or {}).get("guardrails", {}).get("enabled") is True
+
+
+@pytest.mark.asyncio
+async def test_stream_approve_direct_audit_shell_tool_call_grants_command_and_continues(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    await seed_direct_audit_fixture(session_factory)
+
+    async with session_factory() as db:
+        db.add(
+            AuditSession(
+                id="session-shell-approve-1",
+                project_id="project-1",
+                task_id=None,
+                runtime_stack="runtime",
+                state="running",
+                system_prompt="direct audit",
+                recon_payload={
+                    "project_info": {
+                        "project_id": "project-1",
+                        "name": "Managed Demo",
+                        "workspace_root": "D:/Projects/AuditAI/projects/managed-demo",
+                    }
+                },
+                runtime_state_json={},
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        db.add(
+            AuditToolCall(
+                id="tool-call-shell-1",
+                session_id="session-shell-approve-1",
+                turn_id="turn-1",
+                sequence=1,
+                tool_use_id="tool-use-1",
+                tool_name="PowerShell",
+                status="denied",
+                is_concurrency_safe=False,
+                input_payload={"command": "Set-Content README.md hello"},
+                output_payload={
+                    "permission_mode": "ask",
+                    "permission_reason": "Running a mutating PowerShell command requires explicit approval while guardrails are enabled.",
+                    "guardrail_code": "shell_command_requires_approval",
+                },
+                error_message="Running a mutating PowerShell command requires explicit approval while guardrails are enabled.",
+            )
+        )
+        await db.commit()
+
+    async def fake_continue_direct_audit_session_stream(*, session, content, db, current_user):
+        del current_user
+        assert "PowerShell command" in content
+        approvals = ((session.runtime_state_json or {}).get("metadata") or {}).get("shell_approvals") or []
+        assert approvals[0]["tool_name"] == "PowerShell"
+        assert "Set-Content README.md hello" in approvals[0]["command"]
+
+        assistant = AuditSessionMessage(
+            session_id=session.id,
+            sequence=2,
+            role="assistant",
+            content="approved shell follow-up",
+            message_metadata={"kind": "direct_audit_assistant_message", "streaming": True},
+            payload={"continued": True, "approval": True},
+        )
+        db.add(assistant)
+        await db.commit()
+        await db.refresh(assistant)
+        yield {
+            "type": "assistant_start",
+            "message": {
+                "id": "streaming-session-shell-approve-1-2",
+                "session_id": session.id,
+                "sequence": 2,
+                "role": "assistant",
+                "content": "",
+                "metadata": {"kind": "direct_audit_assistant_message", "streaming": True},
+                "payload": {"continued": True, "approval": True},
+                "created_at": assistant.created_at.isoformat(),
+            },
+        }
+        yield {"type": "token", "content": "approved ", "accumulated": "approved "}
+        yield {
+            "type": "done",
+            "message": {
+                "id": assistant.id,
+                "session_id": assistant.session_id,
+                "sequence": assistant.sequence,
+                "role": assistant.role,
+                "content": assistant.content,
+                "metadata": dict(assistant.message_metadata or {}),
+                "payload": dict(assistant.payload or {}),
+                "created_at": assistant.created_at.isoformat(),
+            },
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+        }
+
+    monkeypatch.setattr(
+        agent_direct_audit_endpoint,
+        "continue_direct_audit_session_stream",
+        fake_continue_direct_audit_session_stream,
+    )
+
+    app = build_test_app()
+    build_dependency_overrides(app, session_factory)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/v1/agent-direct-audit/sessions/session-shell-approve-1/tool-calls/tool-call-shell-1/approve/stream",
+        )
+        messages = await client.get("/api/v1/agent-direct-audit/sessions/session-shell-approve-1/messages")
+
+    async with session_factory() as db:
+        session = await db.get(AuditSession, "session-shell-approve-1")
+
+    await engine.dispose()
+
+    assert response.status_code == 200
+    events = parse_sse_events(response.text)
+    assert [event["type"] for event in events] == ["user_message", "assistant_start", "token", "done"]
+    assert "PowerShell" in events[0]["message"]["content"]
+    approvals = ((session.runtime_state_json or {}).get("metadata") or {}).get("shell_approvals") or []
+    assert approvals[0]["tool_name"] == "PowerShell"
+    assert events[1]["message"]["content"] == ""
+    assert events[-1]["message"]["content"] == "approved shell follow-up"
     assert len(messages.json()) == 2

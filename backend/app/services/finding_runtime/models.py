@@ -66,6 +66,7 @@ class ToolExecutionPayload:
     output_payload: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     is_error: bool = False
+    context_modifier: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -77,6 +78,7 @@ class ToolExecutionRecord:
     result: ToolExecutionPayload
     error_message: str | None = None
     duration_ms: int | None = None
+    lifecycle: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

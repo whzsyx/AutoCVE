@@ -22,6 +22,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { AuditTimeline } from "@/pages/AuditSession/components/AuditTimeline";
 import { FindingsSidebar } from "@/pages/AuditSession/components/FindingsSidebar";
@@ -33,7 +34,13 @@ import { ToolTracePanel } from "@/pages/AuditSession/components/ToolTracePanel";
 import { useAuditSession } from "@/pages/AuditSession/hooks/useAuditSession";
 import { useAuditSessionChatStream } from "@/pages/AuditSession/hooks/useAuditSessionChatStream";
 import { useAuditSessionStream } from "@/pages/AuditSession/hooks/useAuditSessionStream";
-import { listDirectAuditSessions, streamApproveDirectAuditToolCall, streamCreateDirectAuditSession, streamDirectAuditSessionMessage } from "@/shared/api/agentDirectAudit";
+import {
+  listDirectAuditSessions,
+  streamApproveDirectAuditToolCall,
+  streamCreateDirectAuditSession,
+  streamDirectAuditSessionMessage,
+  updateDirectAuditGuardrails,
+} from "@/shared/api/agentDirectAudit";
 import type { AuditSessionMessage, AuditSessionStreamEvent } from "@/shared/api/auditSessions";
 import { api } from "@/shared/config/database";
 import type { Project, ProjectFileContent } from "@/shared/types";
@@ -195,9 +202,11 @@ export default function AgentDirectAuditPage() {
   const [filePreviewError, setFilePreviewError] = useState<string | null>(null);
   const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [starterPrompt, setStarterPrompt] = useState("");
+  const [createGuardrailsEnabled, setCreateGuardrailsEnabled] = useState(false);
   const [creatingSession, setCreatingSession] = useState(false);
   const [createStreamError, setCreateStreamError] = useState<string | null>(null);
   const [approvalToolCallId, setApprovalToolCallId] = useState<string | null>(null);
+  const [guardrailUpdating, setGuardrailUpdating] = useState(false);
   const createAbortRef = useRef<AbortController | null>(null);
   const createStreamingAssistantIdRef = useRef<string | null>(null);
 
@@ -216,6 +225,7 @@ export default function AgentDirectAuditPage() {
 
   const fileTree = useMemo(() => buildFileTree(projectFiles), [projectFiles]);
   const previewLines = useMemo(() => buildPreviewLines(filePreview), [filePreview]);
+  const guardrailsEnabled = selectedSessionId ? Boolean(session?.guardrails_enabled) : createGuardrailsEnabled;
 
   useAuditSessionStream(
     () => refresh({ silent: true }),
@@ -431,6 +441,7 @@ export default function AgentDirectAuditPage() {
         {
           project_id: selectedProjectId,
           content,
+          guardrails_enabled: createGuardrailsEnabled,
         },
         {
           signal: createAbortRef.current.signal,
@@ -527,6 +538,23 @@ export default function AgentDirectAuditPage() {
     await reloadSessions(selectedSessionId);
   }
 
+  async function handleGuardrailsChange(checked: boolean) {
+    if (!selectedSessionId) {
+      setCreateGuardrailsEnabled(checked);
+      return;
+    }
+    setGuardrailUpdating(true);
+    try {
+      await updateDirectAuditGuardrails(selectedSessionId, checked);
+      await refresh();
+      toast.success(checked ? "已开启直审 guardrails" : "已关闭直审 guardrails");
+    } catch (guardrailError) {
+      toast.error(guardrailError instanceof Error ? guardrailError.message : "更新 guardrails 失败");
+    } finally {
+      setGuardrailUpdating(false);
+    }
+  }
+
   async function handleApproveToolCall(toolCall: (typeof toolCalls)[number]) {
     if (!selectedSessionId) {
       toast.error("当前没有可批准的直审会话");
@@ -536,9 +564,9 @@ export default function AgentDirectAuditPage() {
     try {
       await runStreamRequest((handlers) => streamApproveDirectAuditToolCall(selectedSessionId, toolCall.id, handlers));
       await reloadSessions(selectedSessionId);
-      toast.success("已批准该文件写入，finding agent 正在继续执行");
+      toast.success("已批准该工具调用，finding agent 正在继续执行");
     } catch (approvalError) {
-      toast.error(approvalError instanceof Error ? approvalError.message : "批准写入失败");
+      toast.error(approvalError instanceof Error ? approvalError.message : "批准工具调用失败");
     } finally {
       setApprovalToolCallId(null);
     }
@@ -625,6 +653,22 @@ export default function AgentDirectAuditPage() {
                     </div>
                   </div>
                 ) : null}
+                <div className="rounded-[22px] border border-[rgba(210,220,214,.85)] bg-[rgba(248,250,248,.92)] p-4 shadow-[0_10px_24px_rgba(103,120,109,.04)]">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="space-y-1">
+                      <p className="text-sm font-semibold text-slate-900">Guardrails</p>
+                      <p className="text-xs leading-5 text-slate-500">
+                        默认关闭，避免影响工作流自动化。开启后，源码写入和可变更 shell 命令会进入显式批准流程。
+                      </p>
+                    </div>
+                    <Switch checked={guardrailsEnabled} onCheckedChange={handleGuardrailsChange} disabled={guardrailUpdating || creatingSession} />
+                  </div>
+                  <div className="mt-3">
+                    <Badge variant="outline" className="rounded-full text-[11px]">
+                      {guardrailsEnabled ? "当前已开启" : selectedSessionId ? "当前已关闭" : "新会话默认关闭"}
+                    </Badge>
+                  </div>
+                </div>
               </CardContent>
             </Card>
 

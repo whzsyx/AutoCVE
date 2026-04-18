@@ -21,6 +21,7 @@ from app.api.v1.endpoints.audit_sessions import (
     _format_sse_event,
     _build_agent_user_config,
     _to_message_response,
+    _to_session_response,
 )
 from app.core.config import settings
 from app.core.encryption import decrypt_sensitive_data
@@ -31,6 +32,10 @@ from app.models.user import User
 from app.services.agent.tools.sandbox_tool import SandboxManager
 from app.services.finding_runtime.bridge import FindingRuntimeBridge
 from app.services.llm.service import LLMService
+from app.services.runtime_core.runtime_guardrails import (
+    register_shell_approval,
+    set_guardrails_enabled,
+)
 from app.services.runtime_core.runtime_tool_registry import CanonicalWriteTool
 from app.services.runtime_core.session_state import SessionRuntimeState as SharedSessionRuntimeState
 
@@ -42,6 +47,11 @@ DEFAULT_DIRECT_AUDIT_MAX_TURNS = 8
 class DirectAuditSessionCreate(BaseModel):
     project_id: str
     content: str
+    guardrails_enabled: bool = False
+
+
+class DirectAuditGuardrailUpdate(BaseModel):
+    enabled: bool
 
 
 def _build_direct_audit_system_prompt(project: Project) -> str:
@@ -188,43 +198,93 @@ async def _get_owned_direct_tool_call(
     return session, tool_call
 
 
-def _build_direct_audit_approval_content(*, path: str) -> str:
+async def _apply_direct_audit_guardrail_setting(*, session_id: str, db: AsyncSession, enabled: bool) -> AuditSession:
+    session = await db.get(AuditSession, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Audit session not found")
+    runtime_payload = dict(session.runtime_state_json or {})
+    runtime_payload["session_id"] = session.id
+    runtime_state = SharedSessionRuntimeState.model_validate(runtime_payload)
+    set_guardrails_enabled(runtime_state, enabled)
+    session.runtime_state_json = runtime_state.model_dump(mode="json")
+    await db.commit()
+    await db.refresh(session)
+    return session
+
+
+def _build_direct_audit_write_approval_content(*, path: str) -> str:
     return (
         f"I approve writing to `{path}` for this direct-audit session. "
         "Please retry the previously blocked write if it is still needed, then continue the audit and explain what changed."
     )
 
 
-def _grant_write_approval(session: AuditSession, tool_call: AuditToolCall) -> str:
+def _build_direct_audit_shell_approval_content(*, tool_name: str, command: str) -> str:
+    return (
+        f"I approve running the {tool_name} command `{command}` for this direct-audit session. "
+        "Please retry the blocked command if it is still needed, then continue the audit and explain what changed."
+    )
+
+
+def _grant_tool_call_approval(session: AuditSession, tool_call: AuditToolCall) -> dict[str, Any]:
     input_payload = dict(tool_call.input_payload or {})
     output_payload = dict(tool_call.output_payload or {})
-    target_path = str(input_payload.get("path") or "").strip()
-    if not target_path:
-        raise HTTPException(status_code=400, detail="Tool call is missing a writable path")
-    if tool_call.tool_name != "Write":
-        raise HTTPException(status_code=400, detail="Only Write tool approvals are supported in this phase")
     if str(output_payload.get("permission_mode") or "") != "ask":
         raise HTTPException(status_code=400, detail="Tool call does not require approval")
-    if str(output_payload.get("guardrail_code") or "") != "source_write_requires_approval":
-        raise HTTPException(status_code=400, detail="This guardrail is not yet approveable in Agent Direct Audit")
 
     runtime_payload = dict(session.runtime_state_json or {})
     runtime_payload["session_id"] = session.id
     runtime_state = SharedSessionRuntimeState.model_validate(runtime_payload)
-    CanonicalWriteTool.register_approval(
-        runtime_state,
-        path=target_path,
-        guardrail_code="source_write_requires_approval",
-        tool_call_id=tool_call.id,
-    )
-    session.runtime_state_json = runtime_state.model_dump(mode="json")
-    return target_path
+    guardrail_code = str(output_payload.get("guardrail_code") or "").strip()
+
+    if tool_call.tool_name == "Write":
+        target_path = str(input_payload.get("path") or "").strip()
+        if not target_path:
+            raise HTTPException(status_code=400, detail="Tool call is missing a writable path")
+        CanonicalWriteTool.register_approval(
+            runtime_state,
+            path=target_path,
+            guardrail_code=guardrail_code or "source_write_requires_approval",
+            tool_call_id=tool_call.id,
+        )
+        session.runtime_state_json = runtime_state.model_dump(mode="json")
+        return {
+            "approval_content": _build_direct_audit_write_approval_content(path=target_path),
+            "payload": {
+                "path": target_path,
+                "guardrail_code": guardrail_code or "source_write_requires_approval",
+            },
+        }
+
+    if tool_call.tool_name in {"Bash", "PowerShell"}:
+        command = str(input_payload.get("command") or "").strip()
+        if not command:
+            raise HTTPException(status_code=400, detail="Tool call is missing a shell command")
+        register_shell_approval(
+            runtime_state,
+            tool_name=tool_call.tool_name,
+            command=command,
+            guardrail_code=guardrail_code or "shell_command_requires_approval",
+            tool_call_id=tool_call.id,
+        )
+        session.runtime_state_json = runtime_state.model_dump(mode="json")
+        return {
+            "approval_content": _build_direct_audit_shell_approval_content(tool_name=tool_call.tool_name, command=command),
+            "payload": {
+                "tool_name": tool_call.tool_name,
+                "command": command,
+                "guardrail_code": guardrail_code or "shell_command_requires_approval",
+            },
+        }
+
+    raise HTTPException(status_code=400, detail="This tool is not yet approveable in Agent Direct Audit")
 
 
 async def start_direct_audit_session(
     *,
     project: Project,
     content: str,
+    guardrails_enabled: bool,
     db: AsyncSession,
     current_user: User,
 ) -> AuditSession:
@@ -234,6 +294,13 @@ async def start_direct_audit_session(
         current_user=current_user,
     )
     try:
+        async def handle_session_created(session_id: str):
+            await _apply_direct_audit_guardrail_setting(
+                session_id=session_id,
+                db=db,
+                enabled=guardrails_enabled,
+            )
+
         result = await bridge.run_chat_session(
             project_id=project.id,
             task_id=None,
@@ -242,6 +309,7 @@ async def start_direct_audit_session(
             user_message=content,
             model_name=model_name,
             max_turns=max_turns,
+            on_session_created=handle_session_created,
         )
     finally:
         try:
@@ -259,6 +327,7 @@ async def start_direct_audit_session_stream(
     *,
     project: Project,
     content: str,
+    guardrails_enabled: bool,
     db: AsyncSession,
     current_user: User,
 ):
@@ -271,6 +340,11 @@ async def start_direct_audit_session_stream(
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
         async def handle_session_created(session_id: str):
+            await _apply_direct_audit_guardrail_setting(
+                session_id=session_id,
+                db=db,
+                enabled=guardrails_enabled,
+            )
             await queue.put({"type": "session_created", "session_id": session_id, "project_id": project.id})
 
         async def handle_user_message_created(message_id: str):
@@ -407,7 +481,7 @@ async def list_direct_audit_sessions(
         )
         .order_by(AuditSession.updated_at.desc(), AuditSession.created_at.desc())
     )
-    return [AuditSessionResponse.model_validate(item) for item in result.scalars().all()]
+    return [_to_session_response(item) for item in result.scalars().all()]
 
 
 @router.post("/sessions", response_model=AuditSessionResponse)
@@ -420,10 +494,11 @@ async def create_direct_audit_session(
     session = await start_direct_audit_session(
         project=project,
         content=payload.content,
+        guardrails_enabled=payload.guardrails_enabled,
         db=db,
         current_user=current_user,
     )
-    return AuditSessionResponse.model_validate(session)
+    return _to_session_response(session)
 
 
 @router.post("/sessions/stream")
@@ -439,6 +514,7 @@ async def stream_create_direct_audit_session(
             async for event in start_direct_audit_session_stream(
                 project=project,
                 content=payload.content,
+                guardrails_enabled=payload.guardrails_enabled,
                 db=db,
                 current_user=current_user,
             ):
@@ -461,7 +537,23 @@ async def get_direct_audit_session(
     current_user: User = Depends(deps.get_current_user),
 ) -> AuditSessionResponse:
     session = await _get_owned_direct_session(session_id=session_id, db=db, current_user=current_user)
-    return AuditSessionResponse.model_validate(session)
+    return _to_session_response(session)
+
+
+@router.patch("/sessions/{session_id}/guardrails", response_model=AuditSessionResponse)
+async def update_direct_audit_guardrails(
+    session_id: str,
+    payload: DirectAuditGuardrailUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> AuditSessionResponse:
+    await _get_owned_direct_session(session_id=session_id, db=db, current_user=current_user)
+    session = await _apply_direct_audit_guardrail_setting(
+        session_id=session_id,
+        db=db,
+        enabled=payload.enabled,
+    )
+    return _to_session_response(session)
 
 
 @router.get("/sessions/{session_id}/messages", response_model=list[AuditSessionMessageResponse])
@@ -572,8 +664,9 @@ async def stream_approve_direct_audit_tool_call(
         db=db,
         current_user=current_user,
     )
-    approved_path = _grant_write_approval(session, tool_call)
-    approval_content = _build_direct_audit_approval_content(path=approved_path)
+    approval = _grant_tool_call_approval(session, tool_call)
+    approval_content = str(approval.get("approval_content") or "").strip()
+    approval_payload = dict(approval.get("payload") or {})
     next_sequence = await db.scalar(
         select(func.max(AuditSessionMessage.sequence)).where(AuditSessionMessage.session_id == session_id)
     )
@@ -592,7 +685,7 @@ async def stream_approve_direct_audit_tool_call(
             "streaming": True,
             "approval": True,
             "tool_call_id": tool_call.id,
-            "path": approved_path,
+            **approval_payload,
         },
     )
     db.add(user_message)

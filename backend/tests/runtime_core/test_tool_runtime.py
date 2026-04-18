@@ -142,10 +142,15 @@ def test_shared_tool_runtime_emits_pre_and_post_hooks_for_allowed_tool():
     )
 
     snapshot = store.load_session_snapshot(session_id)
+    hook_events = [
+        checkpoint.state_payload["event"]
+        for checkpoint in snapshot.checkpoints
+        if checkpoint.state_payload.get("kind") == "runtime_hook"
+    ]
 
     assert records[0].status == AuditToolCallStatus.COMPLETED.value
     assert records[0].result.output_payload == {"echo": "alpha", "agent": "finding"}
-    assert [checkpoint.state_payload["event"] for checkpoint in snapshot.checkpoints] == ["PreToolUse", "PostToolUse"]
+    assert hook_events == ["PreToolUse", "PostToolUse"]
 
 
 class ScopedReadInput(BaseModel):
@@ -334,8 +339,11 @@ def test_canonical_write_tool_requires_approval_for_source_tree_writes():
     store = build_store()
     session_id = store.create_session(project_id="project-1")
     turn_id = store.open_turn(session_id, model_name="gpt-test")
+    runtime_state = store.load_runtime_state(session_id)
+    runtime_state.metadata["guardrails"] = {"enabled": True}
+    store.replace_runtime_state(session_id, runtime_state)
     project_root = build_workspace_temp_dir()
-    registry = ToolRegistry([CanonicalWriteTool()])
+    registry = ToolRegistry([CanonicalWriteTool(session_store=store)])
     orchestrator = ToolOrchestrator(session_store=store, tool_registry=registry, agent_type="finding")
     try:
         records = asyncio.run(
@@ -374,11 +382,54 @@ def test_canonical_write_tool_requires_approval_for_source_tree_writes():
         shutil.rmtree(project_root, ignore_errors=True)
 
 
+def test_canonical_write_tool_allows_source_tree_write_when_guardrails_are_disabled():
+    store = build_store()
+    session_id = store.create_session(project_id="project-1")
+    turn_id = store.open_turn(session_id, model_name="gpt-test")
+    project_root = build_workspace_temp_dir()
+    registry = ToolRegistry([CanonicalWriteTool(session_store=store)])
+    orchestrator = ToolOrchestrator(session_store=store, tool_registry=registry, agent_type="finding")
+    try:
+        records = asyncio.run(
+            orchestrator.execute_tool_calls(
+                session_id=session_id,
+                turn_id=turn_id,
+                session=type(
+                    "SessionRef",
+                    (),
+                    {
+                        "recon_payload": {
+                            "project_info": {
+                                "workspace_root": str(project_root),
+                                "name": "demo-project",
+                            }
+                        }
+                    },
+                )(),
+                recon_payload={"project_info": {"workspace_root": str(project_root), "name": "demo-project"}},
+                tool_calls=[
+                    ToolCallRequest(
+                        id="tool-1",
+                        name="Write",
+                        input={"path": "src/app.py", "content": "print('mutate')", "overwrite": True},
+                    )
+                ],
+            )
+        )
+        written_file = project_root / "src" / "app.py"
+
+        assert records[0].status == AuditToolCallStatus.COMPLETED.value
+        assert written_file.read_text(encoding="utf-8") == "print('mutate')"
+    finally:
+        shutil.rmtree(project_root, ignore_errors=True)
+
+
 def test_canonical_write_tool_allows_session_approved_source_tree_write():
     store = build_store()
     session_id = store.create_session(project_id="project-1")
     turn_id = store.open_turn(session_id, model_name="gpt-test")
     runtime_state = store.load_runtime_state(session_id)
+    runtime_state.metadata["guardrails"] = {"enabled": True}
     runtime_state.metadata["write_approvals"] = [
         {
             "path": "src/app.py",

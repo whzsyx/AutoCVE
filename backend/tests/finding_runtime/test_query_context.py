@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.services.finding_runtime.models import RuntimeMessageRole, TranscriptItem
+import app.services.finding_runtime.query_context as query_context
 from app.services.finding_runtime.query_context import (
     apply_context_collapse_if_needed,
     apply_history_snip,
@@ -8,9 +9,6 @@ from app.services.finding_runtime.query_context import (
     apply_tool_result_budget,
     evaluate_blocking_limit,
     get_messages_after_compact_boundary,
-    project_context_collapse,
-    run_reactive_compact,
-    run_proactive_autocompact,
 )
 from app.services.finding_runtime.query_state import QueryLoopState
 
@@ -82,23 +80,12 @@ def test_apply_microcompact_truncates_large_tool_result_payloads():
     assert result[1].metadata["microcompacted"] is True
 
 
-def test_project_context_collapse_replaces_prefix_with_summary_message():
-    state = QueryLoopState(auto_compact_tracking={
-        "projected_summary": "Earlier turns covered controller routing and auth entrypoints.",
-        "projected_drop_count": 2,
-    })
-    messages = [
-        TranscriptItem(role=RuntimeMessageRole.USER, content="m1"),
-        TranscriptItem(role=RuntimeMessageRole.ASSISTANT, content="m2"),
-        TranscriptItem(role=RuntimeMessageRole.USER, content="m3"),
-    ]
 
-    result = project_context_collapse(messages, state)
 
-    assert result[0].name == "context_collapse_summary"
-    assert result[0].content == "Earlier turns covered controller routing and auth entrypoints."
-    assert [item.content for item in result[1:]] == ["m3"]
-
+def test_query_context_no_longer_exports_legacy_inline_compaction_helpers():
+    assert not hasattr(query_context, "project_context_collapse")
+    assert not hasattr(query_context, "run_proactive_autocompact")
+    assert not hasattr(query_context, "run_reactive_compact")
 
 def test_apply_context_collapse_if_needed_stages_and_projects_summary_view():
     state = QueryLoopState(
@@ -150,91 +137,6 @@ def test_apply_context_collapse_if_needed_replays_persisted_commit_view():
     assert projected_messages[0].metadata["collapse_id"] == "0000000000000001"
     assert projected_messages[-1].content == "tail"
     assert next_state.context_collapse_state["commits"][0]["summary_uuid"] == "summary-1"
-
-
-def test_run_proactive_autocompact_compacts_large_transcript_and_updates_tracking():
-    state = QueryLoopState(tool_use_context={"autocompact": {"max_chars": 30, "preserve_tail_messages": 1}})
-    messages = [
-        TranscriptItem(role=RuntimeMessageRole.USER, content="A" * 20),
-        TranscriptItem(role=RuntimeMessageRole.ASSISTANT, content="B" * 20),
-        TranscriptItem(role=RuntimeMessageRole.USER, content="tail"),
-    ]
-
-    compacted_messages, next_state = run_proactive_autocompact(messages, state)
-
-    assert compacted_messages[0].name == "auto_compact_summary"
-    assert compacted_messages[-1].content == "tail"
-    assert next_state.auto_compact_tracking["compacted"] is True
-    assert next_state.auto_compact_tracking["summary_message_name"] == "auto_compact_summary"
-
-
-def test_run_reactive_compact_builds_restored_style_post_compact_messages():
-    state = QueryLoopState(tool_use_context={"reactive_compact": {"preserve_tail_messages": 1}})
-    messages = [
-        TranscriptItem(role=RuntimeMessageRole.USER, content="controller mapping"),
-        TranscriptItem(role=RuntimeMessageRole.ASSISTANT, content="auth sink reasoning"),
-        TranscriptItem(role=RuntimeMessageRole.USER, content="tail"),
-    ]
-
-    compacted_messages, next_state = run_reactive_compact(
-        messages,
-        state,
-        recoverable_error_kind="prompt_too_long",
-    )
-
-    assert compacted_messages[0].name == "reactive_compact_boundary"
-    assert compacted_messages[1].name == "reactive_compact_summary"
-    assert compacted_messages[-1].content == "tail"
-    assert next_state.auto_compact_tracking["summary_message_name"] == "reactive_compact_summary"
-
-
-def test_run_reactive_compact_strips_media_blocks_for_media_recovery():
-    state = QueryLoopState(tool_use_context={"reactive_compact": {"preserve_tail_messages": 1}})
-    messages = [
-        TranscriptItem(
-            role=RuntimeMessageRole.USER,
-            content="see screenshot evidence",
-            payload={
-                "content_blocks": [
-                    {"type": "image", "source": "img-1"},
-                    {"type": "text", "text": "see screenshot evidence"},
-                ]
-            },
-        ),
-        TranscriptItem(role=RuntimeMessageRole.ASSISTANT, content="tail"),
-    ]
-
-    compacted_messages, next_state = run_reactive_compact(
-        messages,
-        state,
-        recoverable_error_kind="media_size",
-    )
-
-    assert compacted_messages[0].name == "reactive_compact_boundary"
-    assert "[image]" in compacted_messages[1].content
-    assert next_state.auto_compact_tracking["media_stripped_count"] == 1
-
-
-def test_run_proactive_autocompact_uses_restored_style_threshold_controller_when_present():
-    state = QueryLoopState(
-        tool_use_context={
-            "autocompact": {"preserve_tail_messages": 1},
-            "autocompact_controller": {"context_window": 20000, "max_output_tokens": 40},
-        }
-    )
-    messages = [
-        TranscriptItem(role=RuntimeMessageRole.USER, content="A" * 7000),
-        TranscriptItem(role=RuntimeMessageRole.ASSISTANT, content="B" * 30),
-        TranscriptItem(role=RuntimeMessageRole.USER, content="tail"),
-    ]
-
-    compacted_messages, next_state = run_proactive_autocompact(messages, state)
-
-    assert compacted_messages[0].name == "auto_compact_summary"
-    assert compacted_messages[-1].content == "tail"
-    assert next_state.auto_compact_tracking["auto_compact_threshold"] == 6960
-    assert next_state.auto_compact_tracking["effective_context_window"] == 19960
-
 
 
 def test_evaluate_blocking_limit_uses_restored_style_controller_when_present():

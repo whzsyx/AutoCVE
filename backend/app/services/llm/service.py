@@ -334,6 +334,18 @@ class LLMService:
             operation_name=f"{config.provider.value} chat completion",
         )
 
+
+    async def _execute_chat_completion_stream(self, adapter: Any, request: LLMRequest, config: LLMConfig):
+        semaphore = self._get_provider_semaphore(config)
+
+        async with semaphore:
+            await self._await_provider_gap(config)
+            try:
+                async for event in adapter.stream_complete(request):
+                    yield event
+            except Exception as exc:  # noqa: BLE001
+                raise self._normalize_retryable_llm_error(exc) from exc
+
     def _build_analysis_schema(self) -> str:
         return json.dumps(
             {
@@ -455,21 +467,18 @@ class LLMService:
     ) -> AsyncGenerator[Dict[str, Any], None]:
         config = self.get_agent_config(agent_type)
         adapter = LLMFactory.create_adapter(config)
-
-        if hasattr(adapter, "stream_complete"):
-            semaphore = self._get_provider_semaphore(config)
-            async with semaphore:
-                await self._await_provider_gap(config)
-                request = LLMRequest(
-                    messages=[LLMMessage(role=item["role"], content=item["content"]) for item in messages],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    parallel_tool_calls=parallel_tool_calls,
-                    stream=True,
-                )
-                async for event in adapter.stream_complete(request):
-                    yield event
+        request = LLMRequest(
+            messages=[LLMMessage(role=item["role"], content=item["content"]) for item in messages],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            parallel_tool_calls=parallel_tool_calls,
+            stream=True,
+        )
+        stream_complete = getattr(adapter, "stream_complete", None)
+        if callable(stream_complete):
+            async for event in self._execute_chat_completion_stream(adapter, request, config):
+                yield event
             return
 
         result = await self.chat_completion(
@@ -487,12 +496,14 @@ class LLMService:
             token = content[index:index + chunk_size]
             accumulated += token
             yield {"type": "token", "content": token, "accumulated": accumulated}
+        for tool_call in result.get("tool_calls") or []:
+            yield {"type": "tool_call", "tool_call": tool_call}
         yield {
             "type": "done",
             "content": content,
             "usage": result.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             "tool_calls": result.get("tool_calls") or [],
-            "finish_reason": result.get("finish_reason"),
+            "finish_reason": result.get("finish_reason") or "stop",
         }
 
     def _clean_text(self, text: str) -> str:

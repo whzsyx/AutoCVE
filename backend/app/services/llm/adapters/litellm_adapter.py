@@ -328,11 +328,9 @@ class LiteLLMAdapter(BaseLLMAdapter):
 
     async def stream_complete(self, request: LLMRequest):
         """
-        流式调用 LLM，逐 token 返回
-
-        Yields:
-            dict: {"type": "token", "content": str} 或 {"type": "done", "content": str, "usage": dict}
+        Stream model output and surface provider-native tool call events.
         """
+        import json
         import litellm
 
         await self.validate_config()
@@ -341,8 +339,6 @@ class LiteLLMAdapter(BaseLLMAdapter):
         litellm.drop_params = True
 
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-
-        # 🔥 估算输入 token 数量（用于在无法获取真实 usage 时进行估算）
         input_tokens_estimate = sum(
             estimate_tokens(msg["content"], self.config.model) for msg in messages
         )
@@ -352,29 +348,97 @@ class LiteLLMAdapter(BaseLLMAdapter):
             "messages": messages,
             "temperature": request.temperature if request.temperature is not None else self.config.temperature,
             "max_tokens": request.max_tokens if request.max_tokens is not None else self.config.max_tokens,
-            "stream": True,  # 启用流式输出
+            "stream": True,
         }
 
-        # Claude 不允许同时传 temperature 和 top_p
         if self.config.provider != LLMProvider.CLAUDE:
             kwargs["top_p"] = request.top_p if request.top_p is not None else self.config.top_p
-
-        # 🔥 对于支持的模型，请求在流式输出中包含 usage 信息
-        # OpenAI API 支持 stream_options
+        if request.tools:
+            kwargs["tools"] = request.tools
+        if request.parallel_tool_calls is not None:
+            kwargs["parallel_tool_calls"] = request.parallel_tool_calls
         if self.config.provider in [LLMProvider.OPENAI, LLMProvider.DEEPSEEK]:
             kwargs["stream_options"] = {"include_usage": True}
-
         if self.config.api_key and self.config.api_key != "ollama":
             kwargs["api_key"] = self.config.api_key
-
         if self._api_base:
             kwargs["api_base"] = self._api_base
-
         kwargs["timeout"] = self.config.timeout
 
         accumulated_content = ""
-        final_usage = None  # 🔥 存储最终的 usage 信息
-        chunk_count = 0  # 🔥 跟踪 chunk 数量
+        final_usage = None
+        chunk_count = 0
+        partial_tool_calls: Dict[int, Dict[str, Any]] = {}
+        emitted_tool_calls: set[int] = set()
+
+        def _as_dictish(value, field=None, default=None):
+            if isinstance(value, dict):
+                if field is None:
+                    return value
+                return value.get(field, default)
+            if field is None:
+                return value
+            return getattr(value, field, default)
+
+        def _iter_delta_tool_calls(delta):
+            for raw in _as_dictish(delta, "tool_calls", []) or []:
+                function = _as_dictish(raw, "function", {}) or {}
+                yield {
+                    "index": _as_dictish(raw, "index", 0) or 0,
+                    "id": _as_dictish(raw, "id", "") or "",
+                    "type": _as_dictish(raw, "type", "function") or "function",
+                    "name": _as_dictish(function, "name", "") or "",
+                    "arguments": _as_dictish(function, "arguments", "") or "",
+                }
+
+        def _is_complete_json(arguments: str) -> bool:
+            if not arguments or not arguments.strip():
+                return False
+            try:
+                json.loads(arguments)
+            except Exception:
+                return False
+            return True
+
+        def _normalize_stream_tool_call(index: int, state: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "id": state.get("id") or f"tool_call_{index}",
+                "type": state.get("type") or "function",
+                "name": state.get("name") or "",
+                "arguments": state.get("arguments") or "{}",
+            }
+
+        def _collect_ready_tool_calls(delta, *, force_flush: bool = False) -> List[Dict[str, Any]]:
+            ready: List[Dict[str, Any]] = []
+            for tool_delta in _iter_delta_tool_calls(delta):
+                index = int(tool_delta.get("index") or 0)
+                state = partial_tool_calls.setdefault(
+                    index,
+                    {"id": "", "type": "function", "name": "", "arguments": ""},
+                )
+                if tool_delta.get("id"):
+                    state["id"] = tool_delta["id"]
+                if tool_delta.get("type"):
+                    state["type"] = tool_delta["type"]
+                if tool_delta.get("name"):
+                    state["name"] = f"{state['name']}{tool_delta['name']}"
+                if tool_delta.get("arguments"):
+                    state["arguments"] = f"{state['arguments']}{tool_delta['arguments']}"
+                if index in emitted_tool_calls:
+                    continue
+                if state.get("name") and _is_complete_json(state.get("arguments") or ""):
+                    emitted_tool_calls.add(index)
+                    ready.append(_normalize_stream_tool_call(index, state))
+
+            if force_flush:
+                for index, state in sorted(partial_tool_calls.items()):
+                    if index in emitted_tool_calls:
+                        continue
+                    if not state.get("name"):
+                        continue
+                    emitted_tool_calls.add(index)
+                    ready.append(_normalize_stream_tool_call(index, state))
+            return ready
 
         try:
             response = await litellm.acompletion(**kwargs)
@@ -382,7 +446,6 @@ class LiteLLMAdapter(BaseLLMAdapter):
             async for chunk in response:
                 chunk_count += 1
 
-                # 🔥 检查是否有 usage 信息（某些 API 会在最后的 chunk 中包含）
                 if hasattr(chunk, "usage") and chunk.usage:
                     final_usage = {
                         "prompt_tokens": chunk.usage.prompt_tokens or 0,
@@ -391,13 +454,13 @@ class LiteLLMAdapter(BaseLLMAdapter):
                     }
                     logger.debug(f"Got usage from chunk: {final_usage}")
 
-                if not chunk.choices:
-                    # 🔥 某些模型可能发送没有 choices 的 chunk（如心跳）
+                if not getattr(chunk, "choices", None):
                     continue
 
-                delta = chunk.choices[0].delta
-                content = getattr(delta, "content", "") or ""
-                finish_reason = chunk.choices[0].finish_reason
+                choice = chunk.choices[0]
+                delta = getattr(choice, "delta", None) or {}
+                content = _as_dictish(delta, "content", "") or ""
+                finish_reason = getattr(choice, "finish_reason", None)
 
                 if content:
                     accumulated_content += content
@@ -406,27 +469,24 @@ class LiteLLMAdapter(BaseLLMAdapter):
                         "content": content,
                         "accumulated": accumulated_content,
                     }
-                # 🔥 ENHANCED: 处理没有 content 但也没有 finish_reason 的情况
-                # 某些模型（如智谱 GLM）可能在某些 chunk 中不返回内容
+
+                for tool_call in _collect_ready_tool_calls(delta):
+                    yield {"type": "tool_call", "tool_call": tool_call}
 
                 if finish_reason:
-                    # 流式完成
-                    # 🔥 如果没有从 chunk 获取到 usage，进行估算
+                    for tool_call in _collect_ready_tool_calls(delta, force_flush=True):
+                        yield {"type": "tool_call", "tool_call": tool_call}
                     if not final_usage:
-                        output_tokens_estimate = estimate_tokens(
-                            accumulated_content, self.config.model
-                        )
+                        output_tokens_estimate = estimate_tokens(accumulated_content, self.config.model)
                         final_usage = {
                             "prompt_tokens": input_tokens_estimate,
                             "completion_tokens": output_tokens_estimate,
                             "total_tokens": input_tokens_estimate + output_tokens_estimate,
                         }
-                        logger.debug(f"Estimated usage: {final_usage}")
-
-                    # 🔥 ENHANCED: 如果累积内容为空但有 finish_reason，记录警告
-                    if not accumulated_content:
-                        logger.warning(f"Stream completed with no content after {chunk_count} chunks, finish_reason={finish_reason}")
-
+                    if not accumulated_content and not partial_tool_calls:
+                        logger.warning(
+                            f"Stream completed with no content after {chunk_count} chunks, finish_reason={finish_reason}"
+                        )
                     yield {
                         "type": "done",
                         "content": accumulated_content,
@@ -434,45 +494,38 @@ class LiteLLMAdapter(BaseLLMAdapter):
                         "finish_reason": finish_reason,
                     }
                     break
-
-            # 🔥 ENHANCED: 如果循环结束但没有收到 finish_reason，也需要返回 done
-            if accumulated_content:
-                logger.warning(f"Stream ended without finish_reason, returning accumulated content ({len(accumulated_content)} chars)")
-                if not final_usage:
-                    output_tokens_estimate = estimate_tokens(
-                        accumulated_content, self.config.model
-                    )
-                    final_usage = {
-                        "prompt_tokens": input_tokens_estimate,
-                        "completion_tokens": output_tokens_estimate,
-                        "total_tokens": input_tokens_estimate + output_tokens_estimate,
+            else:
+                if accumulated_content or partial_tool_calls:
+                    for tool_call in _collect_ready_tool_calls({}, force_flush=True):
+                        yield {"type": "tool_call", "tool_call": tool_call}
+                    if not final_usage:
+                        output_tokens_estimate = estimate_tokens(accumulated_content, self.config.model)
+                        final_usage = {
+                            "prompt_tokens": input_tokens_estimate,
+                            "completion_tokens": output_tokens_estimate,
+                            "total_tokens": input_tokens_estimate + output_tokens_estimate,
+                        }
+                    yield {
+                        "type": "done",
+                        "content": accumulated_content,
+                        "usage": final_usage,
+                        "finish_reason": "complete",
                     }
-                yield {
-                    "type": "done",
-                    "content": accumulated_content,
-                    "usage": final_usage,
-                    "finish_reason": "complete",
-                }
 
         except litellm.exceptions.RateLimitError as e:
-            # 速率限制错误 - 需要特殊处理
             logger.error(f"Stream rate limit error: {e}")
             error_msg = str(e)
-            # 区分"余额不足"和"频率超限"
-            if any(keyword in error_msg.lower() for keyword in ["余额不足", "资源包", "充值", "quota", "exceeded", "billing"]):
+            if any(keyword in error_msg.lower() for keyword in ["quota", "insufficient", "balance", "billing"]):
                 error_type = "quota_exceeded"
-                user_message = "API 配额已用尽，请检查账户余额或升级计划"
+                user_message = "API quota exceeded or account balance is insufficient."
             else:
                 error_type = "rate_limit"
-                # 尝试从错误消息中提取重试时间
-                import re
-                retry_match = re.search(r"retry\s*(?:in|after)\s*(\d+(?:\.\d+)?)\s*s", error_msg, re.IGNORECASE)
+                import re as _re
+                retry_match = _re.search(r"retry\s*(?:in|after)\s*(\d+(?:\.\d+)?)\s*s", error_msg, _re.IGNORECASE)
                 retry_seconds = float(retry_match.group(1)) if retry_match else 60
-                user_message = f"API 调用频率超限，建议等待 {int(retry_seconds)} 秒后重试"
+                user_message = f"API rate limit reached. Retry after about {int(retry_seconds)} seconds."
 
-            output_tokens_estimate = estimate_tokens(
-                accumulated_content, self.config.model
-            ) if accumulated_content else 0
+            output_tokens_estimate = estimate_tokens(accumulated_content, self.config.model) if accumulated_content else 0
             yield {
                 "type": "error",
                 "error_type": error_type,
@@ -487,59 +540,50 @@ class LiteLLMAdapter(BaseLLMAdapter):
             }
 
         except litellm.exceptions.AuthenticationError as e:
-            # 认证错误 - API Key 无效
             logger.error(f"Stream authentication error: {e}")
             yield {
                 "type": "error",
                 "error_type": "authentication",
                 "error": str(e),
-                "user_message": "API Key 无效或已过期，请检查配置",
+                "user_message": "API Key ???????????????????",
                 "accumulated": accumulated_content,
                 "usage": None,
             }
 
         except litellm.exceptions.APIConnectionError as e:
-            # 连接错误 - 网络问题
             logger.error(f"Stream connection error: {e}")
             yield {
                 "type": "error",
                 "error_type": "connection",
                 "error": str(e),
-                "user_message": "无法连接到 API 服务，请检查网络连接",
+                "user_message": "????????API ????????????????",
                 "accumulated": accumulated_content,
                 "usage": None,
             }
 
         except Exception as e:
-            # 其他错误 - 检查是否是包装的速率限制错误
             error_msg = str(e)
             logger.error(f"Stream error: {e}")
-
-            # 检查是否是包装的速率限制错误（如 ServiceUnavailableError 包装 RateLimitError）
             is_rate_limit = any(keyword in error_msg.lower() for keyword in [
                 "ratelimiterror", "rate limit", "429", "resource_exhausted",
                 "quota exceeded", "too many requests"
             ])
 
             if is_rate_limit:
-                # 按速率限制错误处理
-                import re
-                # 检查是否是配额用尽
+                import re as _re
                 if any(keyword in error_msg.lower() for keyword in ["quota", "exceeded", "billing"]):
                     error_type = "quota_exceeded"
-                    user_message = "API 配额已用尽，请检查账户余额或升级计划"
+                    user_message = "API quota exceeded or account balance is insufficient."
                 else:
                     error_type = "rate_limit"
-                    retry_match = re.search(r"retry\s*(?:in|after)\s*(\d+(?:\.\d+)?)\s*s", error_msg, re.IGNORECASE)
+                    retry_match = _re.search(r"retry\s*(?:in|after)\s*(\d+(?:\.\d+)?)\s*s", error_msg, _re.IGNORECASE)
                     retry_seconds = float(retry_match.group(1)) if retry_match else 60
-                    user_message = f"API 调用频率超限，建议等待 {int(retry_seconds)} 秒后重试"
+                    user_message = f"API rate limit reached. Retry after about {int(retry_seconds)} seconds."
             else:
                 error_type = "unknown"
-                user_message = "LLM 调用发生错误，请重试"
+                user_message = "LLM streaming request failed. Please retry."
 
-            output_tokens_estimate = estimate_tokens(
-                accumulated_content, self.config.model
-            ) if accumulated_content else 0
+            output_tokens_estimate = estimate_tokens(accumulated_content, self.config.model) if accumulated_content else 0
             yield {
                 "type": "error",
                 "error_type": error_type,

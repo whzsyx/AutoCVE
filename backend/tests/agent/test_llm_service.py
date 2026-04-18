@@ -71,23 +71,37 @@ class _ToolingProbeAdapter:
 class _StreamingProbeAdapter:
     def __init__(self):
         self.request = None
+        self.complete_called = False
+
+    async def complete(self, request):
+        self.complete_called = True
+        raise AssertionError("chat_completion_stream should use adapter.stream_complete")
 
     async def stream_complete(self, request):
         self.request = request
-        yield {"type": "token", "content": "流", "accumulated": "流"}
+        yield {"type": "token", "content": "Need ", "accumulated": "Need "}
+        yield {
+            "type": "tool_call",
+            "tool_call": {
+                "id": "call_1",
+                "type": "function",
+                "name": "Read",
+                "arguments": "{\"file_path\":\"README.md\"}",
+            },
+        }
         yield {
             "type": "done",
-            "content": "流式输出",
-            "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+            "content": "Need tool",
+            "finish_reason": "tool_calls",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19},
             "tool_calls": [
                 {
-                    "id": "call-1",
+                    "id": "call_1",
                     "type": "function",
                     "name": "Read",
-                    "arguments": "{\"file_path\":\"app.py\"}",
+                    "arguments": "{\"file_path\":\"README.md\"}",
                 }
             ],
-            "finish_reason": "stop",
         }
 
 
@@ -204,7 +218,7 @@ def test_llm_service_uses_runtime_env_fallbacks_for_provider_config():
 
 
 @pytest.mark.asyncio
-async def test_llm_service_streams_from_adapter_when_available(monkeypatch):
+async def test_llm_service_chat_completion_stream_preserves_provider_tool_call_events(monkeypatch):
     adapter = _StreamingProbeAdapter()
     service = LLMService(
         user_config={
@@ -220,7 +234,7 @@ async def test_llm_service_streams_from_adapter_when_available(monkeypatch):
 
     events = []
     async for event in service.chat_completion_stream(
-        messages=[{"role": "user", "content": "stream this"}],
+        messages=[{"role": "user", "content": "use tools"}],
         tools=[
             {
                 "type": "function",
@@ -235,9 +249,11 @@ async def test_llm_service_streams_from_adapter_when_available(monkeypatch):
     ):
         events.append(event)
 
-    assert [event["type"] for event in events] == ["token", "done"]
-    assert events[-1]["content"] == "流式输出"
-    assert events[-1]["tool_calls"][0]["name"] == "Read"
+    assert [event["type"] for event in events] == ["token", "tool_call", "done"]
+    assert events[1]["tool_call"]["name"] == "Read"
+    assert events[2]["finish_reason"] == "tool_calls"
+    assert events[2]["tool_calls"][0]["name"] == "Read"
     assert adapter.request is not None
     assert adapter.request.stream is True
     assert adapter.request.parallel_tool_calls is True
+    assert adapter.complete_called is False

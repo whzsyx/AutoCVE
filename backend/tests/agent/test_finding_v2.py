@@ -2107,3 +2107,79 @@ async def test_finding_agent_recover_final_result_prefers_checkpoint_findings(tm
 
     assert recovered["findings"]
     assert recovered["findings"][0]["title"] == "Recovered finding"
+
+
+@pytest.mark.asyncio
+async def test_finding_runtime_stack_defaults_to_unbounded_max_turns(monkeypatch):
+    captured = {}
+
+    class FakeBridge:
+        async def run(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "session_id": "session-1",
+                "final_payload": {"findings": [], "summary": "done"},
+                "skill_route": {},
+                "memory_counts": {},
+            }
+
+        def record_handoff(self, session_id, payload):
+            del session_id, payload
+
+    agent = FindingAgent(llm_service=MagicMock(), tools={}, event_emitter=MagicMock())
+    monkeypatch.setattr(agent, "_build_runtime_bridge", lambda user_id: FakeBridge())
+    monkeypatch.setattr(
+        "app.services.agent.skill_service.SkillService.resolve_agent_skills",
+        AsyncMock(return_value={"route_plan": {}, "matched": [], "metadata": []}),
+    )
+
+    result = await agent.run(
+        {
+            "project_id": "project-1",
+            "project_info": {"name": "demo", "project_id": "project-1", "root": "."},
+            "config": {"finding_runtime_stack": "runtime"},
+            "task": "audit",
+            "previous_results": {},
+        }
+    )
+
+    assert result.success is True
+    assert captured["max_turns"] is None
+
+
+@pytest.mark.asyncio
+async def test_finding_runtime_stack_uses_explicit_runtime_turn_limit(monkeypatch):
+    captured = {}
+
+    class FakeBridge:
+        async def run(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "session_id": "session-1",
+                "final_payload": {"findings": [], "summary": "done"},
+                "skill_route": {},
+                "memory_counts": {},
+            }
+
+        def record_handoff(self, session_id, payload):
+            del session_id, payload
+
+    agent = FindingAgent(llm_service=MagicMock(), tools={}, event_emitter=MagicMock())
+    monkeypatch.setattr(agent, "_build_runtime_bridge", lambda user_id: FakeBridge())
+    monkeypatch.setattr(
+        "app.services.agent.skill_service.SkillService.resolve_agent_skills",
+        AsyncMock(return_value={"route_plan": {}, "matched": [], "metadata": []}),
+    )
+
+    await agent.run(
+        {
+            "project_id": "project-1",
+            "project_info": {"name": "demo", "project_id": "project-1", "root": "."},
+            "config": {"finding_runtime_stack": "runtime", "finding_runtime_max_iterations": 7},
+            "task": "audit",
+            "previous_results": {},
+        }
+    )
+
+    assert captured["max_turns"] == 7
+

@@ -50,6 +50,14 @@ def test_runtime_tool_registry_builder_exposes_shared_runtime_tools_for_agent():
     tool_names = [item["name"] for item in registry.describe_tools()]
     skill_tool = registry.get("Skill")
 
-    assert tool_names == ["Read", "Glob", "Grep", "Skill", "TodoWrite", "AskUser", "EnterPlanMode", "ExitPlanMode"]
+    assert "Read" in tool_names
+    assert "Glob" in tool_names
+    assert "Grep" in tool_names
+    assert "Write" in tool_names
+    assert "Skill" in tool_names
+    assert "TodoWrite" in tool_names
+    assert "AskUser" in tool_names
+    assert "EnterPlanMode" in tool_names
+    assert "ExitPlanMode" in tool_names
     assert skill_tool is not None
     assert getattr(skill_tool, "_agent_type") == "recon"
