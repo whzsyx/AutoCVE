@@ -5,6 +5,7 @@ import inspect
 from app.services.agent.skill_service import SkillService
 from app.services.runtime_core.memory_runtime import RuntimeMemoryManager, build_memory_message
 from app.services.finding_runtime.models import RuntimeMessageRole, TranscriptItem
+from app.services.finding_runtime.query_transitions import hydrate_query_loop_state
 from app.services.finding_runtime.skills import RuntimeSkillCatalog
 from app.services.runtime_core.skill_discovery import SkillDiscoveryScheduler
 
@@ -116,6 +117,7 @@ class FindingRuntimeAdapter:
     async def refresh_session_context(self, *, session_id: str) -> dict:
         snapshot = self._session_store.load_session_snapshot(session_id)
         runtime_state = self._session_store.load_runtime_state(session_id)
+        query_loop_state = self._session_store.load_query_loop_state(session_id)
         base_system_prompt = str(runtime_state.metadata.get("base_system_prompt") or snapshot.session.system_prompt or "").strip()
         effective_user_message = self._resolve_latest_user_message(snapshot.messages, runtime_state.metadata.get("last_user_message"))
         recon_payload = dict(snapshot.session.recon_payload or {})
@@ -143,6 +145,20 @@ class FindingRuntimeAdapter:
             user_message=effective_user_message,
             skill_context=skill_context,
             discovery_snapshot=discovery_snapshot,
+        )
+        refreshed_transcript = [
+            TranscriptItem(
+                role=RuntimeMessageRole(message.role),
+                content=message.content,
+                name=message.name,
+                metadata=dict(message.message_metadata or {}),
+                payload=dict(message.payload or {}),
+            )
+            for message in snapshot.messages
+        ]
+        self._session_store.save_query_loop_state(
+            session_id,
+            hydrate_query_loop_state(query_loop_state, messages=refreshed_transcript),
         )
         return {
             "prompt": skill_context.prompt,

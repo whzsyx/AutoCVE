@@ -13,6 +13,8 @@ from app.services.finding_runtime.models import ToolExecutionPayload
 from app.services.finding_runtime.skills import RuntimeSkillTool
 from app.services.runtime_core.permission_runtime import ToolPermissionDecision
 from app.services.runtime_core.runtime_guardrails import (
+    APPROVAL_SCOPE_SINGLE_USE,
+    consume_write_approval,
     has_write_approval,
     is_guardrails_enabled,
     register_write_approval,
@@ -54,7 +56,7 @@ class GrepToolInput(BaseModel):
 
 
 class WriteToolInput(BaseModel):
-    path: str = Field(description="Target path relative to the project root. Managed outputs should go under .auditai/outputs/.")
+    path: str = Field(description="Target path relative to the project root. Managed outputs should go under .auditai/.")
     content: str = Field(description="Text content to write.")
     overwrite: bool = Field(default=False, description="Whether to overwrite an existing file.")
 
@@ -205,7 +207,7 @@ class CanonicalWriteTool(RuntimeTool):
     name = "Write"
     description = (
         "Write a text artifact for the current audit session. "
-        "Managed outputs are allowed under .auditai/outputs/. "
+        "Managed outputs are allowed under .auditai/. "
         "When guardrails are enabled, writes to source files or outside the project root require explicit user approval."
     )
     input_model = WriteToolInput
@@ -248,6 +250,26 @@ class CanonicalWriteTool(RuntimeTool):
             guardrail_code=guardrail_code,
         )
 
+    def _consume_matching_approval(
+        self,
+        *,
+        context: ToolExecutionContext,
+        project_root: Path,
+        resolved_path: Path,
+        guardrail_code: str,
+    ) -> None:
+        if self._session_store is None:
+            return
+        runtime_state = self._session_store.load_runtime_state(context.session_id)
+        approval = consume_write_approval(
+            runtime_state,
+            project_root=project_root,
+            resolved_path=resolved_path,
+            guardrail_code=guardrail_code,
+        )
+        if approval and str(approval.get("scope") or "") == APPROVAL_SCOPE_SINGLE_USE:
+            self._session_store.replace_runtime_state(context.session_id, runtime_state)
+
     @staticmethod
     def register_approval(
         runtime_state,
@@ -255,12 +277,14 @@ class CanonicalWriteTool(RuntimeTool):
         path: str,
         guardrail_code: str,
         tool_call_id: str | None = None,
+        scope: str | None = None,
     ) -> dict[str, Any]:
         return register_write_approval(
             runtime_state,
             path=path,
             guardrail_code=guardrail_code,
             tool_call_id=tool_call_id,
+            scope=scope,
         )
 
     async def check_permission(
@@ -312,7 +336,7 @@ class CanonicalWriteTool(RuntimeTool):
                 )
             return ToolPermissionDecision(allowed=True, source="tool_guardrail", mode="allow")
 
-        artifact_root = (project_root / ".auditai" / "outputs").resolve()
+        artifact_root = (project_root / ".auditai").resolve()
         try:
             resolved_path.relative_to(artifact_root)
         except ValueError:
@@ -328,9 +352,17 @@ class CanonicalWriteTool(RuntimeTool):
                     allowed=False,
                     source="tool_guardrail",
                     mode="ask",
-                    reason="Writing source files requires explicit approval. Use .auditai/outputs/ for generated audit artifacts.",
+                    reason="Writing source files requires explicit approval. Use .auditai/ for generated audit artifacts.",
                     guardrail_code="source_write_requires_approval",
                 )
+
+        if resolved_path.exists() and parsed_input.overwrite and guardrails_enabled and self._has_matching_approval(
+            context=context,
+            project_root=project_root,
+            resolved_path=resolved_path,
+            guardrail_code="overwrite_existing_requires_approval",
+        ):
+            return ToolPermissionDecision(allowed=True, source="tool_guardrail", mode="allow")
 
         if resolved_path.exists() and not parsed_input.overwrite:
             return ToolPermissionDecision(
@@ -341,15 +373,61 @@ class CanonicalWriteTool(RuntimeTool):
                 guardrail_code="artifact_exists_requires_overwrite",
             )
 
+        if resolved_path.exists() and parsed_input.overwrite and guardrails_enabled:
+            return ToolPermissionDecision(
+                allowed=False,
+                source="tool_guardrail",
+                mode="ask",
+                reason="Overwriting an existing file requires explicit approval while guardrails are enabled.",
+                guardrail_code="overwrite_existing_requires_approval",
+            )
+
         return ToolPermissionDecision(allowed=True, source="tool_guardrail", mode="allow")
 
     async def execute(self, parsed_input: WriteToolInput, context: ToolExecutionContext) -> ToolExecutionPayload:
         project_root = self._resolve_project_root(context)
         requested_path = Path(str(parsed_input.path or "").strip())
         resolved_path = requested_path.resolve() if requested_path.is_absolute() else (project_root / requested_path).resolve()
+        guardrails_enabled = self._guardrails_enabled(context=context)
+        if guardrails_enabled:
+            if requested_path.is_absolute():
+                self._consume_matching_approval(
+                    context=context,
+                    project_root=project_root,
+                    resolved_path=resolved_path,
+                    guardrail_code="absolute_path_requires_approval",
+                )
+            else:
+                try:
+                    resolved_path.relative_to(project_root)
+                except ValueError:
+                    self._consume_matching_approval(
+                        context=context,
+                        project_root=project_root,
+                        resolved_path=resolved_path,
+                        guardrail_code="outside_project_root_requires_approval",
+                    )
+                else:
+                    artifact_root = (project_root / ".auditai").resolve()
+                    try:
+                        resolved_path.relative_to(artifact_root)
+                    except ValueError:
+                        self._consume_matching_approval(
+                            context=context,
+                            project_root=project_root,
+                            resolved_path=resolved_path,
+                            guardrail_code="source_write_requires_approval",
+                        )
+                    if resolved_path.exists() and parsed_input.overwrite:
+                        self._consume_matching_approval(
+                            context=context,
+                            project_root=project_root,
+                            resolved_path=resolved_path,
+                            guardrail_code="overwrite_existing_requires_approval",
+                        )
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
         resolved_path.write_text(parsed_input.content, encoding="utf-8")
-        artifact_root = (project_root / ".auditai" / "outputs").resolve()
+        artifact_root = (project_root / ".auditai").resolve()
         is_managed_output = False
         try:
             resolved_path.relative_to(artifact_root)

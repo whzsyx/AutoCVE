@@ -1,7 +1,11 @@
+from pathlib import Path
 from typing import List, Optional, Union
 
 from pydantic import AnyHttpUrl, validator
 from pydantic_settings import BaseSettings
+
+
+DEFAULT_MANAGED_PROJECTS_ROOT = str(Path(__file__).resolve().parents[3] / "projects")
 
 
 class Settings(BaseSettings):
@@ -71,7 +75,7 @@ class Settings(BaseSettings):
     LLM_CONCURRENCY: int = 3
     LLM_GAP_MS: int = 2000
     ZIP_STORAGE_PATH: str = "./uploads/zip_files"
-    MANAGED_PROJECTS_ROOT: str = "./projects"
+    MANAGED_PROJECTS_ROOT: str = DEFAULT_MANAGED_PROJECTS_ROOT
     OUTPUT_LANGUAGE: str = "zh-CN"
 
     EMBEDDING_PROVIDER: str = "openai"

@@ -278,6 +278,31 @@ class RuntimeLLMModelClient:
 
 
 class FindingRuntimeBridge:
+    _RECOVERY_KEYWORDS: dict[str, tuple[str, ...]] = {
+        "ssrf": ("ssrf", "server-side request forgery"),
+        "path_traversal": ("path traversal", "directory traversal", "zip slip", "lfi", "rfi"),
+        "sql_injection": ("sql injection", "sqli"),
+        "xss": ("xss", "cross-site scripting"),
+        "auth_bypass": ("auth bypass", "authentication bypass", "authorization bypass", "未认证", "绕过", "鉴权"),
+        "idor": ("idor", "insecure direct object reference", "越权"),
+        "command_injection": ("command injection", "rce", "remote code execution"),
+        "deserialization": ("deserialization", "unsafe deserialization", "反序列化"),
+        "file_upload": ("file upload", "arbitrary file upload"),
+        "business_logic": ("business logic", "logic flaw", "race condition"),
+    }
+    _RECOVERY_SEVERITY: dict[str, str] = {
+        "ssrf": "high",
+        "path_traversal": "high",
+        "sql_injection": "critical",
+        "xss": "high",
+        "auth_bypass": "high",
+        "idor": "high",
+        "command_injection": "critical",
+        "deserialization": "critical",
+        "file_upload": "high",
+        "business_logic": "medium",
+    }
+
     def __init__(
         self,
         *,
@@ -644,9 +669,10 @@ class FindingRuntimeBridge:
 
     @classmethod
     def _default_fallback_payload(cls, snapshot: Any) -> dict[str, Any]:
+        recovered_findings = cls._recover_findings_from_assistant_transcript(snapshot)
         return {
-            'findings': [],
-            'summary': cls._fallback_summary(snapshot),
+            'findings': recovered_findings,
+            'summary': cls._fallback_summary(snapshot, recovered_findings),
         }
 
     @staticmethod
@@ -688,18 +714,95 @@ class FindingRuntimeBridge:
             return parsed
         return None
 
+    @classmethod
+    def _recover_findings_from_assistant_transcript(cls, snapshot: Any) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        seen_titles: set[str] = set()
+
+        for message in getattr(snapshot, "messages", []) or []:
+            if getattr(message, "role", "") != "assistant":
+                continue
+            content = str(getattr(message, "content", "") or "")
+            for raw_line in content.splitlines():
+                line = cls._normalize_recovery_line(raw_line)
+                if not line:
+                    continue
+                vuln_type = cls._infer_recovered_vulnerability_type(line)
+                if not vuln_type:
+                    continue
+                title = cls._normalize_recovered_title(line)
+                if not title or title in seen_titles:
+                    continue
+                seen_titles.add(title)
+                findings.append(
+                    {
+                        "vulnerability_type": vuln_type,
+                        "severity": cls._RECOVERY_SEVERITY.get(vuln_type, "high"),
+                        "title": title,
+                        "description": (
+                            "Recovered from the runtime assistant transcript after final JSON finalization failed. "
+                            f"Evidence line: {line}"
+                        ),
+                        "confidence": 0.84,
+                        "needs_verification": True,
+                        "verdict": "candidate",
+                        "verification_notes": (
+                            "Recovered from high-signal runtime transcript after finalizer failure. "
+                            "Please verify the code path before disclosure."
+                        ),
+                        "evidence_gaps": ["recovered_after_finalizer_failure"],
+                        "entry_point_refs": [],
+                        "priority_path_refs": [],
+                        "business_flow_notes": [line],
+                    }
+                )
+        return findings
+
+    @classmethod
+    def _normalize_recovery_line(cls, raw_line: str) -> str:
+        line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", str(raw_line or "").strip())
+        if not line:
+            return ""
+        lowered = line.lower()
+        if lowered.startswith("thought:") or lowered.startswith("tool call:"):
+            return ""
+        if len(line) < 6:
+            return ""
+        return line.strip().strip("`").strip()
+
+    @classmethod
+    def _infer_recovered_vulnerability_type(cls, line: str) -> str | None:
+        lowered = line.lower()
+        for vuln_type, keywords in cls._RECOVERY_KEYWORDS.items():
+            if any(keyword in lowered for keyword in keywords):
+                return vuln_type
+        return None
+
     @staticmethod
-    def _fallback_summary(snapshot: Any) -> str:
+    def _normalize_recovered_title(line: str) -> str:
+        cleaned = re.sub(r"\s*[-:：]\s*(?:明确确认|待确认|confirmed|candidate).*$", "", line, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*[（(].*?(?:策略|确认|confirmed|candidate).*?[）)]\s*$", "", cleaned, flags=re.IGNORECASE)
+        return cleaned.replace("`", "").strip()
+
+    @staticmethod
+    def _fallback_summary(snapshot: Any, recovered_findings: list[dict[str, Any]] | None = None) -> str:
+        recovered_findings = list(recovered_findings or [])
         last_assistant = ''
         for message in reversed(getattr(snapshot, 'messages', []) or []):
             if getattr(message, 'role', '') == 'assistant':
                 last_assistant = str(getattr(message, 'content', '') or '').strip()
                 if last_assistant:
                     break
+        prefix = ""
+        if recovered_findings:
+            prefix = (
+                f"Recovered {len(recovered_findings)} high-signal findings from the runtime transcript after finalizer failure. "
+            )
         if last_assistant:
             return (
-                'Runtime session ended without a machine-parseable final JSON payload. '
+                prefix
+                + 'Runtime session ended without a machine-parseable final JSON payload. '
                 f'Last assistant reply: {last_assistant[:1200]}'
             )
-        return 'Runtime session ended without a machine-parseable final JSON payload.'
+        return prefix + 'Runtime session ended without a machine-parseable final JSON payload.'
 

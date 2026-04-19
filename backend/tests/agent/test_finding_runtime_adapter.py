@@ -8,7 +8,8 @@ from sqlalchemy.orm import sessionmaker
 from app.db.base import Base
 from app.models.audit_session import AuditMemoryKind
 from app.services.finding_runtime.adapters.finding import FindingRuntimeAdapter
-from app.services.finding_runtime.models import RuntimeMemoryBundle, RuntimeMemoryRecord, RuntimeStopReason
+from app.services.finding_runtime.models import RuntimeMemoryBundle, RuntimeMemoryRecord, RuntimeMessageRole, RuntimeStopReason, TranscriptItem
+from app.services.finding_runtime.query_state import QueryLoopState
 from app.services.finding_runtime.session_store import AuditSessionStore
 
 
@@ -18,7 +19,7 @@ class FakeRunner:
 
     async def run_once(self, *, session_id: str, model_name: str):
         self.calls.append({"session_id": session_id, "model_name": model_name})
-        return {"stop_reason": RuntimeStopReason.ASSISTANT_TURN_COMPLETE.value}
+        return {"stop_reason": RuntimeStopReason.COMPLETED.value}
 
 
 class FakeSkillCatalog:
@@ -143,3 +144,55 @@ def test_finding_runtime_adapter_defaults_user_message_when_not_provided():
     snapshot = store.load_session_snapshot(result["session_id"])
 
     assert snapshot.messages[-1].content == "Continue the audit with the current Finding objective."
+
+
+def test_refresh_session_context_rehydrates_query_loop_state_with_latest_user_message():
+    store = build_store()
+    adapter = FindingRuntimeAdapter(
+        session_store=store,
+        runner=FakeRunner(),
+        skill_catalog=FakeSkillCatalog(),
+        memory_manager=FakeMemoryManager(),
+    )
+
+    result = asyncio.run(
+        adapter.run(
+            project_id="project-1",
+            task_id="task-1",
+            system_prompt="prompt",
+            recon_payload={"repo": "demo"},
+            user_message="first turn",
+        )
+    )
+
+    session_id = result["session_id"]
+    store.save_query_loop_state(
+        session_id,
+        QueryLoopState(
+            messages=[
+                TranscriptItem(
+                    role=RuntimeMessageRole.USER,
+                    content="first turn",
+                )
+            ],
+            turn_count=2,
+        ),
+    )
+    store.append_message(
+        session_id,
+        TranscriptItem(
+            role=RuntimeMessageRole.USER,
+            content="follow-up question",
+        ),
+    )
+
+    asyncio.run(adapter.refresh_session_context(session_id=session_id))
+
+    refreshed_state = store.load_query_loop_state(session_id)
+
+    assert refreshed_state.messages[-1].role == RuntimeMessageRole.USER
+    assert refreshed_state.messages[-1].content == "follow-up question"
+    assert [message.content for message in refreshed_state.messages if message.role == RuntimeMessageRole.USER] == [
+        "first turn",
+        "follow-up question",
+    ]

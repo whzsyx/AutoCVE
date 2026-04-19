@@ -1,11 +1,14 @@
 import { apiClient } from "./serverClient";
 import type { AuditSessionDetail, AuditSessionMessage, AuditSessionStreamEvent } from "./auditSessions";
+import type { ManagedVulnerability } from "./vulnerabilities";
 
 export interface CreateDirectAuditSessionRequest {
   project_id: string;
   content: string;
   guardrails_enabled?: boolean;
 }
+
+export type DirectAuditApprovalScope = "single_use" | "session";
 
 export async function listDirectAuditSessions(projectId: string): Promise<AuditSessionDetail[]> {
   const response = await apiClient.get("/agent-direct-audit/sessions", {
@@ -90,6 +93,22 @@ export async function updateDirectAuditGuardrails(
 
 export async function getDirectAuditSessionMessages(sessionId: string): Promise<AuditSessionMessage[]> {
   const response = await apiClient.get(`/agent-direct-audit/sessions/${sessionId}/messages`);
+  return response.data;
+}
+
+export async function listDirectAuditManagedVulnerabilities(
+  sessionId: string,
+): Promise<ManagedVulnerability[]> {
+  const response = await apiClient.get(`/agent-direct-audit/sessions/${sessionId}/managed-vulnerabilities`);
+  return response.data;
+}
+
+export async function syncLatestDirectAuditManagedVulnerability(
+  sessionId: string,
+): Promise<ManagedVulnerability> {
+  const response = await apiClient.post(
+    `/agent-direct-audit/sessions/${sessionId}/managed-vulnerabilities/sync-latest-report`,
+  );
   return response.data;
 }
 
@@ -186,6 +205,7 @@ export async function streamDirectAuditSessionMessage(
 export async function streamApproveDirectAuditToolCall(
   sessionId: string,
   toolCallId: string,
+  scope: DirectAuditApprovalScope,
   handlers: {
     onEvent?: (event: AuditSessionStreamEvent) => void;
     signal?: AbortSignal;
@@ -201,7 +221,9 @@ export async function streamApproveDirectAuditToolCall(
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "text/event-stream",
+      "Content-Type": "application/json",
     },
+    body: JSON.stringify({ scope }),
     signal: handlers.signal,
   });
 

@@ -65,14 +65,13 @@ def test_bash_runtime_tool_matches_restored_style_metadata_and_safety_flags():
 
     denied_background = asyncio.run(tool.check_permission(BashToolInput(command="ls", run_in_background=True), _context()))
     denied_sandbox = asyncio.run(tool.check_permission(BashToolInput(command="ls", dangerouslyDisableSandbox=True), _context()))
-    denied_destructive = asyncio.run(tool.check_permission(BashToolInput(command="rm -rf build"), _context()))
+    allowed_destructive = asyncio.run(tool.check_permission(BashToolInput(command="rm -rf build"), _context()))
 
     assert denied_background.allowed is False
     assert "background" in str(denied_background.reason).lower()
     assert denied_sandbox.allowed is False
     assert "sandbox" in str(denied_sandbox.reason).lower()
-    assert denied_destructive.allowed is False
-    assert "destructive" in str(denied_destructive.reason).lower()
+    assert allowed_destructive.allowed is True
 
 
 def test_bash_runtime_tool_executes_with_backend_tool_when_present(monkeypatch):
@@ -104,11 +103,11 @@ def test_powershell_runtime_tool_matches_restored_style_metadata_and_safety_flag
 
     denied_background = asyncio.run(tool.check_permission(PowerShellToolInput(command="Get-ChildItem", run_in_background=True), _context()))
     denied_sandbox = asyncio.run(tool.check_permission(PowerShellToolInput(command="Get-ChildItem", dangerouslyDisableSandbox=True), _context()))
-    denied_destructive = asyncio.run(tool.check_permission(PowerShellToolInput(command="Remove-Item README.md -Force"), _context()))
+    allowed_destructive = asyncio.run(tool.check_permission(PowerShellToolInput(command="Remove-Item README.md -Force"), _context()))
 
     assert denied_background.allowed is False
     assert denied_sandbox.allowed is False
-    assert denied_destructive.allowed is False
+    assert allowed_destructive.allowed is True
 
 
 def test_runtime_tool_registry_adds_shell_tools_when_shell_backends_are_available(monkeypatch):
@@ -183,3 +182,151 @@ def test_bash_runtime_tool_allows_session_approved_mutating_command(monkeypatch)
     )
 
     assert decision.allowed is True
+
+
+def test_bash_runtime_tool_requires_approval_for_destructive_commands_when_guardrails_are_enabled(monkeypatch):
+    monkeypatch.setattr("app.services.runtime_core.shell_runtime_tools.detect_bash_executable", lambda: None)
+    store = _store()
+    session_id = store.create_session(project_id="project-1")
+    runtime_state = store.load_runtime_state(session_id)
+    runtime_state.metadata["guardrails"] = {"enabled": True}
+    store.replace_runtime_state(session_id, runtime_state)
+    tool = BashRuntimeTool(project_root="D:/repo", backend_tool=FakeExecAgentTool(), executable=None, session_store=store)
+
+    decision = asyncio.run(
+        tool.check_permission(
+            BashToolInput(command="rm -rf build"),
+            ToolExecutionContext(session_id=session_id, turn_id="turn-1", tool_use_id="tool-use-1", tool_call_id="tool-call-1"),
+        )
+    )
+
+    assert decision.allowed is False
+    assert decision.mode == "ask"
+    assert decision.guardrail_code == "shell_destructive_command_requires_approval"
+
+
+def test_bash_runtime_tool_allows_destructive_commands_when_guardrails_are_disabled(monkeypatch):
+    monkeypatch.setattr("app.services.runtime_core.shell_runtime_tools.detect_bash_executable", lambda: None)
+    store = _store()
+    session_id = store.create_session(project_id="project-1")
+    tool = BashRuntimeTool(project_root="D:/repo", backend_tool=FakeExecAgentTool(), executable=None, session_store=store)
+
+    decision = asyncio.run(
+        tool.check_permission(
+            BashToolInput(command="rm -rf build"),
+            ToolExecutionContext(session_id=session_id, turn_id="turn-1", tool_use_id="tool-use-1", tool_call_id="tool-call-1"),
+        )
+    )
+
+    assert decision.allowed is True
+
+
+def test_bash_runtime_tool_requires_approval_for_commands_targeting_paths_outside_project_root(monkeypatch):
+    monkeypatch.setattr("app.services.runtime_core.shell_runtime_tools.detect_bash_executable", lambda: None)
+    store = _store()
+    session_id = store.create_session(project_id="project-1")
+    runtime_state = store.load_runtime_state(session_id)
+    runtime_state.metadata["guardrails"] = {"enabled": True}
+    store.replace_runtime_state(session_id, runtime_state)
+    tool = BashRuntimeTool(project_root="D:/repo", backend_tool=FakeExecAgentTool(), executable=None, session_store=store)
+
+    decision = asyncio.run(
+        tool.check_permission(
+            BashToolInput(command="python audit.py ../other-project/output.json"),
+            ToolExecutionContext(session_id=session_id, turn_id="turn-1", tool_use_id="tool-use-1", tool_call_id="tool-call-1"),
+        )
+    )
+
+    assert decision.allowed is False
+    assert decision.mode == "ask"
+    assert decision.guardrail_code == "shell_outside_project_root_requires_approval"
+
+
+def test_bash_runtime_tool_consumes_single_use_shell_approval_after_first_execution(monkeypatch):
+    monkeypatch.setattr("app.services.runtime_core.shell_runtime_tools.detect_bash_executable", lambda: None)
+    store = _store()
+    session_id = store.create_session(project_id="project-1")
+    runtime_state = store.load_runtime_state(session_id)
+    runtime_state.metadata["guardrails"] = {"enabled": True}
+    register_shell_approval(
+        runtime_state,
+        tool_name="Bash",
+        command="python -c \"open('out.txt','w').write('x')\"",
+        guardrail_code="shell_command_requires_approval",
+        scope="single_use",
+    )
+    store.replace_runtime_state(session_id, runtime_state)
+    backend = FakeExecAgentTool()
+    tool = BashRuntimeTool(project_root="D:/repo", backend_tool=backend, executable=None, session_store=store)
+    context = ToolExecutionContext(session_id=session_id, turn_id="turn-1", tool_use_id="tool-use-1", tool_call_id="tool-call-1")
+
+    first_decision = asyncio.run(
+        tool.check_permission(
+            BashToolInput(command="python -c \"open('out.txt','w').write('x')\""),
+            context,
+        )
+    )
+    first_payload = asyncio.run(
+        tool.execute(
+            BashToolInput(command="python -c \"open('out.txt','w').write('x')\""),
+            context,
+        )
+    )
+    persisted_state = store.load_runtime_state(session_id)
+    second_decision = asyncio.run(
+        tool.check_permission(
+            BashToolInput(command="python -c \"open('out.txt','w').write('x')\""),
+            ToolExecutionContext(session_id=session_id, turn_id="turn-2", tool_use_id="tool-use-2", tool_call_id="tool-call-2"),
+        )
+    )
+
+    assert first_decision.allowed is True
+    assert first_payload.output_payload["command"] == "python -c \"open('out.txt','w').write('x')\""
+    assert persisted_state.metadata["shell_approvals"][0]["scope"] == "single_use"
+    assert persisted_state.metadata["shell_approvals"][0].get("consumed_at")
+    assert second_decision.allowed is False
+    assert second_decision.mode == "ask"
+    assert second_decision.guardrail_code == "shell_command_requires_approval"
+
+
+def test_bash_runtime_tool_keeps_session_scope_shell_approval_reusable(monkeypatch):
+    monkeypatch.setattr("app.services.runtime_core.shell_runtime_tools.detect_bash_executable", lambda: None)
+    store = _store()
+    session_id = store.create_session(project_id="project-1")
+    runtime_state = store.load_runtime_state(session_id)
+    runtime_state.metadata["guardrails"] = {"enabled": True}
+    register_shell_approval(
+        runtime_state,
+        tool_name="Bash",
+        command="python -c \"open('out.txt','w').write('x')\"",
+        guardrail_code="shell_command_requires_approval",
+        scope="session",
+    )
+    store.replace_runtime_state(session_id, runtime_state)
+    backend = FakeExecAgentTool()
+    tool = BashRuntimeTool(project_root="D:/repo", backend_tool=backend, executable=None, session_store=store)
+
+    first_decision = asyncio.run(
+        tool.check_permission(
+            BashToolInput(command="python -c \"open('out.txt','w').write('x')\""),
+            ToolExecutionContext(session_id=session_id, turn_id="turn-1", tool_use_id="tool-use-1", tool_call_id="tool-call-1"),
+        )
+    )
+    asyncio.run(
+        tool.execute(
+            BashToolInput(command="python -c \"open('out.txt','w').write('x')\""),
+            ToolExecutionContext(session_id=session_id, turn_id="turn-1", tool_use_id="tool-use-1", tool_call_id="tool-call-1"),
+        )
+    )
+    second_decision = asyncio.run(
+        tool.check_permission(
+            BashToolInput(command="python -c \"open('out.txt','w').write('x')\""),
+            ToolExecutionContext(session_id=session_id, turn_id="turn-2", tool_use_id="tool-use-2", tool_call_id="tool-call-2"),
+        )
+    )
+    persisted_state = store.load_runtime_state(session_id)
+
+    assert first_decision.allowed is True
+    assert second_decision.allowed is True
+    assert persisted_state.metadata["shell_approvals"][0]["scope"] == "session"
+    assert persisted_state.metadata["shell_approvals"][0].get("consumed_at") is None

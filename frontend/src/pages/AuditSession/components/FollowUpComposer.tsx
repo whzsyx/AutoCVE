@@ -1,4 +1,4 @@
-﻿import { FormEvent, useState } from "react";
+import { FormEvent, KeyboardEvent, useCallback, useState } from "react";
 import { Loader2, SendHorizonal } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -14,19 +14,33 @@ export function FollowUpComposer({
   const [content, setContent] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  const submitContent = useCallback(async () => {
     const trimmed = content.trim();
-    if (!trimmed) {
+    if (!trimmed || disabled || submitting) {
       return;
     }
     setSubmitting(true);
     try {
       await onSubmit(trimmed);
       setContent("");
+    } catch (error) {
+      console.error("[FollowUpComposer] submit failed", error);
     } finally {
       setSubmitting(false);
     }
+  }, [content, disabled, onSubmit, submitting]);
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await submitContent();
+  }
+
+  async function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
+      return;
+    }
+    event.preventDefault();
+    await submitContent();
   }
 
   return (
@@ -37,6 +51,7 @@ export function FollowUpComposer({
           placeholder="继续追问利用链、修复方案、验证步骤或证据来源……"
           value={content}
           onChange={(event) => setContent(event.target.value)}
+          onKeyDown={(event) => void handleKeyDown(event)}
           disabled={disabled || submitting}
         />
         <div className="mt-3 flex items-center justify-between gap-3 border-t border-[rgba(154,180,163,.2)] px-2 pt-3 text-xs text-muted-foreground">

@@ -157,6 +157,41 @@ def test_bridge_fallback_summary_uses_last_assistant_message():
     assert "OpenApiController" in summary
 
 
+def test_bridge_fallback_payload_recovers_findings_from_assistant_transcript():
+    session_factory = build_session_factory()
+    bridge = FindingRuntimeBridge(llm_service=FakeLLMService([]), tools={}, session_factory=session_factory)
+    store = bridge._session_store
+    session_id = store.create_session(project_id="project-1", system_prompt="system")
+    store.append_message(session_id, TranscriptItem(role=RuntimeMessageRole.USER, content="inspect"))
+    store.append_message(
+        session_id,
+        TranscriptItem(
+            role=RuntimeMessageRole.ASSISTANT,
+            content=(
+                "Thought: 现在让我深入确认几个关键发现并验证完整利用链。\n"
+                "1. `/user/invited` 注册限制绕过 - 明确确认\n"
+                "2. `unpinDashboard` IDOR - 明确确认\n"
+                "3. 数据库连接测试 SSRF（MySQL/MongoDB 无 outbound 策略）\n"
+                "4. `/chart/:chart_id/query` 未认证端点\n"
+            ),
+        ),
+    )
+    snapshot = store.load_session_snapshot(session_id)
+
+    payload = bridge._default_fallback_payload(snapshot)
+
+    assert len(payload["findings"]) == 4
+    assert [finding["vulnerability_type"] for finding in payload["findings"]] == [
+        "auth_bypass",
+        "idor",
+        "ssrf",
+        "auth_bypass",
+    ]
+    assert payload["findings"][0]["title"] == "/user/invited 注册限制绕过"
+    assert payload["findings"][0]["needs_verification"] is True
+    assert "Recovered 4 high-signal findings" in payload["summary"]
+
+
 def test_bridge_exposes_restored_style_runtime_tools():
     bridge = FindingRuntimeBridge(
         llm_service=FakeLLMService([]),

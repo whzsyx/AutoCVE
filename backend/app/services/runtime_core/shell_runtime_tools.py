@@ -14,6 +14,8 @@ from app.services.agent.tools.base import AgentTool
 from app.services.finding_runtime.models import ToolExecutionPayload
 from app.services.runtime_core.permission_runtime import ToolPermissionDecision
 from app.services.runtime_core.runtime_guardrails import (
+    APPROVAL_SCOPE_SINGLE_USE,
+    consume_shell_approval,
     has_shell_approval,
     is_guardrails_enabled,
 )
@@ -309,6 +311,34 @@ def _clamp_timeout_ms(raw_timeout: int | None) -> int:
     return min(timeout_ms, MAX_TIMEOUT_MS)
 
 
+def _command_targets_outside_project(command: str) -> bool:
+    text = str(command or "").strip()
+    if not text:
+        return False
+    return bool(
+        re.search(r"(^|[\s'\"=])\.\.[/\\]", text)
+        or re.search(r"(^|[\s'\"=])[A-Za-z]:[/\\]", text)
+        or re.search(r"(^|[\s'\"=])/(?![/-])", text)
+    )
+
+
+def _shell_guardrail_payload(*, command: str, destructive: bool) -> tuple[str, str]:
+    if _command_targets_outside_project(command):
+        return (
+            "shell_outside_project_root_requires_approval",
+            "Running a shell command that references paths outside the project root requires explicit approval while guardrails are enabled.",
+        )
+    if destructive:
+        return (
+            "shell_destructive_command_requires_approval",
+            "Running a destructive shell command requires explicit approval while guardrails are enabled.",
+        )
+    return (
+        "shell_command_requires_approval",
+        "Running a mutating shell command requires explicit approval while guardrails are enabled.",
+    )
+
+
 async def _run_local_command(*, executable: str, args: list[str], cwd: str, timeout_ms: int) -> ToolExecutionPayload:
     process = await asyncio.create_subprocess_exec(
         executable,
@@ -389,29 +419,46 @@ class BashRuntimeTool(RuntimeTool):
             return ToolPermissionDecision(allowed=False, reason="Background shell execution is not implemented in AuditAI runtime yet")
         if parsed_input.dangerously_disable_sandbox:
             return ToolPermissionDecision(allowed=False, reason="Disabling sandbox execution is not supported by the runtime Bash tool")
-        if self.is_destructive(parsed_input):
-            return ToolPermissionDecision(allowed=False, reason="Destructive shell commands are blocked by the runtime Bash tool")
         if self._executable is None and self._backend_tool is None:
             return ToolPermissionDecision(allowed=False, reason="No Bash execution backend is available for this runtime")
         if not self.is_read_only(parsed_input) and self._session_store is not None:
             runtime_state = self._session_store.load_runtime_state(context.session_id)
-            if is_guardrails_enabled(runtime_state) and not has_shell_approval(
-                runtime_state,
-                tool_name=self.name,
-                command=parsed_input.command,
-                guardrail_code="shell_command_requires_approval",
-            ):
-                return ToolPermissionDecision(
-                    allowed=False,
-                    source="tool_guardrail",
-                    mode="ask",
-                    reason="Running a mutating shell command requires explicit approval while guardrails are enabled.",
-                    guardrail_code="shell_command_requires_approval",
+            if is_guardrails_enabled(runtime_state):
+                guardrail_code, reason = _shell_guardrail_payload(
+                    command=parsed_input.command,
+                    destructive=self.is_destructive(parsed_input),
                 )
+                if not has_shell_approval(
+                    runtime_state,
+                    tool_name=self.name,
+                    command=parsed_input.command,
+                    guardrail_code=guardrail_code,
+                ):
+                    return ToolPermissionDecision(
+                        allowed=False,
+                        source="tool_guardrail",
+                        mode="ask",
+                        reason=reason,
+                        guardrail_code=guardrail_code,
+                    )
         return ToolPermissionDecision(allowed=True)
 
     async def execute(self, parsed_input: BashToolInput, context: ToolExecutionContext) -> ToolExecutionPayload:
-        del context
+        if not self.is_read_only(parsed_input) and self._session_store is not None:
+            runtime_state = self._session_store.load_runtime_state(context.session_id)
+            if is_guardrails_enabled(runtime_state):
+                guardrail_code, _reason = _shell_guardrail_payload(
+                    command=parsed_input.command,
+                    destructive=self.is_destructive(parsed_input),
+                )
+                approval = consume_shell_approval(
+                    runtime_state,
+                    tool_name=self.name,
+                    command=parsed_input.command,
+                    guardrail_code=guardrail_code,
+                )
+                if approval and str(approval.get("scope") or "") == APPROVAL_SCOPE_SINGLE_USE:
+                    self._session_store.replace_runtime_state(context.session_id, runtime_state)
         timeout_ms = _clamp_timeout_ms(parsed_input.timeout)
         if self._executable is not None:
             payload = await _run_local_command(
@@ -478,29 +525,46 @@ class PowerShellRuntimeTool(RuntimeTool):
             return ToolPermissionDecision(allowed=False, reason="Background shell execution is not implemented in AuditAI runtime yet")
         if parsed_input.dangerously_disable_sandbox:
             return ToolPermissionDecision(allowed=False, reason="Disabling sandbox execution is not supported by the runtime PowerShell tool")
-        if self.is_destructive(parsed_input):
-            return ToolPermissionDecision(allowed=False, reason="Destructive PowerShell commands are blocked by the runtime tool")
         if self._executable is None and self._backend_tool is None:
             return ToolPermissionDecision(allowed=False, reason="No PowerShell execution backend is available for this runtime")
         if not self.is_read_only(parsed_input) and self._session_store is not None:
             runtime_state = self._session_store.load_runtime_state(context.session_id)
-            if is_guardrails_enabled(runtime_state) and not has_shell_approval(
-                runtime_state,
-                tool_name=self.name,
-                command=parsed_input.command,
-                guardrail_code="shell_command_requires_approval",
-            ):
-                return ToolPermissionDecision(
-                    allowed=False,
-                    source="tool_guardrail",
-                    mode="ask",
-                    reason="Running a mutating PowerShell command requires explicit approval while guardrails are enabled.",
-                    guardrail_code="shell_command_requires_approval",
+            if is_guardrails_enabled(runtime_state):
+                guardrail_code, reason = _shell_guardrail_payload(
+                    command=parsed_input.command,
+                    destructive=self.is_destructive(parsed_input),
                 )
+                if not has_shell_approval(
+                    runtime_state,
+                    tool_name=self.name,
+                    command=parsed_input.command,
+                    guardrail_code=guardrail_code,
+                ):
+                    return ToolPermissionDecision(
+                        allowed=False,
+                        source="tool_guardrail",
+                        mode="ask",
+                        reason=reason.replace("shell command", "PowerShell command"),
+                        guardrail_code=guardrail_code,
+                    )
         return ToolPermissionDecision(allowed=True)
 
     async def execute(self, parsed_input: PowerShellToolInput, context: ToolExecutionContext) -> ToolExecutionPayload:
-        del context
+        if not self.is_read_only(parsed_input) and self._session_store is not None:
+            runtime_state = self._session_store.load_runtime_state(context.session_id)
+            if is_guardrails_enabled(runtime_state):
+                guardrail_code, _reason = _shell_guardrail_payload(
+                    command=parsed_input.command,
+                    destructive=self.is_destructive(parsed_input),
+                )
+                approval = consume_shell_approval(
+                    runtime_state,
+                    tool_name=self.name,
+                    command=parsed_input.command,
+                    guardrail_code=guardrail_code,
+                )
+                if approval and str(approval.get("scope") or "") == APPROVAL_SCOPE_SINGLE_USE:
+                    self._session_store.replace_runtime_state(context.session_id, runtime_state)
         timeout_ms = _clamp_timeout_ms(parsed_input.timeout)
         if self._executable is not None:
             payload = await _run_local_command(

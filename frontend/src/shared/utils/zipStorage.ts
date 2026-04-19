@@ -10,6 +10,9 @@ export interface ZipFileMeta {
   original_filename?: string;
   file_size?: number;
   uploaded_at?: string;
+  has_persistent_source?: boolean;
+  persistent_source_path?: string;
+  persistent_source_updated_at?: string;
 }
 
 /**
@@ -28,14 +31,21 @@ export async function getZipFileInfo(projectId: string): Promise<ZipFileMeta> {
 /**
  * 上传项目ZIP文件
  */
-export async function uploadZipFile(projectId: string, file: File): Promise<{
+export async function uploadZipFile(projectId: string, file: File, options?: {
+  keepArchive?: boolean;
+}): Promise<{
   success: boolean;
   message?: string;
   original_filename?: string;
   file_size?: number;
+  has_file?: boolean;
+  has_persistent_source?: boolean;
+  persistent_source_path?: string;
+  persistent_source_updated_at?: string;
 }> {
   const formData = new FormData();
   formData.append('file', file);
+  formData.append('keep_archive', String(options?.keepArchive ?? true));
 
   try {
     const response = await apiClient.post(`/projects/${projectId}/zip`, formData, {
@@ -48,6 +58,10 @@ export async function uploadZipFile(projectId: string, file: File): Promise<{
       message: response.data.message,
       original_filename: response.data.original_filename,
       file_size: response.data.file_size,
+      has_file: response.data.has_file,
+      has_persistent_source: response.data.has_persistent_source,
+      persistent_source_path: response.data.persistent_source_path,
+      persistent_source_updated_at: response.data.persistent_source_updated_at,
     };
   } catch (error: any) {
     console.error('上传ZIP文件失败:', error);
@@ -69,6 +83,23 @@ export async function deleteZipFile(projectId: string): Promise<boolean> {
     console.error('删除ZIP文件失败:', error);
     return false;
   }
+}
+
+export async function deleteProjectSourceArtifacts(
+  projectId: string,
+  payload: {
+    deleteZip?: boolean;
+    deletePersistentSource?: boolean;
+  },
+): Promise<{
+  deleted_zip: boolean;
+  deleted_persistent_source: boolean;
+}> {
+  const response = await apiClient.post(`/projects/${projectId}/source-artifacts/delete`, {
+    delete_zip: Boolean(payload.deleteZip),
+    delete_persistent_source: Boolean(payload.deletePersistentSource),
+  });
+  return response.data;
 }
 
 /**

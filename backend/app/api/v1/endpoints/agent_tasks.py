@@ -441,16 +441,16 @@ async def _load_runtime_session_ids(db: AsyncSession, task_ids: List[str]) -> Di
 
 def _is_verification_enabled(workflow_config: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(workflow_config, dict):
-        return True
+        return False
     agent_states = workflow_config.get('agentStates')
     if not isinstance(agent_states, dict):
-        return True
+        return False
     verification_state = agent_states.get('verification')
     if isinstance(verification_state, dict):
-        return bool(verification_state.get('enabled', True))
+        return bool(verification_state.get('enabled', False))
     if isinstance(verification_state, bool):
         return verification_state
-    return True
+    return False
 
 
 async def _load_latest_task_audit_session(db: AsyncSession, task_id: str) -> Optional[AuditSession]:
@@ -1036,9 +1036,6 @@ async def _initialize_tools(
         CreateVulnerabilityReportTool,
         SkillBodyTool,
         SkillResourceTool,
-        RAGQueryTool,
-        SecurityCodeSearchTool,
-        FunctionContextTool,
         SandboxTool,
         build_shared_agent_tool_catalog,
         build_agent_skill_tools,
@@ -1048,9 +1045,6 @@ async def _initialize_tools(
         SecurityKnowledgeQueryTool,
         GetVulnerabilityKnowledgeTool,
     )
-    from app.services.rag import CodeIndexer, CodeRetriever, EmbeddingService, IndexUpdateMode
-    from app.core.config import settings
-
     async def emit(message: str, level: str = "info") -> None:
         if not event_emitter:
             return
@@ -1063,91 +1057,6 @@ async def _initialize_tools(
                 await event_emitter.emit_info(message)
         except Exception as exc:
             logger.warning(f"Failed to emit tool event: {exc}")
-
-    retriever = None
-    try:
-        await emit("Initializing RAG indexing...")
-        user_llm_config = (user_config or {}).get("llmConfig", {})
-        user_other_config = (user_config or {}).get("otherConfig", {})
-        user_embedding_config = user_other_config.get("embedding_config", {})
-
-        embedding_provider = user_embedding_config.get("provider") or getattr(settings, "EMBEDDING_PROVIDER", "openai")
-        embedding_model = user_embedding_config.get("model") or getattr(settings, "EMBEDDING_MODEL", "text-embedding-3-small")
-        embedding_api_key = (
-            user_embedding_config.get("api_key")
-            or getattr(settings, "EMBEDDING_API_KEY", None)
-            or user_llm_config.get("llmApiKey")
-            or getattr(settings, "LLM_API_KEY", "")
-            or ""
-        )
-        embedding_base_url = user_embedding_config.get("base_url") or getattr(settings, "EMBEDDING_BASE_URL", None)
-
-        embedding_service = EmbeddingService(
-            provider=embedding_provider,
-            model=embedding_model,
-            api_key=embedding_api_key,
-            base_url=embedding_base_url,
-        )
-        embedding_service.batch_size = user_embedding_config.get("batch_size", 100)
-
-        collection_name = f"project_{project_id}" if project_id else "default_project"
-        indexer = CodeIndexer(
-            collection_name=collection_name,
-            embedding_service=embedding_service,
-            persist_directory=settings.VECTOR_DB_PATH,
-        )
-
-        last_embedding_progress = 0
-
-        def on_embedding_progress(processed: int, total: int) -> None:
-            nonlocal last_embedding_progress
-            if total <= 0:
-                return
-            if processed - last_embedding_progress < 50 and processed != total:
-                return
-            last_embedding_progress = processed
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(emit(f"Embedding progress: {processed}/{total} ({processed / total:.0%})"))
-            except Exception:
-                logger.debug("Embedding progress emit skipped", exc_info=True)
-
-        def check_cancelled() -> bool:
-            return task_id is not None and is_task_cancelled(task_id)
-
-        last_index_progress = 0
-        async for progress in indexer.smart_index_directory(
-            directory=project_root,
-            exclude_patterns=exclude_patterns or [],
-            include_patterns=target_files,
-            update_mode=IndexUpdateMode.SMART,
-            embedding_progress_callback=on_embedding_progress,
-            cancel_check=check_cancelled,
-        ):
-            if check_cancelled():
-                raise asyncio.CancelledError("Task cancelled during RAG indexing")
-            if progress.processed_files - last_index_progress >= 10 or progress.processed_files == progress.total_files:
-                last_index_progress = progress.processed_files
-                if progress.total_files:
-                    await emit(
-                        f"Index progress: {progress.processed_files}/{progress.total_files} ({progress.progress_percentage:.0f}%)"
-                    )
-            if progress.status_message:
-                await emit(progress.status_message)
-
-        retriever = CodeRetriever(
-            collection_name=collection_name,
-            embedding_service=embedding_service,
-            persist_directory=settings.VECTOR_DB_PATH,
-            api_key=embedding_api_key,
-        )
-        await emit("RAG indexing ready")
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.warning(f"RAG initialization failed: {exc}")
-        await emit(f"RAG initialization failed: {exc}", "warning")
-        retriever = None
 
     base_tools = build_shared_agent_tool_catalog(
         project_root=project_root,
@@ -1170,8 +1079,6 @@ async def _initialize_tools(
         **build_agent_skill_tools(user_id=user_id, agent_type="recon"),
         **shared_scanners,
     }
-    if retriever:
-        recon_tools["rag_query"] = RAGQueryTool(retriever)
 
     from app.services.agent.tools import SmartScanTool, QuickAuditTool
 
@@ -1186,10 +1093,6 @@ async def _initialize_tools(
         "query_security_knowledge": SecurityKnowledgeQueryTool(),
         "get_vulnerability_knowledge": GetVulnerabilityKnowledgeTool(),
     }
-    if retriever:
-        analysis_tools["rag_query"] = RAGQueryTool(retriever)
-        analysis_tools["security_search"] = SecurityCodeSearchTool(retriever)
-        analysis_tools["function_context"] = FunctionContextTool(retriever)
 
     scan_tools = {
         **analysis_tools,
@@ -1207,10 +1110,6 @@ async def _initialize_tools(
         "dataflow_analysis": DataFlowAnalysisTool(llm_service),
         "sandbox_exec": SandboxTool(sandbox_manager),
     }
-    if retriever:
-        finding_tools["rag_query"] = RAGQueryTool(retriever)
-        finding_tools["security_search"] = SecurityCodeSearchTool(retriever)
-        finding_tools["function_context"] = FunctionContextTool(retriever)
 
     from app.services.agent.tools import (
         SandboxHttpTool,
@@ -2732,6 +2631,40 @@ def safe_extract_zip(zip_ref: zipfile.ZipFile, extract_dir: str, task_id: str) -
             shutil.copyfileobj(src, dst)
 
 
+def _find_managed_project_root_fallback(project: Project) -> Optional[str]:
+    managed_root = os.path.abspath(settings.MANAGED_PROJECTS_ROOT)
+    if not os.path.isdir(managed_root):
+        return None
+
+    entries: list[tuple[str, str]] = []
+    for name in os.listdir(managed_root):
+        path = os.path.join(managed_root, name)
+        if os.path.isdir(path):
+            entries.append((name, path))
+
+    if not entries:
+        return None
+
+    project_name = str(project.name or "").strip().lower()
+    if not project_name:
+        return None
+
+    exact_matches = [path for name, path in entries if name.lower() == project_name]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
+    normalized_project_name = re.sub(r"[^a-z0-9]+", "", project_name)
+    prefix_matches = [
+        path
+        for name, path in entries
+        if re.sub(r"[^a-z0-9]+", "", name.lower()).startswith(normalized_project_name)
+    ]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
+
+    return None
+
+
 async def _get_project_root(
     project: Project,
     task_id: str,
@@ -2769,12 +2702,27 @@ async def _get_project_root(
     check_cancelled()
 
     if project.source_type == "zip":
-        await emit("Extracting uploaded ZIP project...")
-        zip_path = await load_project_zip(project.id)
-        if not zip_path or not os.path.exists(zip_path):
-            raise RuntimeError(f"Project ZIP not found: {project.id}")
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            safe_extract_zip(zip_ref, base_path, task_id)
+        persistent_source = str(getattr(project, "local_path", "") or "").strip()
+        if persistent_source and os.path.isdir(persistent_source):
+            await emit("Copying persistent ZIP source directory into a temporary working copy...")
+            target_dir = os.path.join(base_path, os.path.basename(os.path.abspath(persistent_source)))
+            shutil.copytree(persistent_source, target_dir, dirs_exist_ok=True)
+            base_path = target_dir
+        else:
+            await emit("Extracting uploaded ZIP project...")
+            zip_path = await load_project_zip(project.id)
+            if not zip_path or not os.path.exists(zip_path):
+                fallback_root = _find_managed_project_root_fallback(project)
+                if fallback_root:
+                    await emit(f"ZIP source missing; falling back to managed project directory: {fallback_root}", level="warning")
+                    target_dir = os.path.join(base_path, os.path.basename(fallback_root))
+                    shutil.copytree(fallback_root, target_dir, dirs_exist_ok=True)
+                    base_path = target_dir
+                else:
+                    raise RuntimeError(f"Project ZIP not found: {project.id}")
+            else:
+                with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                    safe_extract_zip(zip_ref, base_path, task_id)
     elif project.source_type == "repository" and project.repository_url:
         repo_url = project.repository_url
         if not validate_git_url(repo_url):

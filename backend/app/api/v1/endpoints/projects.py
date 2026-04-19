@@ -1,5 +1,5 @@
 from typing import Any, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -11,6 +11,7 @@ import shutil
 import os
 import uuid
 import json
+import tempfile
 
 from app.api import deps
 from app.core.config import settings
@@ -34,8 +35,15 @@ from app.services.scanner import (
     is_text_file,
 )
 from app.services.zip_storage import (
-    save_project_zip, load_project_zip, get_project_zip_meta,
-    delete_project_zip, has_project_zip
+    delete_project_persistent_source,
+    delete_project_zip,
+    get_project_persistent_source_meta,
+    get_project_zip_meta,
+    has_project_persistent_source,
+    has_project_zip,
+    load_project_zip,
+    materialize_project_source_from_zip,
+    save_project_zip,
 )
 
 router = APIRouter()
@@ -116,7 +124,9 @@ class ProjectFileContentResponse(BaseModel):
 
 
 def _get_managed_projects_root() -> Path:
-    return Path(settings.MANAGED_PROJECTS_ROOT).resolve()
+    managed_root = Path(settings.MANAGED_PROJECTS_ROOT).resolve()
+    managed_root.mkdir(parents=True, exist_ok=True)
+    return managed_root
 
 
 def _normalize_managed_local_path(local_path: str) -> str:
@@ -162,6 +172,38 @@ def _build_file_content_response(*, relative_path: str, content: str) -> Project
     )
 
 
+def _normalize_zip_local_path(local_path: str | None) -> Optional[str]:
+    if not local_path:
+        return None
+    candidate = Path(local_path)
+    if not candidate.exists() or not candidate.is_dir():
+        return None
+    try:
+        return _normalize_managed_local_path(str(candidate))
+    except HTTPException:
+        return None
+
+
+def _resolve_persistent_project_root(project: Project) -> Optional[Path]:
+    normalized = _normalize_zip_local_path(project.local_path)
+    if not normalized:
+        return None
+    return Path(normalized).resolve()
+
+
+def _list_local_project_files(project_root: Path, exclude_patterns: Optional[list[str]] = None) -> list[dict[str, Any]]:
+    exclude_patterns = list(exclude_patterns or [])
+    files: list[dict[str, Any]] = []
+    for file_path in sorted(project_root.rglob("*")):
+        if not file_path.is_file():
+            continue
+        relative_path = file_path.relative_to(project_root).as_posix()
+        if should_exclude(relative_path, exclude_patterns):
+            continue
+        files.append({"path": relative_path, "size": file_path.stat().st_size})
+    return files
+
+
 @router.get("/managed-local-directories", response_model=List[ManagedLocalDirectoryResponse])
 async def list_managed_local_directories(
     current_user: User = Depends(deps.get_current_user),
@@ -170,8 +212,6 @@ async def list_managed_local_directories(
     List first-level managed project directories available for local import.
     """
     managed_root = _get_managed_projects_root()
-    if not managed_root.exists():
-        return []
 
     directories = [
         ManagedLocalDirectoryResponse(name=entry.name, path=str(entry.resolve()))
@@ -209,14 +249,18 @@ async def create_project(
         )
         if existing_result.scalars().first():
             raise HTTPException(status_code=400, detail="local directory is already registered")
+    elif source_type == "zip":
+        normalized_local_path = _normalize_zip_local_path(project_in.local_path)
     
     project = Project(
         name=project_in.name,
         source_type=source_type,
         repository_url=project_in.repository_url if source_type == "repository" else None,
         repository_type=project_in.repository_type or "other" if source_type == "repository" else "other",
-        local_path=normalized_local_path if source_type == "local_directory" else None,
-        workspace_mode=project_in.workspace_mode or ("in_place" if source_type == "local_directory" else None),
+        local_path=normalized_local_path if source_type in {"local_directory", "zip"} else None,
+        workspace_mode=project_in.workspace_mode or (
+            "in_place" if source_type == "local_directory" else "persistent_source" if source_type == "zip" else None
+        ),
         description=project_in.description,
         default_branch=project_in.default_branch or "main",
         programming_languages=json.dumps(project_in.programming_languages or []),
@@ -409,7 +453,11 @@ async def update_project(
 
         update_data["local_path"] = normalized_local_path
         update_data["workspace_mode"] = update_data.get("workspace_mode") or project.workspace_mode or "in_place"
-    elif "source_type" in update_data and update_data["source_type"] != "local_directory":
+    elif target_source_type == "zip":
+        normalized_local_path = _normalize_zip_local_path(update_data.get("local_path", project.local_path))
+        update_data["local_path"] = normalized_local_path
+        update_data["workspace_mode"] = update_data.get("workspace_mode") or project.workspace_mode or "persistent_source"
+    elif "source_type" in update_data and update_data["source_type"] not in {"local_directory", "zip"}:
         update_data["local_path"] = None
         update_data["workspace_mode"] = None
     
@@ -485,14 +533,6 @@ async def permanently_delete_project(
     if project.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="无权永久删除此项目")
     
-    # 如果是ZIP类型项目，删除关联的ZIP文件和元数据
-    if project.source_type == "zip":
-        try:
-            await delete_project_zip(id)
-            print(f"[Project] 已删除项目 {id} 的ZIP文件")
-        except Exception as e:
-            print(f"[Warning] 删除ZIP文件失败: {e}")
-    
     await db.delete(project)
     await db.commit()
     return {"message": "项目已永久删除"}
@@ -531,7 +571,14 @@ async def get_project_files(
     files = []
     
     if project.source_type == "zip":
-        # Handle ZIP project
+        project_root = _resolve_persistent_project_root(project)
+        if project_root is not None:
+            return [
+                entry
+                for entry in _list_local_project_files(project_root, parsed_exclude_patterns)
+                if is_text_file(str(entry["path"]))
+            ]
+
         zip_path = await load_project_zip(id)
         print(f"📦 ZIP项目 {id} 文件路径: {zip_path}")
         if not zip_path or not os.path.exists(zip_path):
@@ -667,6 +714,10 @@ async def get_project_file_content(
     """
     Read a single text file from the selected project for workspace preview.
     """
+    temp_file_handle = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    temp_file_path = temp_file_handle.name
+    temp_file_handle.close()
+
     project = await db.get(Project, id)
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
@@ -700,6 +751,26 @@ async def get_project_file_content(
         return _build_file_content_response(relative_path=relative_path, content=content)
 
     if project.source_type == "zip":
+        project_root = _resolve_persistent_project_root(project)
+        if project_root is not None:
+            file_path = (project_root / relative_path).resolve()
+            try:
+                file_path.relative_to(project_root)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="path must stay inside the project root") from exc
+
+            if not file_path.exists() or not file_path.is_file():
+                raise HTTPException(status_code=404, detail="project file not found")
+            if not is_text_file(relative_path):
+                raise HTTPException(status_code=400, detail="only text files can be previewed")
+
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                raise HTTPException(status_code=400, detail="file is not valid UTF-8 text") from exc
+
+            return _build_file_content_response(relative_path=relative_path, content=content)
+
         zip_path = await load_project_zip(id)
         if not zip_path or not os.path.exists(zip_path):
             raise HTTPException(status_code=404, detail="project zip not found")
@@ -893,6 +964,14 @@ class ZipFileMetaResponse(BaseModel):
     original_filename: Optional[str] = None
     file_size: Optional[int] = None
     uploaded_at: Optional[str] = None
+    has_persistent_source: bool = False
+    persistent_source_path: Optional[str] = None
+    persistent_source_updated_at: Optional[str] = None
+
+
+class ProjectSourceArtifactDeleteRequest(BaseModel):
+    delete_zip: bool = False
+    delete_persistent_source: bool = False
 
 
 @router.get("/{id}/zip", response_model=ZipFileMetaResponse)
@@ -901,81 +980,90 @@ async def get_project_zip_info(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    """
-    获取项目ZIP文件信息
-    """
+    """Get ZIP archive and persistent source metadata for a project."""
     project = await db.get(Project, id)
     if not project:
-        raise HTTPException(status_code=404, detail="项目不存在")
-    
-    # 检查是否有ZIP文件
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Permission denied")
+
     has_file = await has_project_zip(id)
-    if not has_file:
-        return {"has_file": False}
-    
-    # 获取元数据
+    source_meta = await get_project_persistent_source_meta(id)
     meta = await get_project_zip_meta(id)
+    payload: dict[str, Any] = {
+        "has_file": has_file,
+        "has_persistent_source": source_meta is not None,
+        "persistent_source_path": source_meta.get("path") if source_meta else None,
+        "persistent_source_updated_at": source_meta.get("updated_at") if source_meta else None,
+    }
     if meta:
-        return {
-            "has_file": True,
-            "original_filename": meta.get("original_filename"),
-            "file_size": meta.get("file_size"),
-            "uploaded_at": meta.get("uploaded_at")
-        }
-    
-    return {"has_file": True}
+        payload.update(
+            {
+                "original_filename": meta.get("original_filename"),
+                "file_size": meta.get("file_size"),
+                "uploaded_at": meta.get("uploaded_at"),
+            }
+        )
+    return payload
 
 
 @router.post("/{id}/zip")
 async def upload_project_zip(
     id: str,
     file: UploadFile = File(...),
+    keep_archive: bool = Form(True),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    """
-    上传或更新项目ZIP文件
-    """
+    """Upload a ZIP archive, materialize persistent source, and optionally keep the archive."""
     project = await db.get(Project, id)
     if not project:
-        raise HTTPException(status_code=404, detail="项目不存在")
-    
-    # 检查权限
+        raise HTTPException(status_code=404, detail="Project not found")
     if project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权操作此项目")
-    
-    # 检查项目类型
+        raise HTTPException(status_code=403, detail="Permission denied")
     if project.source_type != "zip":
-        raise HTTPException(status_code=400, detail="仅ZIP类型项目可以上传ZIP文件")
-    
-    # 验证文件类型
-    if not file.filename.lower().endswith('.zip'):
-        raise HTTPException(status_code=400, detail="请上传ZIP格式文件")
-    
-    # 保存到临时文件
-    temp_file_id = str(uuid.uuid4())
-    temp_file_path = f"/tmp/{temp_file_id}.zip"
-    
+        raise HTTPException(status_code=400, detail="Only ZIP projects can upload ZIP archives")
+    if not str(file.filename or "").lower().endswith('.zip'):
+        raise HTTPException(status_code=400, detail="Please upload a ZIP file")
+
+    temp_file_handle = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+    temp_file_path = temp_file_handle.name
+    temp_file_handle.close()
+
     try:
-        with open(temp_file_path, "wb") as buffer:
+        with open(temp_file_path, 'wb') as buffer:
             shutil.copyfileobj(file.file, buffer)
-        
-        # 检查文件大小
+
         file_size = os.path.getsize(temp_file_path)
-        if file_size > 500 * 1024 * 1024:  # 500MB limit
-            raise HTTPException(status_code=400, detail="文件大小不能超过500MB")
-        
-        # 保存到持久化存储
-        meta = await save_project_zip(id, temp_file_path, file.filename)
-        
-        return {
-            "message": "ZIP文件上传成功",
-            "original_filename": meta["original_filename"],
-            "file_size": meta["file_size"],
-            "uploaded_at": meta["uploaded_at"]
+        if file_size > 500 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="ZIP file size cannot exceed 500MB")
+
+        source_meta = await materialize_project_source_from_zip(id, temp_file_path)
+        archive_meta = None
+        if keep_archive:
+            archive_meta = await save_project_zip(id, temp_file_path, str(file.filename or 'upload.zip'))
+        else:
+            await delete_project_zip(id)
+
+        project.local_path = str(source_meta.get('path') or '')
+        project.workspace_mode = 'persistent_source'
+        project.updated_at = datetime.now(timezone.utc)
+        await db.commit()
+        await db.refresh(project)
+
+        payload = {
+            'message': 'ZIP archive uploaded successfully',
+            'has_file': archive_meta is not None,
+            'has_persistent_source': True,
+            'persistent_source_path': source_meta.get('path'),
+            'persistent_source_updated_at': source_meta.get('updated_at'),
+            'original_filename': str(file.filename or 'upload.zip'),
+            'file_size': file_size,
         }
+        if archive_meta:
+            payload['uploaded_at'] = archive_meta.get('uploaded_at')
+        return payload
     finally:
-        # 清理临时文件
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
@@ -986,26 +1074,50 @@ async def delete_project_zip_file(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    """
-    删除项目ZIP文件
-    """
+    """Delete only the stored ZIP archive and keep the persistent source directory."""
     project = await db.get(Project, id)
     if not project:
-        raise HTTPException(status_code=404, detail="项目不存在")
-    
-    # 检查权限
+        raise HTTPException(status_code=404, detail="Project not found")
     if project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权操作此项目")
-    
+        raise HTTPException(status_code=403, detail="Permission denied")
+
     deleted = await delete_project_zip(id)
-    
     if deleted:
-        return {"message": "ZIP文件已删除"}
-    else:
-        return {"message": "没有找到ZIP文件"}
+        return {"message": "ZIP archive deleted"}
+    return {"message": "No ZIP archive found"}
 
 
-# ============ 分支管理端点 ============
+@router.post("/{id}/source-artifacts/delete")
+async def delete_project_source_artifacts(
+    id: str,
+    payload: ProjectSourceArtifactDeleteRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    project = await db.get(Project, id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Permission denied")
+    if not payload.delete_zip and not payload.delete_persistent_source:
+        raise HTTPException(status_code=400, detail="Select at least one source artifact to delete")
+
+    deleted_zip = False
+    deleted_persistent_source = False
+    if payload.delete_zip:
+        deleted_zip = await delete_project_zip(id)
+    if payload.delete_persistent_source:
+        deleted_persistent_source = await delete_project_persistent_source(id)
+        if deleted_persistent_source:
+            project.local_path = None
+            project.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    return {
+        'deleted_zip': deleted_zip,
+        'deleted_persistent_source': deleted_persistent_source,
+    }
+
 
 @router.get("/{id}/branches")
 async def get_project_branches(

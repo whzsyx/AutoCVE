@@ -1,145 +1,167 @@
 """
-ZIP文件存储服务
-用于管理项目的ZIP文件持久化存储
+ZIP artifact storage helpers.
+
+This module manages two separate assets for ZIP-based projects:
+1. the optional original ZIP archive used for traceability
+2. the persistent extracted source directory used by audits
 """
 
+from __future__ import annotations
+
+import json
 import os
 import shutil
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from datetime import datetime, timezone
 
 from app.core.config import settings
 
 
 def get_zip_storage_path() -> Path:
-    """获取ZIP文件存储目录"""
-    path = Path(settings.ZIP_STORAGE_PATH)
+    path = Path(settings.ZIP_STORAGE_PATH).resolve()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def get_project_zip_path(project_id: str) -> Path:
-    """获取项目ZIP文件路径"""
     return get_zip_storage_path() / f"{project_id}.zip"
 
 
 def get_project_zip_meta_path(project_id: str) -> Path:
-    """获取项目ZIP文件元数据路径"""
     return get_zip_storage_path() / f"{project_id}.meta"
 
 
+def get_managed_projects_root() -> Path:
+    path = Path(settings.MANAGED_PROJECTS_ROOT).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_project_persistent_source_path(project_id: str) -> Path:
+    return get_managed_projects_root() / project_id
+
+
+def _is_within_directory(base_dir: Path, candidate: Path) -> bool:
+    try:
+        candidate.resolve().relative_to(base_dir.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _extract_zip_to_directory(zip_path: Path, target_dir: Path) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        for member in archive.infolist():
+            member_name = str(member.filename or "").strip()
+            if not member_name or member_name.endswith("/"):
+                continue
+            destination = (target_dir / member_name).resolve()
+            if not _is_within_directory(target_dir, destination):
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member, "r") as src, open(destination, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+
+def _collapse_single_root_directory(target_dir: Path) -> None:
+    entries = [entry for entry in target_dir.iterdir() if entry.name not in {".DS_Store", "__MACOSX"}]
+    if len(entries) != 1 or not entries[0].is_dir():
+        return
+
+    root_dir = entries[0]
+    temp_dir = target_dir.parent / f"{target_dir.name}.normalized"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    for child in root_dir.iterdir():
+        shutil.move(str(child), str(temp_dir / child.name))
+    shutil.rmtree(target_dir, ignore_errors=True)
+    temp_dir.rename(target_dir)
+
+
 async def save_project_zip(project_id: str, file_path: str, original_filename: str) -> dict:
-    """
-    保存项目ZIP文件
-    
-    Args:
-        project_id: 项目ID
-        file_path: 临时文件路径
-        original_filename: 原始文件名
-        
-    Returns:
-        文件元数据
-    """
     target_path = get_project_zip_path(project_id)
     meta_path = get_project_zip_meta_path(project_id)
-    
-    # 复制文件到存储目录
+
     shutil.copy2(file_path, target_path)
-    
-    # 获取文件大小
     file_size = os.path.getsize(target_path)
-    
-    # 保存元数据
     meta = {
         "original_filename": original_filename,
         "file_size": file_size,
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
-        "project_id": project_id
+        "project_id": project_id,
     }
-    
-    import json
-    with open(meta_path, 'w') as f:
-        json.dump(meta, f)
-    
-    print(f"✓ ZIP文件已保存: {project_id} ({file_size / 1024 / 1024:.2f} MB)")
-    
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(meta, handle)
     return meta
 
 
+async def materialize_project_source_from_zip(project_id: str, file_path: str) -> dict[str, str]:
+    source_root = get_project_persistent_source_path(project_id)
+    if source_root.exists():
+        shutil.rmtree(source_root, ignore_errors=True)
+    source_root.mkdir(parents=True, exist_ok=True)
+    _extract_zip_to_directory(Path(file_path).resolve(), source_root)
+    _collapse_single_root_directory(source_root)
+    return {
+        "path": str(source_root.resolve()),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 async def load_project_zip(project_id: str) -> Optional[str]:
-    """
-    加载项目ZIP文件路径
-    
-    Args:
-        project_id: 项目ID
-        
-    Returns:
-        ZIP文件路径，如果不存在返回None
-    """
     zip_path = get_project_zip_path(project_id)
-    
     if zip_path.exists():
         return str(zip_path)
-    
     return None
 
 
 async def get_project_zip_meta(project_id: str) -> Optional[dict]:
-    """
-    获取项目ZIP文件元数据
-    
-    Args:
-        project_id: 项目ID
-        
-    Returns:
-        元数据字典，如果不存在返回None
-    """
     meta_path = get_project_zip_meta_path(project_id)
-    
     if not meta_path.exists():
         return None
-    
-    import json
-    with open(meta_path, 'r') as f:
-        return json.load(f)
+    with open(meta_path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+async def get_project_persistent_source_meta(project_id: str) -> Optional[dict[str, str]]:
+    source_root = get_project_persistent_source_path(project_id)
+    if not source_root.exists() or not source_root.is_dir():
+        return None
+    return {
+        "path": str(source_root.resolve()),
+        "updated_at": datetime.fromtimestamp(source_root.stat().st_mtime, tz=timezone.utc).isoformat(),
+    }
 
 
 async def delete_project_zip(project_id: str) -> bool:
-    """
-    删除项目ZIP文件
-    
-    Args:
-        project_id: 项目ID
-        
-    Returns:
-        是否成功删除
-    """
     zip_path = get_project_zip_path(project_id)
     meta_path = get_project_zip_meta_path(project_id)
-    
+
     deleted = False
-    
     if zip_path.exists():
         os.remove(zip_path)
         deleted = True
-        print(f"✓ 已删除ZIP文件: {project_id}")
-    
     if meta_path.exists():
         os.remove(meta_path)
-    
     return deleted
 
 
+async def delete_project_persistent_source(project_id: str) -> bool:
+    source_root = get_project_persistent_source_path(project_id)
+    if not source_root.exists() or not source_root.is_dir():
+        return False
+    shutil.rmtree(source_root, ignore_errors=True)
+    return True
+
+
 async def has_project_zip(project_id: str) -> bool:
-    """
-    检查项目是否有ZIP文件
-    
-    Args:
-        project_id: 项目ID
-        
-    Returns:
-        是否存在ZIP文件
-    """
-    zip_path = get_project_zip_path(project_id)
-    return zip_path.exists()
+    return get_project_zip_path(project_id).exists()
+
+
+async def has_project_persistent_source(project_id: str) -> bool:
+    source_root = get_project_persistent_source_path(project_id)
+    return source_root.exists() and source_root.is_dir()

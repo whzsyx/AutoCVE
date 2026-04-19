@@ -193,12 +193,9 @@ TOOL_USAGE_GUIDE = """
 | `dataflow_analysis` | 数据流追踪验证 |
 | `code_analysis` | 代码结构分析 |
 
-#### 辅助工具（RAG 优先！）
+#### 辅助工具
 | 工具 | 用途 |
 |------|------|
-| `rag_query` | **🔥 首选代码搜索工具** - 语义搜索，查找业务逻辑和漏洞上下文 |
-| `security_search` | **🔥 首选安全搜索工具** - 查找特定的安全敏感代码模式 |
-| `function_context` | **🔥 理解代码结构** - 获取函数调用关系和定义 |
 | `read_file` | 读取文件内容验证发现 |
 | `list_files` | ⚠️ **仅用于** 了解根目录结构，**严禁** 用于遍历代码查找内容 |
 | `search_code` | ⚠️ **仅用于** 查找非常具体的字符串常量，**严禁** 作为主要代码搜索手段 |
@@ -207,9 +204,6 @@ TOOL_USAGE_GUIDE = """
 ### 🔍 代码搜索工具对比
 | 工具 | 特点 | 适用场景 |
 |------|------|---------|
-| `rag_query` | **🔥 语义搜索**，理解代码含义 | **首选！** 查找"处理用户输入的函数"、"数据库查询逻辑" |
-| `security_search` | **🔥 安全专用搜索** | **首选！** 查找"SQL注入相关代码"、"认证授权代码" |
-| `function_context` | **🔥 函数上下文** | 查找某函数的调用者和被调用者 |
 | `search_code` | **❌ 关键词搜索**，仅精确匹配 | **不推荐**，仅用于查找确定的常量或变量名 |
 
 **❌ 严禁行为**：
@@ -217,9 +211,9 @@ TOOL_USAGE_GUIDE = """
 2. **不要** 使用 `search_code` 搜索通用关键词（如 "function", "user"），这会产生大量无用结果
 
 **✅ 推荐行为**：
-1. **始终优先使用 RAG 工具** (`rag_query`, `security_search`)
-2. `rag_query` 可以理解自然语言，如 "Show me the login function"
-3. 仅在确实需要精确匹配特定字符串时才使用 `search_code`
+1. 优先使用 `read_file`、`search_code` 和专业扫描工具交叉验证
+2. `search_code` 仅在确实需要精确匹配特定字符串时使用
+3. 需要理解完整上下文时，先定位再读取源文件，不依赖语义向量检索
 
 ### 📋 推荐分析流程
 
@@ -231,10 +225,10 @@ Action Input: {"directory": ".", "max_depth": 2}
 ```
 了解项目根目录结构（不要遍历全项目）
 
-**🔥 RAG 搜索关键逻辑（RAG 优先！）：**
-```
-Action: rag_query
-Action Input: {"query": "用户的登录认证逻辑在哪里？", "top_k": 5}
+**定位关键逻辑：**
+``` 
+Action: search_code
+Action Input: {"keyword": "login", "directory": ".", "max_results": 20}
 ```
 
 #### 第二步：外部工具全面扫描（60%时间）⚡重点！

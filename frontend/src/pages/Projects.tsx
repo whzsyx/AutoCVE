@@ -40,7 +40,13 @@ import {
 import { api } from "@/shared/config/database";
 import { validateZipFile } from "@/features/projects/services";
 import type { Project, CreateProjectForm, ManagedLocalDirectory } from "@/shared/types";
-import { uploadZipFile, getZipFileInfo, type ZipFileMeta } from "@/shared/utils/zipStorage";
+import {
+  deleteProjectSourceArtifacts,
+  formatFileSize,
+  getZipFileInfo,
+  type ZipFileMeta,
+  uploadZipFile,
+} from "@/shared/utils/zipStorage";
 import { isLocalDirectoryProject, isRepositoryProject, isZipProject, getSourceTypeBadge } from "@/shared/utils/projectUtils";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
@@ -86,11 +92,14 @@ export default function Projects() {
   });
 
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [keepZipArchive, setKeepZipArchive] = useState(true);
 
   // 编辑对话框中的ZIP文件状态
   const [editZipInfo, setEditZipInfo] = useState<ZipFileMeta | null>(null);
   const [editZipFile, setEditZipFile] = useState<File | null>(null);
   const [loadingEditZipInfo, setLoadingEditZipInfo] = useState(false);
+  const [editKeepZipArchive, setEditKeepZipArchive] = useState(true);
+  const [deletingZipArtifacts, setDeletingZipArtifacts] = useState(false);
   const editZipInputRef = useRef<HTMLInputElement>(null);
 
   // 将小写语言名转换为显示格式
@@ -206,6 +215,7 @@ export default function Projects() {
       programming_languages: []
     });
     setSelectedFile(null);
+    setKeepZipArchive(true);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -258,7 +268,7 @@ export default function Projects() {
       } as any);
 
       try {
-        await uploadZipFile(project.id, selectedFile);
+        await uploadZipFile(project.id, selectedFile, { keepArchive: keepZipArchive });
       } catch (error) {
         console.error('保存ZIP文件失败:', error);
       }
@@ -342,6 +352,7 @@ export default function Projects() {
       try {
         const zipInfo = await getZipFileInfo(project.id);
         setEditZipInfo(zipInfo);
+        setEditKeepZipArchive(Boolean(zipInfo.has_file));
       } catch (error) {
         console.error('加载ZIP文件信息失败:', error);
       } finally {
@@ -350,35 +361,103 @@ export default function Projects() {
     }
   };
 
+  const refreshEditZipInfo = async (projectId: string) => {
+    setLoadingEditZipInfo(true);
+    try {
+      const zipInfo = await getZipFileInfo(projectId);
+      setEditZipInfo(zipInfo);
+      setEditKeepZipArchive(Boolean(zipInfo.has_file));
+    } catch (error) {
+      console.error("Failed to load ZIP file info:", error);
+      toast.error("加载源码归档信息失败");
+    } finally {
+      setLoadingEditZipInfo(false);
+    }
+  };
+
+  const handleDeleteZipArtifacts = async (
+    deleteZip: boolean,
+    deletePersistentSource: boolean,
+  ) => {
+    if (!projectToEdit) {
+      return;
+    }
+
+    const targetLabel = deleteZip && deletePersistentSource
+      ? "the original ZIP archive and persistent source directory"
+      : deleteZip
+        ? "the original ZIP archive"
+        : "the persistent source directory";
+
+    if (!window.confirm(`Delete ${targetLabel}? This cannot be undone.`)) {
+      return;
+    }
+
+    try {
+      setDeletingZipArtifacts(true);
+      const result = await deleteProjectSourceArtifacts(projectToEdit.id, {
+        deleteZip,
+        deletePersistentSource,
+      });
+
+      await refreshEditZipInfo(projectToEdit.id);
+      await loadProjects();
+
+      toast.success("Project source artifacts deleted", {
+        description: [
+          result.deleted_zip ? "ZIP archive removed" : null,
+          result.deleted_persistent_source ? "Persistent source directory removed" : null,
+        ].filter(Boolean).join(", "),
+      });
+
+      if (result.deleted_persistent_source) {
+        setEditForm((current) => ({
+          ...current,
+          local_path: "",
+        }));
+      }
+    } catch (error) {
+      console.error("Failed to delete project source artifacts:", error);
+      toast.error("Failed to delete project source artifacts");
+    } finally {
+      setDeletingZipArtifacts(false);
+    }
+  };
+
   const handleSaveEdit = async () => {
     if (!projectToEdit) return;
 
     if (!editForm.name.trim()) {
-      toast.error("项目名称不能为空");
+      toast.error("Project name cannot be empty");
       return;
     }
 
     try {
       await api.updateProject(projectToEdit.id, editForm);
 
-      if (editZipFile && editForm.source_type === 'zip') {
-        const result = await uploadZipFile(projectToEdit.id, editZipFile);
+      if (editZipFile && editForm.source_type === "zip") {
+        const result = await uploadZipFile(projectToEdit.id, editZipFile, {
+          keepArchive: editKeepZipArchive,
+        });
         if (result.success) {
-          toast.success(`ZIP文件已更新: ${result.original_filename}`);
+          toast.success(`ZIP file updated: ${result.original_filename}`);
+          setEditZipFile(null);
+          await refreshEditZipInfo(projectToEdit.id);
         } else {
-          toast.error(`ZIP文件上传失败: ${result.message}`);
+          toast.error(`ZIP upload failed: ${result.message}`);
+          return;
         }
       }
 
-      toast.success(`项目 "${editForm.name}" 已更新`);
+      toast.success(`Project "${editForm.name}" updated`);
       setShowEditDialog(false);
       setProjectToEdit(null);
       setEditZipFile(null);
       setEditZipInfo(null);
       loadProjects();
     } catch (error) {
-      console.error('Failed to update project:', error);
-      toast.error("更新项目失败");
+      console.error("Failed to update project:", error);
+      toast.error("Failed to update project");
     }
   };
 
@@ -758,6 +837,23 @@ export default function Projects() {
                     </div>
                   )}
 
+                  <label className="flex items-start gap-3 rounded border border-border bg-muted/30 p-3">
+                    <input
+                      type="checkbox"
+                      checked={keepZipArchive}
+                      onChange={(event) => setKeepZipArchive(event.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border border-border bg-transparent"
+                    />
+                    <div className="space-y-1">
+                      <p className="text-sm font-mono font-bold text-foreground">
+                        保留原始 ZIP 归档
+                      </p>
+                      <p className="text-xs font-mono text-muted-foreground">
+                        持久源码目录始终会保存到 `projects/`。关闭此项后，仅保留解压后的持久源码目录。
+                      </p>
+                    </div>
+                  </label>
+
                   {uploading && (
                     <div className="space-y-1.5">
                       <div className="flex items-center justify-between text-xs font-mono text-muted-foreground">
@@ -774,9 +870,9 @@ export default function Projects() {
                       <div className="text-xs font-mono text-amber-300">
                         <p className="font-bold mb-1 uppercase">上传协议:</p>
                         <ul className="space-y-0.5 list-disc list-inside text-amber-400/80">
-                          <li>确保完整的项目代码</li>
-                          <li>移除 node_modules 等依赖目录</li>
-                          <li>包含必要的配置文件</li>
+                          <li>上传后会先生成持久源码目录，供 Agent 直审默认直接使用</li>
+                          <li>工作流审计会从持久源码目录复制临时工作副本后再执行</li>
+                          <li>是否保留原始 ZIP 归档由上方选项控制，可在项目管理中手动删除</li>
                         </ul>
                       </div>
                     </div>
@@ -1298,7 +1394,7 @@ export default function Projects() {
             )}
 
             {/* ZIP项目文件管理 */}
-            {editForm.source_type === 'zip' && (
+            {editForm.source_type === "zip" && (
               <div className="space-y-4">
                 <h3 className="font-mono font-bold uppercase text-sm text-muted-foreground border-b border-border pb-2 flex items-center gap-2">
                   <Upload className="w-4 h-4" />
@@ -1308,49 +1404,73 @@ export default function Projects() {
                 {loadingEditZipInfo ? (
                   <div className="flex items-center space-x-3 p-4 bg-sky-500/10 border border-sky-500/30 rounded">
                     <div className="loading-spinner w-5 h-5"></div>
-                    <p className="text-sm text-sky-400 font-bold font-mono">正在加载ZIP文件信息...</p>
-                  </div>
-                ) : editZipInfo?.has_file ? (
-                  <div className="bg-emerald-500/10 border border-emerald-500/30 p-4 rounded">
-                    <div className="flex items-start space-x-3">
-                      <FileText className="w-5 h-5 text-emerald-400 mt-0.5" />
-                      <div className="flex-1 text-sm font-mono">
-                        <p className="font-bold text-emerald-300 mb-1 uppercase">当前存储的ZIP文件</p>
-                        <p className="text-emerald-400/80 text-xs">
-                          文件名: {editZipInfo.original_filename}
-                          {editZipInfo.file_size && (
-                            <> ({editZipInfo.file_size >= 1024 * 1024
-                              ? `${(editZipInfo.file_size / 1024 / 1024).toFixed(2)} MB`
-                              : `${(editZipInfo.file_size / 1024).toFixed(2)} KB`
-                            })</>
-                          )}
-                        </p>
-                        {editZipInfo.uploaded_at && (
-                          <p className="text-emerald-500/60 text-xs mt-0.5">
-                            上传时间: {new Date(editZipInfo.uploaded_at).toLocaleString('zh-CN')}
-                          </p>
-                        )}
-                      </div>
-                    </div>
+                    <p className="text-sm text-sky-400 font-bold font-mono">正在加载源码工件信息...</p>
                   </div>
                 ) : (
-                  <div className="bg-amber-500/10 border border-amber-500/30 p-4 rounded">
-                    <div className="flex items-start space-x-3">
-                      <AlertCircle className="w-5 h-5 text-amber-400 mt-0.5" />
-                      <div className="text-sm font-mono">
-                        <p className="font-bold text-amber-300 mb-1 uppercase">暂无ZIP文件</p>
-                        <p className="text-amber-400/80 text-xs">
-                          此项目还没有上传ZIP文件，请上传文件以便进行代码审计。
-                        </p>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <div className={`rounded border p-4 ${editZipInfo?.has_file ? "border-emerald-500/30 bg-emerald-500/10" : "border-amber-500/30 bg-amber-500/10"}`}>
+                      <div className="flex items-start gap-3">
+                        <FileText className={`mt-0.5 h-5 w-5 ${editZipInfo?.has_file ? "text-emerald-400" : "text-amber-400"}`} />
+                        <div className="space-y-1 text-sm font-mono">
+                          <p className={`font-bold uppercase ${editZipInfo?.has_file ? "text-emerald-300" : "text-amber-300"}`}>
+                            原始 ZIP 归档
+                          </p>
+                          {editZipInfo?.has_file ? (
+                            <>
+                              <p className="text-xs text-muted-foreground">
+                                文件: {editZipInfo.original_filename}
+                                {typeof editZipInfo.file_size === "number" ? ` (${formatFileSize(editZipInfo.file_size)})` : ""}
+                              </p>
+                              {editZipInfo.uploaded_at && (
+                                <p className="text-xs text-muted-foreground">
+                                  上传时间: {new Date(editZipInfo.uploaded_at).toLocaleString("zh-CN")}
+                                </p>
+                              )}
+                            </>
+                          ) : (
+                            <p className="text-xs text-muted-foreground">
+                              当前未保留原始 ZIP 归档。
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className={`rounded border p-4 ${editZipInfo?.has_persistent_source ? "border-emerald-500/30 bg-emerald-500/10" : "border-amber-500/30 bg-amber-500/10"}`}>
+                      <div className="flex items-start gap-3">
+                        <Folder className={`mt-0.5 h-5 w-5 ${editZipInfo?.has_persistent_source ? "text-emerald-400" : "text-amber-400"}`} />
+                        <div className="space-y-1 text-sm font-mono">
+                          <p className={`font-bold uppercase ${editZipInfo?.has_persistent_source ? "text-emerald-300" : "text-amber-300"}`}>
+                            持久源码目录
+                          </p>
+                          {editZipInfo?.has_persistent_source ? (
+                            <>
+                              <p className="break-all text-xs text-muted-foreground">
+                                路径: {editZipInfo.persistent_source_path}
+                              </p>
+                              {editZipInfo.persistent_source_updated_at && (
+                                <p className="text-xs text-muted-foreground">
+                                  更新时间: {new Date(editZipInfo.persistent_source_updated_at).toLocaleString("zh-CN")}
+                                </p>
+                              )}
+                              <p className="text-xs text-emerald-300/80">
+                                Agent 直审默认直接使用这份目录，workflow 审计会先复制临时工作副本。
+                              </p>
+                            </>
+                          ) : (
+                            <p className="text-xs text-muted-foreground">
+                              当前没有可用的持久源码目录。重新上传 ZIP 后会自动生成。
+                            </p>
+                          )}
+                        </div>
                       </div>
                     </div>
                   </div>
                 )}
 
-                {/* 上传新文件 */}
-                <div className="space-y-2">
+                <div className="space-y-3 rounded border border-border bg-muted/20 p-4">
                   <Label className="font-mono font-bold uppercase text-xs text-muted-foreground">
-                    {editZipInfo?.has_file ? '更新ZIP文件' : '上传ZIP文件'}
+                    {editZipInfo?.has_persistent_source ? "替换源码 ZIP" : "上传源码 ZIP"}
                   </Label>
                   <input
                     ref={editZipInputRef}
@@ -1363,7 +1483,7 @@ export default function Projects() {
                         const validation = validateZipFile(file);
                         if (!validation.valid) {
                           toast.error(validation.error || "文件无效");
-                          e.target.value = '';
+                          e.target.value = "";
                           return;
                         }
                         setEditZipFile(file);
@@ -1378,7 +1498,7 @@ export default function Projects() {
                         <FileText className="w-4 h-4 text-sky-400" />
                         <span className="text-sm font-mono font-bold text-sky-300">{editZipFile.name}</span>
                         <span className="text-xs text-muted-foreground">
-                          ({(editZipFile.size / 1024 / 1024).toFixed(2)} MB)
+                          ({formatFileSize(editZipFile.size)})
                         </span>
                       </div>
                       <Button
@@ -1397,9 +1517,61 @@ export default function Projects() {
                       className="cyber-btn-outline w-full"
                     >
                       <Upload className="w-4 h-4 mr-2" />
-                      {editZipInfo?.has_file ? '选择新文件替换' : '选择ZIP文件'}
+                      {editZipInfo?.has_persistent_source ? "选择新 ZIP 替换" : "选择 ZIP 文件"}
                     </Button>
                   )}
+
+                  <label className="flex items-start gap-3 rounded border border-border bg-background/40 p-3">
+                    <input
+                      type="checkbox"
+                      checked={editKeepZipArchive}
+                      onChange={(event) => setEditKeepZipArchive(event.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border border-border bg-transparent"
+                    />
+                    <div className="space-y-1">
+                      <p className="text-sm font-mono font-bold text-foreground">保留原始 ZIP 归档</p>
+                      <p className="text-xs font-mono text-muted-foreground">
+                        上传替换包时，无论是否保留归档，系统都会重建持久源码目录。
+                      </p>
+                    </div>
+                  </label>
+                </div>
+
+                <div className="space-y-3 rounded border border-rose-500/25 bg-rose-500/5 p-4">
+                  <div className="space-y-1">
+                    <p className="text-sm font-mono font-bold uppercase text-rose-300">手动删除源码工件</p>
+                    <p className="text-xs font-mono text-muted-foreground">
+                      删除能力已移动到项目管理中。项目本身不会自动清理 ZIP 归档或持久源码目录。
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="cyber-btn-outline"
+                      disabled={deletingZipArtifacts || !editZipInfo?.has_file}
+                      onClick={() => void handleDeleteZipArtifacts(true, false)}
+                    >
+                      删除原始 ZIP
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="cyber-btn-outline"
+                      disabled={deletingZipArtifacts || !editZipInfo?.has_persistent_source}
+                      onClick={() => void handleDeleteZipArtifacts(false, true)}
+                    >
+                      删除持久源码目录
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      disabled={deletingZipArtifacts || (!editZipInfo?.has_file && !editZipInfo?.has_persistent_source)}
+                      onClick={() => void handleDeleteZipArtifacts(true, true)}
+                    >
+                      全部删除
+                    </Button>
+                  </div>
                 </div>
               </div>
             )}

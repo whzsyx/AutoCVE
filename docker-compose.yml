@@ -52,6 +52,7 @@ services:
       AGENT_ENABLED: 'true'
       SANDBOX_ENABLED: 'true'
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-auditai-sandbox:latest}
+      MANAGED_PROJECTS_ROOT: /workspace/projects
       HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:-}
       HTTP_PROXY: ''
       HTTPS_PROXY: ''
@@ -70,6 +71,7 @@ services:
       - backend_uploads:/app/uploads
       - ./skill_library:/app/skill_library
       - ./report_template_library:/app/report_template_library
+      - ./projects:/workspace/projects
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - auditai-network

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
 import uuid
+import zipfile
 
 import pytest
 from fastapi import FastAPI
@@ -17,6 +19,7 @@ from app.db.base import Base
 from app.models.user import User
 import app.api.v1.endpoints.projects as projects_endpoint
 from app.models.project import Project
+from app.services.zip_storage import save_project_zip
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 
@@ -31,6 +34,24 @@ def make_managed_root() -> Path:
     managed_root = WORKSPACE_ROOT / ".pytest-managed-projects" / str(uuid.uuid4())
     managed_root.mkdir(parents=True, exist_ok=True)
     return managed_root
+
+
+@pytest.mark.asyncio
+async def test_list_managed_local_directories_creates_missing_root():
+    managed_root = WORKSPACE_ROOT / ".pytest-managed-projects" / str(uuid.uuid4()) / "projects"
+    original_root = projects_endpoint.settings.MANAGED_PROJECTS_ROOT
+    projects_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
+
+    try:
+        payload = await projects_endpoint.list_managed_local_directories(
+            current_user=SimpleNamespace(id="user-1", is_active=True),
+        )
+        assert managed_root.exists() is True
+        assert managed_root.is_dir() is True
+        assert payload == []
+    finally:
+        projects_endpoint.settings.MANAGED_PROJECTS_ROOT = original_root
+        shutil.rmtree(managed_root.parent, ignore_errors=True)
 
 
 @pytest.mark.asyncio
@@ -329,3 +350,203 @@ async def test_get_local_directory_project_file_content_rejects_path_escape():
 
     assert response.status_code == 400
     assert "project root" in response.json()["detail"]
+
+
+def build_zip_bytes(files: dict[str, str]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_buffer:
+        for path, content in files.items():
+            zip_buffer.writestr(path, content)
+    return buffer.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_upload_project_zip_extracts_persistent_source_and_can_skip_archive_retention():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as db:
+        db.add(
+            User(
+                id="user-1",
+                email="owner@example.com",
+                hashed_password="not-a-real-hash",
+                full_name="Owner",
+                is_active=True,
+            )
+        )
+        db.add(
+            Project(
+                id="project-zip-1",
+                name="Zip Demo",
+                owner_id="user-1",
+                source_type="zip",
+                repository_type="other",
+                default_branch="main",
+            )
+        )
+        await db.commit()
+
+    managed_root = make_managed_root()
+    zip_root = managed_root / "zip-storage"
+    original_managed_root = projects_endpoint.settings.MANAGED_PROJECTS_ROOT
+    original_zip_root = projects_endpoint.settings.ZIP_STORAGE_PATH
+    projects_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
+    projects_endpoint.settings.ZIP_STORAGE_PATH = str(zip_root)
+
+    app = build_test_app()
+
+    async def override_get_db():
+        async with session_factory() as db:
+            yield db
+
+    async def override_get_current_user():
+        return SimpleNamespace(id="user-1", is_active=True)
+
+    app.dependency_overrides[deps.get_db] = override_get_db
+    app.dependency_overrides[deps.get_current_user] = override_get_current_user
+
+    transport = ASGITransport(app=app)
+    zip_bytes = build_zip_bytes({"demo/src/app.py": "print('zip source')\n"})
+
+    try:
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            upload_response = await client.post(
+                "/api/v1/projects/project-zip-1/zip",
+                data={"keep_archive": "false"},
+                files={"file": ("demo.zip", zip_bytes, "application/zip")},
+            )
+            info_response = await client.get("/api/v1/projects/project-zip-1/zip")
+            preview_response = await client.get(
+                "/api/v1/projects/project-zip-1/file-content",
+                params={"path": "src/app.py"},
+            )
+    finally:
+        projects_endpoint.settings.MANAGED_PROJECTS_ROOT = original_managed_root
+        projects_endpoint.settings.ZIP_STORAGE_PATH = original_zip_root
+
+    async with session_factory() as db:
+        project = await db.get(Project, "project-zip-1")
+
+    await engine.dispose()
+
+    assert upload_response.status_code == 200
+    assert info_response.status_code == 200
+    assert preview_response.status_code == 200
+    assert project.local_path
+    assert Path(project.local_path).is_dir() is True
+    assert Path(project.local_path, "src", "app.py").read_text(encoding="utf-8") == "print('zip source')\n"
+    assert preview_response.json()["content"] == "print('zip source')\n"
+    assert info_response.json()["has_file"] is False
+    assert info_response.json()["has_persistent_source"] is True
+    assert info_response.json()["persistent_source_path"] == str(Path(project.local_path).resolve())
+
+
+@pytest.mark.asyncio
+async def test_delete_project_source_artifacts_supports_source_only_and_both():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as db:
+        db.add(
+            User(
+                id="user-1",
+                email="owner@example.com",
+                hashed_password="not-a-real-hash",
+                full_name="Owner",
+                is_active=True,
+            )
+        )
+        project = Project(
+            id="project-zip-delete-1",
+            name="Zip Delete Demo",
+            owner_id="user-1",
+            source_type="zip",
+            repository_type="other",
+            default_branch="main",
+        )
+        db.add(project)
+        await db.commit()
+
+    managed_root = make_managed_root()
+    zip_root = managed_root / "zip-storage"
+    original_managed_root = projects_endpoint.settings.MANAGED_PROJECTS_ROOT
+    original_zip_root = projects_endpoint.settings.ZIP_STORAGE_PATH
+    projects_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
+    projects_endpoint.settings.ZIP_STORAGE_PATH = str(zip_root)
+
+    persistent_source = managed_root / "project-zip-delete-1"
+    persistent_source.mkdir(parents=True, exist_ok=True)
+    (persistent_source / "README.md").write_text("persisted source", encoding="utf-8")
+
+    temp_archive = managed_root / "archive.zip"
+    temp_archive.write_bytes(build_zip_bytes({"README.md": "archive"}))
+    await save_project_zip("project-zip-delete-1", str(temp_archive), "archive.zip")
+
+    async with session_factory() as db:
+        project = await db.get(Project, "project-zip-delete-1")
+        project.local_path = str(persistent_source.resolve())
+        await db.commit()
+
+    app = build_test_app()
+
+    async def override_get_db():
+        async with session_factory() as db:
+            yield db
+
+    async def override_get_current_user():
+        return SimpleNamespace(id="user-1", is_active=True)
+
+    app.dependency_overrides[deps.get_db] = override_get_db
+    app.dependency_overrides[deps.get_current_user] = override_get_current_user
+
+    transport = ASGITransport(app=app)
+
+    try:
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            delete_source_response = await client.post(
+                "/api/v1/projects/project-zip-delete-1/source-artifacts/delete",
+                json={"delete_persistent_source": True},
+            )
+            info_after_source_delete = await client.get("/api/v1/projects/project-zip-delete-1/zip")
+
+            persistent_source.mkdir(parents=True, exist_ok=True)
+            (persistent_source / "README.md").write_text("persisted source again", encoding="utf-8")
+            async with session_factory() as db:
+                project = await db.get(Project, "project-zip-delete-1")
+                project.local_path = str(persistent_source.resolve())
+                await db.commit()
+
+            delete_both_response = await client.post(
+                "/api/v1/projects/project-zip-delete-1/source-artifacts/delete",
+                json={"delete_zip": True, "delete_persistent_source": True},
+            )
+            final_info_response = await client.get("/api/v1/projects/project-zip-delete-1/zip")
+    finally:
+        projects_endpoint.settings.MANAGED_PROJECTS_ROOT = original_managed_root
+        projects_endpoint.settings.ZIP_STORAGE_PATH = original_zip_root
+        shutil.rmtree(managed_root, ignore_errors=True)
+
+    async with session_factory() as db:
+        project = await db.get(Project, "project-zip-delete-1")
+
+    await engine.dispose()
+
+    assert delete_source_response.status_code == 200
+    assert delete_source_response.json()["deleted_persistent_source"] is True
+    assert delete_source_response.json()["deleted_zip"] is False
+    assert info_after_source_delete.json()["has_file"] is True
+    assert info_after_source_delete.json()["has_persistent_source"] is False
+
+    assert delete_both_response.status_code == 200
+    assert delete_both_response.json()["deleted_zip"] is True
+    assert delete_both_response.json()["deleted_persistent_source"] is True
+    assert final_info_response.json()["has_file"] is False
+    assert final_info_response.json()["has_persistent_source"] is False
+    assert project.local_path is None

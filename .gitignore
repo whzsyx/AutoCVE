@@ -209,3 +209,7 @@ backend/pytest-cache-files-*/
 # 日志和环境文件
 .env
 *.log
+
+# 审计的项目
+/projects/*
+!/projects/.gitkeep

@@ -4,10 +4,11 @@ import { Check, ChevronDown, ChevronUp, Copy, DatabaseZap, Hammer, Loader2, Shie
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { AuditSessionToolCall } from "@/pages/AuditSession/types";
+import type { DirectAuditApprovalScope } from "@/shared/api/agentDirectAudit";
 
 interface ToolTracePanelProps {
   toolCalls: AuditSessionToolCall[];
-  onApproveToolCall?: (toolCall: AuditSessionToolCall) => void | Promise<void>;
+  onApproveToolCall?: (toolCall: AuditSessionToolCall, scope: DirectAuditApprovalScope) => void | Promise<void>;
   approvalLoadingToolCallId?: string | null;
 }
 
@@ -40,9 +41,18 @@ function getApprovalLabel(toolCall: AuditSessionToolCall, approvalState: ReturnT
     return null;
   }
   if (toolCall.tool_name === "Write") {
+    if (approvalState.guardrailCode === "overwrite_existing_requires_approval") {
+      return "批准覆盖此文件";
+    }
     return "批准写入此文件";
   }
   if (toolCall.tool_name === "Bash" || toolCall.tool_name === "PowerShell") {
+    if (approvalState.guardrailCode === "shell_destructive_command_requires_approval") {
+      return `批准执行高风险${toolCall.tool_name}`;
+    }
+    if (approvalState.guardrailCode === "shell_outside_project_root_requires_approval") {
+      return `批准执行跨目录${toolCall.tool_name}`;
+    }
     return `批准运行${toolCall.tool_name}`;
   }
   return "批准此次操作";
@@ -54,7 +64,7 @@ function ToolTraceCard({
   approvalLoadingToolCallId,
 }: {
   toolCall: AuditSessionToolCall;
-  onApproveToolCall?: (toolCall: AuditSessionToolCall) => void | Promise<void>;
+  onApproveToolCall?: (toolCall: AuditSessionToolCall, scope: DirectAuditApprovalScope) => void | Promise<void>;
   approvalLoadingToolCallId?: string | null;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -66,7 +76,11 @@ function ToolTraceCard({
       (
         (toolCall.tool_name === "Write" && approvalState.guardrailCode !== "artifact_exists_requires_overwrite") ||
         ((toolCall.tool_name === "Bash" || toolCall.tool_name === "PowerShell") &&
-          approvalState.guardrailCode === "shell_command_requires_approval")
+          (
+            approvalState.guardrailCode === "shell_command_requires_approval" ||
+            approvalState.guardrailCode === "shell_destructive_command_requires_approval" ||
+            approvalState.guardrailCode === "shell_outside_project_root_requires_approval"
+          ))
       ),
   );
   const approvalLoading = approvalLoadingToolCallId === toolCall.id;
@@ -134,18 +148,32 @@ function ToolTraceCard({
             <p className="mt-1 text-[11px] text-amber-800/80">Guardrail: {approvalState.guardrailCode}</p>
           ) : null}
           {canApprove ? (
-            <div className="mt-3">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={approvalLoading}
-                className="h-8 rounded-full border-amber-300 bg-white px-3 text-xs text-amber-900 hover:bg-amber-100"
-                onClick={() => void onApproveToolCall?.(toolCall)}
-              >
-                {approvalLoading ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="mr-1.5 h-3.5 w-3.5" />}
-                {approvalLoading ? "批准中..." : approvalLabel}
-              </Button>
+            <div className="mt-3 space-y-2">
+              <p className="text-[11px] text-amber-800/85">{approvalLabel}</p>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={approvalLoading}
+                  className="h-8 rounded-full border-amber-300 bg-white px-3 text-xs text-amber-900 hover:bg-amber-100"
+                  onClick={() => void onApproveToolCall?.(toolCall, "single_use")}
+                >
+                  {approvalLoading ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="mr-1.5 h-3.5 w-3.5" />}
+                  仅本次批准
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={approvalLoading}
+                  className="h-8 rounded-full border-amber-300 bg-white px-3 text-xs text-amber-900 hover:bg-amber-100"
+                  onClick={() => void onApproveToolCall?.(toolCall, "session")}
+                >
+                  {approvalLoading ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="mr-1.5 h-3.5 w-3.5" />}
+                  本会话批准
+                </Button>
+              </div>
             </div>
           ) : null}
         </div>

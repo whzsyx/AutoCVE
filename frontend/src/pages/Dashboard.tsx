@@ -12,7 +12,7 @@ import {
 } from "recharts";
 import {
   Activity, AlertTriangle, Clock, Code,
-  FileText, GitBranch, Shield, TrendingUp, Zap,
+  FileText, FolderGit2, GitBranch, Shield, TrendingUp, Zap,
   BarChart3, Target, ArrowUpRight, Calendar,
   MessageSquare, Bot, Cpu, Terminal
 } from "lucide-react";

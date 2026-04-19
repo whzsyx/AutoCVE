@@ -3,6 +3,9 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
 import json
+import shutil
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
@@ -682,6 +685,168 @@ async def test_auto_generate_managed_reports_skips_when_verification_enabled(mon
     assert message_result.scalars().all() == []
 
 
+@pytest.mark.asyncio
+async def test_auto_generate_managed_reports_runs_when_verification_config_missing(monkeypatch):
+    engine = create_async_engine('sqlite+aiosqlite:///:memory:')
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as db:
+        user = User(
+            id='user-1',
+            email='owner@example.com',
+            hashed_password='not-a-real-hash',
+            full_name='Owner',
+            is_active=True,
+        )
+        project = Project(
+            id='project-1',
+            name='Managed Project',
+            description='demo',
+            owner_id=user.id,
+            source_type='repository',
+            repository_url='https://example.com/repo.git',
+        )
+        task = AgentTask(
+            id='task-1',
+            project_id=project.id,
+            created_by=user.id,
+            name='Audit demo',
+            version_label='runtime-test',
+            status=AgentTaskStatus.COMPLETED,
+            current_phase='reporting',
+            agent_config={'finding_runtime_stack': 'runtime'},
+        )
+        finding = AgentFinding(
+            id='finding-1',
+            task_id=task.id,
+            title='Recovered finding',
+            severity='high',
+            vulnerability_type='idor',
+            description='Recovered from transcript',
+            file_path='server/api/UserRoute.js',
+            line_start=10,
+            line_end=20,
+        )
+        session = AuditSession(
+            id='session-1',
+            project_id=project.id,
+            task_id=task.id,
+            runtime_stack='runtime',
+            state='completed',
+            system_prompt='audit',
+            recon_payload={'project_info': {'workspace_root': '/tmp/project'}},
+            runtime_state_json={},
+        )
+        db.add_all([user, project, task, finding, session])
+        await db.commit()
+
+        async def fake_get_user_config(db_session, user_id):
+            del db_session, user_id
+            return {}
+
+        async def fake_generate_managed_report_bundle_from_session(
+            db_session,
+            *,
+            session,
+            task,
+            finding,
+            managed_vulnerability,
+            report_service,
+        ):
+            del db_session, task, finding, managed_vulnerability, report_service
+            assert session.id == 'session-1'
+            return GeneratedReportBundle(
+                report_en='# EN\n\n## Summary\n\n## Vulnerability Description\n\n## Exploitation\n\n## Impact\n\n## Remediation\n\n## Disclosure Notes\n\n## Supplemental Information\n\n### Affected products\n- Ecosystem: self-hosted\n- Package name: demo-app\n- Affected versions: to be confirmed\n- Patched versions: none confirmed\n\n### Severity\n- Scoring method: CVSS v3.1\n- Score: 8.6\n- Vector string: CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N\n\n### Weaknesses\n- CWE: CWE-639 Authorization Bypass Through User-Controlled Key',
+                report_zh='# ZH\n\n## Summary\n\n## Vulnerability Description\n\n## Exploitation\n\n## Impact\n\n## Remediation\n\n## Disclosure Notes\n\n## 补充信息\n\n### Affected products\n- Ecosystem: self-hosted\n- Package name: demo-app\n- Affected versions: to be confirmed\n- Patched versions: none confirmed\n\n### Severity\n- Scoring method: CVSS v3.1\n- Score: 8.6\n- Vector string: CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N\n\n### Weaknesses\n- CWE: CWE-639 Authorization Bypass Through User-Controlled Key',
+                report_cve='# demo_cve.md\n\n## CVE Submission Helper\n\n## Vulnerability type\n- [x] Incorrect Authorization\n\n## CWE\nCWE-639 Authorization Bypass Through User-Controlled Key\n\n## Vendor of the product(s)\nDemo Vendor\n\n## Affected product(s)/code base\n### Product\ndemo-app\n\n### Version\nto be confirmed\n\n## Attack type\n- [x] Remote\n\n## Impact\n- [x] Unauthorized access\n\n## Affected component(s)\n/api/user endpoint\n\n## Core vulnerable code path\n`javascript\nreturn res.status(200).send(user)\n`\n\n## Attack vector(s)\nGET /api/user?id=<other-user>\n\n## Suggested description of the vulnerability for use in the CVE\nIDOR in user endpoint.\n\n## Discoverer(s)/Credits\ncil\n\n## Reference(s)\n- [ ] TBD\n\n## Additional information\nNone.',
+            )
+
+        async def fail_chat_completion(self, *args, **kwargs):
+            raise AssertionError('chat_completion should not be called when runtime session is available')
+
+        monkeypatch.setattr(agent_tasks_endpoint, '_get_user_config', fake_get_user_config)
+        monkeypatch.setattr(
+            agent_tasks_endpoint,
+            '_generate_managed_report_bundle_from_session',
+            fake_generate_managed_report_bundle_from_session,
+        )
+        monkeypatch.setattr('app.services.llm.service.LLMService.chat_completion', fail_chat_completion)
+
+        stats = await agent_tasks_endpoint._auto_generate_managed_vulnerability_reports(
+            db=db,
+            task=task,
+            workflow_config={'finding_runtime_stack': 'runtime'},
+            findings=[finding],
+        )
+        await db.commit()
+
+        managed_result = await db.execute(select(ManagedVulnerability))
+        managed = managed_result.scalar_one()
+
+    await engine.dispose()
+
+    assert stats == {'generated': 1, 'failed': 0, 'skipped': 0}
+    assert managed.report_generation_status == 'completed'
+
+
+@pytest.mark.asyncio
+async def test_get_project_root_falls_back_to_managed_directory_when_zip_missing(monkeypatch):
+    managed_root = Path('D:/Projects/AuditAI/backend/.pytest-managed-projects') / str(uuid4()) / 'projects'
+    fallback_dir = managed_root / 'chartbrew-4.9.0'
+    fallback_dir.mkdir(parents=True)
+    (fallback_dir / 'README.md').write_text('fallback workspace', encoding='utf-8')
+
+    async def fake_load_project_zip(project_id):
+        del project_id
+        return None
+
+    original_root = agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT
+    monkeypatch.setattr('app.services.zip_storage.load_project_zip', fake_load_project_zip)
+    agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
+
+    project = Project(
+        id='project-zip-1',
+        name='chartbrew',
+        owner_id='user-1',
+        source_type='zip',
+        repository_type='other',
+        default_branch='main',
+    )
+
+    try:
+        project_root = await agent_tasks_endpoint._get_project_root(project, 'zip-fallback-task')
+        assert Path(project_root, 'README.md').read_text(encoding='utf-8') == 'fallback workspace'
+        assert Path(project_root).resolve() != fallback_dir.resolve()
+    finally:
+        agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = original_root
+        shutil.rmtree(managed_root.parent, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_get_project_root_copies_persistent_zip_source_directory_when_available():
+    persistent_root = Path('D:/Projects/AuditAI/backend/.pytest-managed-projects') / str(uuid4()) / 'projects' / 'zip-demo'
+    persistent_root.mkdir(parents=True)
+    (persistent_root / 'README.md').write_text('persistent workspace', encoding='utf-8')
+
+    project = Project(
+        id='project-zip-persistent-1',
+        name='zip-demo',
+        owner_id='user-1',
+        source_type='zip',
+        local_path=str(persistent_root.resolve()),
+        repository_type='other',
+        default_branch='main',
+    )
+
+    try:
+        project_root = await agent_tasks_endpoint._get_project_root(project, 'zip-persistent-task')
+        assert Path(project_root, 'README.md').read_text(encoding='utf-8') == 'persistent workspace'
+        assert Path(project_root).resolve() != persistent_root.resolve()
+    finally:
+        shutil.rmtree(persistent_root.parents[2], ignore_errors=True)
 
 
 @pytest.mark.asyncio
@@ -693,27 +858,6 @@ async def test_initialize_tools_builds_sandbox_tools_without_local_scope_error(m
 
     class FakeSandboxTool(FakeSimpleTool):
         pass
-
-    class FakeEmbeddingService:
-        def __init__(self, *args, **kwargs):
-            self.args = args
-            self.kwargs = kwargs
-            self.batch_size = None
-
-    class FakeCodeIndexer:
-        def __init__(self, *args, **kwargs):
-            self.args = args
-            self.kwargs = kwargs
-
-        async def smart_index_directory(self, **kwargs):
-            if False:
-                yield None
-            return
-
-    class FakeCodeRetriever:
-        def __init__(self, *args, **kwargs):
-            self.args = args
-            self.kwargs = kwargs
 
     simple_tool_names = [
         'FileReadTool',
@@ -734,9 +878,6 @@ async def test_initialize_tools_builds_sandbox_tools_without_local_scope_error(m
         'CreateVulnerabilityReportTool',
         'SkillBodyTool',
         'SkillResourceTool',
-        'RAGQueryTool',
-        'SecurityCodeSearchTool',
-        'FunctionContextTool',
         'SmartScanTool',
         'QuickAuditTool',
         'SandboxTool',
@@ -775,11 +916,6 @@ async def test_initialize_tools_builds_sandbox_tools_without_local_scope_error(m
     monkeypatch.setattr(agent_tasks_endpoint, 'SecurityKnowledgeQueryTool', type('SecurityKnowledgeQueryTool', (FakeSimpleTool,), {}), raising=False)
     monkeypatch.setattr(agent_tasks_endpoint, 'GetVulnerabilityKnowledgeTool', type('GetVulnerabilityKnowledgeTool', (FakeSimpleTool,), {}), raising=False)
 
-    monkeypatch.setattr(rag_module, 'EmbeddingService', FakeEmbeddingService, raising=False)
-    monkeypatch.setattr(rag_module, 'CodeIndexer', FakeCodeIndexer, raising=False)
-    monkeypatch.setattr(rag_module, 'CodeRetriever', FakeCodeRetriever, raising=False)
-    monkeypatch.setattr(rag_module, 'IndexUpdateMode', SimpleNamespace(SMART='smart'), raising=False)
-
     tools = await agent_tasks_endpoint._initialize_tools(
         project_root='D:/repo',
         llm_service=SimpleNamespace(),
@@ -792,3 +928,8 @@ async def test_initialize_tools_builds_sandbox_tools_without_local_scope_error(m
     assert isinstance(tools['finding']['sandbox_exec'], FakeSandboxTool)
     assert 'sandbox_exec' in tools['verification']
     assert isinstance(tools['verification']['sandbox_exec'], FakeSandboxTool)
+    assert 'rag_query' not in tools['recon']
+    assert 'rag_query' not in tools['analysis']
+    assert 'security_search' not in tools['analysis']
+    assert 'function_context' not in tools['analysis']
+    assert 'rag_query' not in tools['finding']

@@ -38,7 +38,7 @@
         }
       ],
       "installed_at": "2026-04-13T06:46:54.935284+00:00",
-      "updated_at": "2026-04-18T17:08:16.651638+00:00"
+      "updated_at": "2026-04-19T15:28:32.994420+00:00"
     },
     {
       "slug": "code-security",
@@ -59,7 +59,7 @@
           "skill_id": "code-security",
           "slug": "code-security",
           "agent_type": "finding",
-          "enabled": true,
+          "enabled": false,
           "always_include": true,
           "sort_order": 1,
           "match_keywords": [
@@ -93,7 +93,7 @@
         }
       ],
       "installed_at": "2026-04-13T06:46:55.166264+00:00",
-      "updated_at": "2026-04-18T17:08:17.970893+00:00"
+      "updated_at": "2026-04-19T15:28:33.196848+00:00"
     },
     {
       "slug": "cve-report-writer",
@@ -104,10 +104,28 @@
       "workspace_relative_path": "skill_library/cve-report-writer",
       "is_system": false,
       "is_active": true,
-      "bound_agents": [],
-      "bindings": [],
+      "bound_agents": [
+        "finding"
+      ],
+      "bindings": [
+        {
+          "id": "finding:cve-report-writer",
+          "skill_id": "cve-report-writer",
+          "slug": "cve-report-writer",
+          "agent_type": "finding",
+          "enabled": true,
+          "always_include": true,
+          "sort_order": 0,
+          "match_keywords": [],
+          "match_config": {},
+          "bindings_file": "/app/skill_library/agents/finding/bindings.json",
+          "skill_file": "/app/skill_library/cve-report-writer/SKILL.md",
+          "workspace_relative_path": "skill_library/cve-report-writer",
+          "skill_root": "/app/skill_library/cve-report-writer"
+        }
+      ],
       "installed_at": "2026-04-15T07:49:49.799600+00:00",
-      "updated_at": "2026-04-18T17:08:19.585736+00:00"
+      "updated_at": "2026-04-19T15:28:33.406145+00:00"
     },
     {
       "slug": "skill-dfyx-code-security-review",
@@ -127,7 +145,7 @@
           "skill_id": "skill-dfyx-code-security-review",
           "slug": "skill-dfyx-code-security-review",
           "agent_type": "finding",
-          "enabled": true,
+          "enabled": false,
           "always_include": true,
           "sort_order": 1,
           "match_keywords": [
@@ -145,7 +163,7 @@
         }
       ],
       "installed_at": "2026-04-13T06:46:55.398166+00:00",
-      "updated_at": "2026-04-18T17:08:20.995030+00:00"
+      "updated_at": "2026-04-19T15:28:33.590767+00:00"
     }
   ]
 }
