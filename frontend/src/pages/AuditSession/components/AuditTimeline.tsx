@@ -31,7 +31,7 @@ function rolePresentation(message: AuditSessionMessage) {
         label: "提问",
         icon: UserRound,
         bubble:
-          "ml-auto max-w-[82%] rounded-[26px] rounded-br-md border border-[rgba(120,156,129,.35)] bg-[linear-gradient(135deg,rgba(233,244,235,.96),rgba(212,232,216,.92))] text-slate-900 shadow-[0_18px_40px_rgba(109,141,116,.12)]",
+          "ml-auto max-w-[82%] rounded-[26px] rounded-br-md border border-[#dce5df] bg-[linear-gradient(135deg,#ffffff,#f7f8f6)] text-slate-900 shadow-[0_18px_40px_rgba(54,68,60,.08)]",
         align: "justify-end",
       };
     case "assistant":
@@ -39,7 +39,7 @@ function rolePresentation(message: AuditSessionMessage) {
         label: "助手",
         icon: Bot,
         bubble:
-          "mr-auto max-w-[88%] rounded-[26px] rounded-bl-md border border-[rgba(210,220,214,.9)] bg-white/95 text-slate-900 shadow-[0_28px_60px_rgba(77,102,84,.08)]",
+          "mr-auto max-w-[88%] rounded-[26px] rounded-bl-md border border-[#e3e8e5] bg-[linear-gradient(135deg,#ffffff,#fbfcfb)] text-slate-900 shadow-[0_28px_60px_rgba(54,68,60,.07)]",
         align: "justify-start",
       };
     case "tool_use":
@@ -47,7 +47,7 @@ function rolePresentation(message: AuditSessionMessage) {
         label: "工具调用",
         icon: Wrench,
         bubble:
-          "mr-auto max-w-[88%] rounded-[22px] border border-[rgba(237,196,116,.45)] bg-[linear-gradient(135deg,rgba(255,248,233,.95),rgba(252,240,206,.92))] text-amber-950",
+          "mr-auto max-w-[88%] rounded-[22px] border border-[#efd79d] bg-[linear-gradient(135deg,#fff9eb,#fff3cf)] text-amber-950",
         align: "justify-start",
       };
     case "tool_result":
@@ -55,7 +55,7 @@ function rolePresentation(message: AuditSessionMessage) {
         label: "工具结果",
         icon: MessageSquareQuote,
         bubble:
-          "mr-auto max-w-[88%] rounded-[22px] border border-[rgba(139,166,224,.4)] bg-[linear-gradient(135deg,rgba(238,245,255,.96),rgba(222,236,255,.94))] text-slate-900",
+          "mr-auto max-w-[88%] rounded-[22px] border border-[#cddaf3] bg-[linear-gradient(135deg,#f4f8ff,#eaf2ff)] text-slate-900",
         align: "justify-start",
       };
     default:
@@ -63,7 +63,7 @@ function rolePresentation(message: AuditSessionMessage) {
         label: message.role,
         icon: BrainCircuit,
         bubble:
-          "mx-auto max-w-[90%] rounded-[22px] border border-[rgba(210,215,220,.7)] bg-[rgba(248,250,252,.92)] text-slate-700",
+          "mx-auto max-w-[90%] rounded-[22px] border border-[#d8dee5] bg-slate-50 text-slate-700",
         align: "justify-center",
       };
   }
@@ -390,15 +390,21 @@ export function AuditTimeline({
   };
 
   return (
-    <Card className="overflow-hidden rounded-[30px] border border-[rgba(191,208,198,.72)] bg-[linear-gradient(180deg,rgba(255,255,255,.96),rgba(244,249,246,.96))] shadow-[0_28px_90px_rgba(84,110,93,.12)]">
-      <CardHeader className="border-b border-[rgba(186,203,193,.45)] bg-[radial-gradient(circle_at_top_left,rgba(214,234,220,.9),rgba(255,255,255,.72)_55%)] pb-5">
+    <Card className="flex h-full overflow-hidden rounded-[34px] border border-[#dce5df] bg-white shadow-[0_32px_90px_rgba(54,68,60,0.10)]">
+      <div className="flex min-h-0 flex-1 flex-col">
+      <CardHeader className="border-b border-[#e7ece9] bg-[linear-gradient(180deg,#ffffff,#fafcfb)] pb-5">
         <div className="flex items-center justify-between gap-4">
-          <div>
-            <CardTitle className="text-2xl font-semibold tracking-tight text-slate-900">审计会话</CardTitle>
-            <p className="mt-1 text-sm text-muted-foreground">像聊天窗口一样追问审计过程，回答会实时流式展开。</p>
+          <div className="flex min-w-0 items-start gap-3">
+            <span className="mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-[#dce8e1] bg-[linear-gradient(135deg,#ffffff,#eff6f2)] text-[#5f8069] shadow-sm">
+              <Bot className="h-5 w-5" />
+            </span>
+            <div className="min-w-0">
+              <CardTitle className="text-2xl font-semibold tracking-tight text-slate-950">审计会话</CardTitle>
+              <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">将审计流程作为会话上下文后，可围绕流程步骤、漏洞发现、利用方式、部署验证等内容继续灵活提问。</p>
+            </div>
           </div>
           <div className="flex items-center gap-3">
-            <div className="rounded-full border border-[rgba(154,180,163,.35)] bg-white/75 px-4 py-2 text-xs text-slate-600 shadow-sm">
+            <div className="rounded-full border border-[#e0e8e3] bg-white px-4 py-2 text-xs text-slate-600 shadow-sm">
               {isStreaming ? "正在生成回复..." : `共 ${messages.length} 条会话消息`}
             </div>
             {isStreaming && onStopStreaming ? (
@@ -415,14 +421,14 @@ export function AuditTimeline({
           </div>
         </div>
       </CardHeader>
-      <CardContent className="p-0">
-        <div className="relative">
-          <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(rgba(99,125,108,.05)_1px,transparent_1px),linear-gradient(90deg,rgba(99,125,108,.05)_1px,transparent_1px)] bg-[size:28px_28px] opacity-50" />
-          <div className="relative max-h-[72vh] space-y-5 overflow-y-auto px-5 py-6 sm:px-7">
+      <CardContent className="flex min-h-0 flex-1 flex-col p-0">
+        <div className="relative m-4 min-h-0 flex-1 overflow-hidden rounded-[30px] border border-[#edf1ef] bg-[linear-gradient(180deg,rgba(255,255,255,.98),rgba(248,250,248,.96))] shadow-inner">
+          <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(rgba(99,125,108,.035)_1px,transparent_1px),linear-gradient(90deg,rgba(99,125,108,.035)_1px,transparent_1px)] bg-[size:28px_28px]" />
+          <div className="relative h-full space-y-5 overflow-y-auto px-5 py-6 sm:px-7">
             {renderedItems.length === 0 ? (
               <div className="flex min-h-[320px] items-center justify-center">
-                <div className="max-w-md rounded-[28px] border border-dashed border-[rgba(154,180,163,.45)] bg-white/70 px-8 py-10 text-center shadow-[0_20px_50px_rgba(120,146,126,.07)]">
-                  <Bot className="mx-auto mb-4 h-10 w-10 text-[rgba(94,122,99,.85)]" />
+                <div className="max-w-md rounded-[28px] border border-dashed border-[#dfe7e3] bg-white px-8 py-10 text-center shadow-[0_20px_50px_rgba(54,68,60,.06)]">
+                  <Bot className="mx-auto mb-4 h-10 w-10 text-[#5f8069]" />
                   <p className="text-base font-medium text-slate-800">会话还没有消息</p>
                   <p className="mt-2 text-sm leading-6 text-muted-foreground">审计过程消息、工具调用结果和后续追问都会在这里按聊天形式显示。</p>
                 </div>
@@ -458,7 +464,7 @@ export function AuditTimeline({
                     <div className={`${presentation.bubble} w-full px-5 py-4 sm:px-6`}>
                       <div className="mb-3 flex items-center justify-between gap-4 text-xs">
                         <div className="flex items-center gap-2 font-medium text-slate-500">
-                          <span className="flex h-8 w-8 items-center justify-center rounded-full bg-white/80 shadow-sm ring-1 ring-[rgba(180,194,187,.45)]">
+                          <span className="flex h-8 w-8 items-center justify-center rounded-full bg-white/90 shadow-sm ring-1 ring-[rgba(180,194,187,.45)]">
                             <Icon className="h-4 w-4" />
                           </span>
                           <span>{presentation.label}</span>
@@ -470,9 +476,9 @@ export function AuditTimeline({
                       </div>
                       {emptyStreaming ? (
                         <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                          <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-[rgba(94,122,99,.75)]" />
-                          <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-[rgba(94,122,99,.55)] [animation-delay:120ms]" />
-                          <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-[rgba(94,122,99,.35)] [animation-delay:240ms]" />
+                          <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-[#6fa27b]" />
+                          <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-[#8fb99a] [animation-delay:120ms]" />
+                          <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-[#b9d8c0] [animation-delay:240ms]" />
                           <span className="ml-2">正在组织回答...</span>
                         </div>
                       ) : (
@@ -480,9 +486,9 @@ export function AuditTimeline({
                           {reasoningContent ? (
                             <details
                               defaultOpen
-                              className="mb-3 rounded-2xl border border-[rgba(154,180,163,.28)] bg-[rgba(246,250,247,.82)] px-4 py-3 text-sm text-slate-600"
+                              className="mb-3 rounded-2xl border border-[#e0e8e3] bg-[#f7fbf8] px-4 py-3 text-sm text-slate-600"
                             >
-                              <summary className="cursor-pointer select-none font-medium text-[#5E7A63]">
+                              <summary className="cursor-pointer select-none font-medium text-[#6fa27b]">
                                 {isActiveStreamingAssistant ? "正在思考" : "模型思考"}
                               </summary>
                               <div className="mt-2 whitespace-pre-wrap break-words font-mono text-xs leading-5 text-slate-500">
@@ -492,25 +498,25 @@ export function AuditTimeline({
                           ) : null}
                           <div className={`relative ${longMessageCollapsed ? "max-h-[360px] overflow-hidden" : ""}`}>
                             <div
-                              className="audit-markdown max-w-none whitespace-pre-wrap break-words text-[15px] leading-7 text-slate-800 [&_a]:text-[rgb(56,118,92)] [&_a]:underline [&_blockquote]:border-l-4 [&_blockquote]:border-[rgba(126,154,135,.4)] [&_blockquote]:pl-4 [&_code]:rounded-md [&_code]:bg-[rgba(27,31,35,.06)] [&_code]:px-1.5 [&_code]:py-0.5 [&_pre]:overflow-x-auto [&_pre]:rounded-2xl [&_pre]:bg-[rgb(18,24,22)] [&_pre]:p-4 [&_pre]:text-[rgb(231,243,236)] [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:w-full [&_table]:border-collapse [&_td]:border [&_td]:border-[rgba(187,200,193,.7)] [&_td]:px-3 [&_td]:py-2 [&_th]:border [&_th]:border-[rgba(187,200,193,.7)] [&_th]:bg-[rgba(239,246,241,.9)] [&_th]:px-3 [&_th]:py-2 [&_ul]:list-disc [&_ul]:pl-6 [&_ol]:list-decimal [&_ol]:pl-6"
+                              className="audit-markdown max-w-none whitespace-pre-wrap break-words text-[15px] leading-7 text-slate-800 [&_a]:text-[#5f8069] [&_a]:underline [&_blockquote]:border-l-4 [&_blockquote]:border-[#cbdccf] [&_blockquote]:pl-4 [&_code]:rounded-md [&_code]:bg-[rgba(27,31,35,.06)] [&_code]:px-1.5 [&_code]:py-0.5 [&_pre]:overflow-x-auto [&_pre]:rounded-2xl [&_pre]:bg-[rgb(18,24,22)] [&_pre]:p-4 [&_pre]:text-[rgb(231,243,236)] [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:w-full [&_table]:border-collapse [&_td]:border [&_td]:border-[#d8e3db] [&_td]:px-3 [&_td]:py-2 [&_th]:border [&_th]:border-[#d8e3db] [&_th]:bg-[#f4f8f5] [&_th]:px-3 [&_th]:py-2 [&_ul]:list-disc [&_ul]:pl-6 [&_ol]:list-decimal [&_ol]:pl-6"
                               dangerouslySetInnerHTML={renderMarkdown(message.content)}
                             />
                             {longMessageCollapsed ? (
-                              <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-[rgba(229,242,232,.98)] to-transparent" />
+                              <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-[#edf6ef] to-transparent" />
                             ) : null}
                           </div>
                           {shouldCollapseLongMessage ? (
                             <button
                               type="button"
                               onClick={() => toggleLongMessage(message.id)}
-                              className="mt-3 inline-flex items-center gap-1.5 rounded-full px-1 py-1 text-sm font-medium text-[#5E7A63] transition hover:text-[#3f5e45]"
+                              className="mt-3 inline-flex items-center gap-1.5 rounded-full px-1 py-1 text-sm font-medium text-[#5f8069] transition hover:text-[#3f5e45]"
                             >
                               {longMessageExpanded ? "收起" : "显示更多"}
                               {longMessageExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
                             </button>
                           ) : null}
                           {isActiveStreamingAssistant ? (
-                            <span className="ml-1 inline-flex h-6 w-[3px] animate-pulse rounded-full bg-[linear-gradient(180deg,#5E7A63,#9ECB97)] align-middle shadow-[0_0_12px_rgba(94,122,99,.45)]" />
+                            <span className="ml-1 inline-flex h-6 w-[3px] animate-pulse rounded-full bg-[linear-gradient(180deg,#6fa27b,#b9d8c0)] align-middle shadow-[0_0_12px_rgba(111,162,123,.35)]" />
                           ) : null}
                         </div>
                       )}
@@ -526,8 +532,9 @@ export function AuditTimeline({
             ) : null}
           </div>
         </div>
-        {footer ? <div className="border-t border-[rgba(186,203,193,.45)] bg-[rgba(250,252,250,.92)] p-5 sm:p-6">{footer}</div> : null}
+        {footer ? <div className="border-t border-[#e7ece9] bg-[linear-gradient(180deg,#ffffff,#fafcfb)] p-5 sm:p-6">{footer}</div> : null}
       </CardContent>
+      </div>
     </Card>
   );
 }

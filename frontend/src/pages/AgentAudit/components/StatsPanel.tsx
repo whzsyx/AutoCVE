@@ -22,7 +22,7 @@ function CircularProgress({ value, size = 52, strokeWidth = 4, color = "primary"
   const offset = circumference - (value / 100) * circumference;
 
   const colorMap: Record<string, { stroke: string; glow: string }> = {
-    primary: { stroke: '#FF6B2C', glow: 'rgba(255,107,44,0.4)' },
+    primary: { stroke: '#6FA27F', glow: 'rgba(111,162,127,0.35)' },
     emerald: { stroke: '#34d399', glow: 'rgba(52,211,153,0.4)' },
     rose: { stroke: '#fb7185', glow: 'rgba(251,113,133,0.4)' },
     amber: { stroke: '#fbbf24', glow: 'rgba(251,191,36,0.4)' },
@@ -86,8 +86,8 @@ function MetricCard({ icon, label, value, suffix = "", colorClass = "text-muted-
   return (
     <div className={`
       group relative flex items-center gap-3 p-3.5 rounded-lg
-      bg-card/80 border border-border/50 backdrop-blur-sm
-      hover:bg-card hover:border-border/80 hover:shadow-md
+      bg-white border border-[#dfe7e3]
+      hover:bg-[#fbfdfb] hover:border-[#cbdcd2] hover:shadow-md
       transition-all duration-300
       ${bgClass}
     `}>
@@ -98,7 +98,7 @@ function MetricCard({ icon, label, value, suffix = "", colorClass = "text-muted-
         {icon}
       </div>
       <div className="flex-1 min-w-0 relative z-10">
-        <div className="text-xs text-muted-foreground uppercase tracking-wider truncate font-medium mb-0.5">{label}</div>
+        <div className="text-xs text-muted-foreground truncate font-medium mb-0.5">{label}</div>
         <div className="text-lg text-foreground font-mono font-bold leading-tight">
           {value}<span className="text-muted-foreground text-sm ml-0.5">{suffix}</span>
         </div>
@@ -144,31 +144,31 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
 
   const outcomeConfig = {
     finalized: {
-      label: 'Finalized',
+      label: '已确认',
       badgeClass: 'bg-emerald-500/15 text-emerald-700 border border-emerald-500/30',
-      description: 'Runtime ended with explicit finalized findings.',
+      description: '',
     },
     recovered_only: {
-      label: 'Recovered Only',
+      label: '仅恢复候选',
       badgeClass: 'bg-sky-500/15 text-sky-700 border border-sky-500/30',
-      description: 'Only transcript-recovered candidates are available.',
+      description: '当前仅有从运行记录中恢复的候选漏洞。',
     },
     incomplete: {
-      label: 'Incomplete',
+      label: '未完成',
       badgeClass: 'bg-amber-500/15 text-amber-700 border border-amber-500/30',
-      description: 'Runtime stopped without a terminal action or finalized findings.',
+      description: '运行已停止，但尚未形成终态动作或确认漏洞。',
     },
     none: {
-      label: 'No Findings',
+      label: '暂无漏洞',
       badgeClass: 'bg-slate-500/15 text-slate-700 border border-slate-500/30',
-      description: 'No finalized findings or recovered candidates are currently available.',
+      description: '当前没有确认漏洞或恢复候选漏洞。',
     },
   }[task.finding_outcome || 'none'];
 
   return (
     <div className="space-y-3">
       {/* Progress Section with enhanced styling */}
-      <div className="p-4 rounded-lg border border-border/50 bg-card/80 backdrop-blur-sm relative overflow-hidden">
+      <div className="p-4 rounded-[18px] border border-[#dfe7e3] bg-white relative overflow-hidden shadow-sm">
         {/* Background gradient */}
         <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent pointer-events-none" />
 
@@ -178,7 +178,7 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
               <div className="p-1.5 rounded-md bg-primary/15 border border-primary/30">
                 <Activity className="w-4 h-4 text-primary" />
               </div>
-              <span className="text-sm text-foreground uppercase tracking-wider font-semibold">Progress</span>
+              <span className="text-sm text-foreground font-semibold">审计进度</span>
             </div>
             <div className="flex items-center gap-2">
               <span className="text-lg text-primary font-mono font-bold">{progressPercent.toFixed(0)}</span>
@@ -205,7 +205,7 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
               className="absolute inset-y-0 left-0 rounded-full blur-sm opacity-50"
               style={{
                 width: `${progressPercent}%`,
-                background: 'linear-gradient(to right, #FF6B2C, #FF6B2C)',
+                background: 'linear-gradient(to right, #6FA27F, #8DB79A)',
               }}
             />
           </div>
@@ -214,7 +214,7 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
           <div className="flex items-center justify-between mt-4 text-sm">
             <div className="flex items-center gap-2 text-muted-foreground">
               <FileCode className="w-4 h-4" />
-              <span className="font-medium">Files scanned</span>
+              <span className="font-medium">已扫描文件</span>
             </div>
             <span className="text-foreground font-mono font-bold">
               {task.analyzed_files}<span className="text-muted-foreground font-normal"> / {task.total_files}</span>
@@ -225,7 +225,7 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
             <div className="flex items-center justify-between mt-2 text-sm">
               <div className="flex items-center gap-2 text-muted-foreground">
                 <AlertTriangle className="w-4 h-4 text-rose-500" />
-                <span className="font-medium">Files with findings</span>
+                <span className="font-medium">涉及漏洞文件</span>
               </div>
               <span className="text-rose-500 font-mono font-bold">
                 {task.files_with_findings}
@@ -235,15 +235,17 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
         </div>
       </div>
 
-      <div className="rounded-lg border border-border/50 bg-card/80 p-4 backdrop-blur-sm">
+      <div className="rounded-[18px] border border-[#dfe7e3] bg-white p-4 shadow-sm">
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-2.5">
             <div className="rounded-md border border-border/50 bg-muted/40 p-1.5">
               <Shield className="h-4 w-4 text-primary" />
             </div>
             <div>
-              <div className="text-sm font-semibold text-foreground">Finding Outcome</div>
-              <div className="text-xs text-muted-foreground">{outcomeConfig.description}</div>
+              <div className="text-sm font-semibold text-foreground">漏洞结果</div>
+              {outcomeConfig.description ? (
+                <div className="text-xs text-muted-foreground">{outcomeConfig.description}</div>
+              ) : null}
             </div>
           </div>
           <Badge className={outcomeConfig.badgeClass}>{outcomeConfig.label}</Badge>
@@ -251,14 +253,14 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
         <div className="mt-3 grid grid-cols-2 gap-2.5">
           <MetricCard
             icon={<Bug className="w-4 h-4" />}
-            label="Finalized"
+            label="已确认"
             value={finalizedFindings}
             colorClass={finalizedFindings > 0 ? "text-rose-500" : "text-muted-foreground"}
             bgClass={finalizedFindings > 0 ? "border-rose-500/20" : ""}
           />
           <MetricCard
             icon={<AlertTriangle className="w-4 h-4" />}
-            label="Recovered"
+            label="已恢复"
             value={recoveredCandidates}
             colorClass={recoveredCandidates > 0 ? "text-sky-500" : "text-muted-foreground"}
             bgClass={recoveredCandidates > 0 ? "border-sky-500/20" : ""}
@@ -266,8 +268,8 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
         </div>
         {task.runtime_completion_mode ? (
           <div className="mt-3 text-xs text-muted-foreground">
-            Runtime completion mode: <span className="font-mono text-foreground">{task.runtime_completion_mode}</span>
-            {task.handoff_ready ? <span className="ml-2 text-emerald-600">handoff ready</span> : null}
+            运行完成模式：<span className="font-mono text-foreground">{task.runtime_completion_mode}</span>
+            {task.handoff_ready ? <span className="ml-2 text-emerald-600">已准备交接</span> : null}
           </div>
         ) : null}
       </div>
@@ -276,26 +278,26 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
       <div className="grid grid-cols-2 gap-2.5">
         <MetricCard
           icon={<Repeat className="w-4 h-4" />}
-          label="Iterations"
+          label="迭代次数"
           value={task.total_iterations || 0}
           colorClass="text-teal-500"
         />
         <MetricCard
           icon={<Zap className="w-4 h-4" />}
-          label="Tool Calls"
+          label="工具调用"
           value={task.tool_calls_count || 0}
           colorClass="text-amber-500"
         />
         <MetricCard
           icon={<TrendingUp className="w-4 h-4" />}
-          label="Tokens"
+          label="Token 用量"
           value={((task.tokens_used || 0) / 1000).toFixed(1)}
           suffix="k"
           colorClass="text-violet-500"
         />
         <MetricCard
           icon={<Bug className="w-4 h-4" />}
-          label="Persisted Findings"
+          label="已入库漏洞"
           value={totalFindings}
           colorClass={totalFindings > 0 ? "text-rose-500" : "text-muted-foreground"}
           bgClass={totalFindings > 0 ? "border-rose-500/20" : ""}
@@ -304,7 +306,7 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
 
       {/* Findings breakdown with enhanced styling */}
       {totalFindings > 0 && (
-        <div className="p-4 rounded-lg border border-rose-500/20 bg-card/80 backdrop-blur-sm relative overflow-hidden">
+        <div className="p-4 rounded-[18px] border border-rose-500/20 bg-white relative overflow-hidden shadow-sm">
           {/* Background gradient */}
           <div className="absolute inset-0 bg-gradient-to-br from-rose-500/5 to-transparent pointer-events-none" />
 
@@ -313,28 +315,28 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
               <div className="p-1.5 rounded-md bg-rose-500/15 border border-rose-500/30">
                 <AlertTriangle className="w-4 h-4 text-rose-500" />
               </div>
-              <span className="text-sm text-foreground uppercase tracking-wider font-semibold">Severity Breakdown</span>
+              <span className="text-sm text-foreground font-semibold">严重级别分布</span>
             </div>
 
             <div className="flex flex-wrap gap-2">
               {severityCounts.critical > 0 && (
                 <Badge className="bg-rose-500/20 text-rose-600 dark:text-rose-300 border border-rose-500/40 text-xs font-mono font-bold px-2.5 py-1 shadow-[0_0_10px_rgba(244,63,94,0.15)]">
-                  CRITICAL: {severityCounts.critical}
+                  严重：{severityCounts.critical}
                 </Badge>
               )}
               {severityCounts.high > 0 && (
                 <Badge className="bg-orange-500/20 text-orange-600 dark:text-orange-300 border border-orange-500/40 text-xs font-mono font-bold px-2.5 py-1 shadow-[0_0_10px_rgba(249,115,22,0.15)]">
-                  HIGH: {severityCounts.high}
+                  高危：{severityCounts.high}
                 </Badge>
               )}
               {severityCounts.medium > 0 && (
                 <Badge className="bg-amber-500/20 text-amber-600 dark:text-amber-300 border border-amber-500/40 text-xs font-mono font-bold px-2.5 py-1 shadow-[0_0_10px_rgba(245,158,11,0.15)]">
-                  MEDIUM: {severityCounts.medium}
+                  中危：{severityCounts.medium}
                 </Badge>
               )}
               {severityCounts.low > 0 && (
                 <Badge className="bg-sky-500/20 text-sky-600 dark:text-sky-300 border border-sky-500/40 text-xs font-mono font-bold px-2.5 py-1 shadow-[0_0_10px_rgba(14,165,233,0.15)]">
-                  LOW: {severityCounts.low}
+                  低危：{severityCounts.low}
                 </Badge>
               )}
             </div>
@@ -343,14 +345,14 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
       )}
 
       {topFindings.length > 0 && (
-        <div className="p-4 rounded-lg border border-primary/20 bg-card/80 backdrop-blur-sm relative overflow-hidden">
+        <div className="p-4 rounded-[18px] border border-primary/20 bg-white relative overflow-hidden shadow-sm">
           <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent pointer-events-none" />
           <div className="relative z-10">
             <div className="flex items-center gap-2.5 mb-3">
               <div className="p-1.5 rounded-md bg-primary/15 border border-primary/30">
                 <Bug className="w-4 h-4 text-primary" />
               </div>
-              <span className="text-sm text-foreground uppercase tracking-wider font-semibold">Finalized Findings Preview</span>
+              <span className="text-sm text-foreground font-semibold">已确认漏洞预览</span>
             </div>
             <div className="space-y-2.5">
               {topFindings.map((finding) => {
@@ -379,18 +381,18 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
                     )}
                     {(finding.source || finding.sink) && (
                       <div className="mt-2 space-y-1 text-xs text-muted-foreground">
-                        {finding.source && <div><span className="text-foreground/80">Source:</span> {finding.source}</div>}
-                        {finding.sink && <div><span className="text-foreground/80">Sink:</span> {finding.sink}</div>}
+                        {finding.source && <div><span className="text-foreground/80">源点：</span> {finding.source}</div>}
+                        {finding.sink && <div><span className="text-foreground/80">汇点：</span> {finding.sink}</div>}
                       </div>
                     )}
                     {finding.impact && (
                       <div className="mt-2 text-xs text-muted-foreground">
-                        <span className="text-foreground/80">Impact:</span> {finding.impact}
+                        <span className="text-foreground/80">影响：</span> {finding.impact}
                       </div>
                     )}
                     {finding.exploit_chain && finding.exploit_chain.length > 0 && (
                       <div className="mt-2 text-xs text-muted-foreground">
-                        <span className="text-foreground/80">Exploit Chain:</span>{" "}
+                        <span className="text-foreground/80">利用链：</span>{" "}
                         {finding.exploit_chain
                           .slice(0, 2)
                           .map((step) => step.location || step.description || `step ${step.step ?? "?"}`)
@@ -435,11 +437,11 @@ export const StatsPanel = memo(function StatsPanel({ task, findings }: StatsPane
                 }`} />
               </div>
               <div>
-                <span className="text-sm text-foreground uppercase tracking-wider font-semibold block">Security Score</span>
+                <span className="text-sm text-foreground font-semibold block">安全评分</span>
                 <span className="text-xs text-muted-foreground">
-                  {task.security_score >= 80 ? 'Excellent' :
-                   task.security_score >= 60 ? 'Good' :
-                   'Needs Attention'}
+                  {task.security_score >= 80 ? '状态优秀' :
+                   task.security_score >= 60 ? '状态良好' :
+                   '需要关注'}
                 </span>
               </div>
             </div>

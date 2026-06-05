@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import json
 import shutil
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
@@ -1246,8 +1245,8 @@ async def test_sync_managed_vulnerability_records_imports_findings_without_gener
 
 
 @pytest.mark.asyncio
-async def test_get_project_root_falls_back_to_managed_directory_when_zip_missing(monkeypatch):
-    managed_root = Path('D:/Projects/AuditAI/backend/.pytest-managed-projects') / str(uuid4()) / 'projects'
+async def test_get_project_root_falls_back_to_managed_directory_when_zip_missing(monkeypatch, tmp_path):
+    managed_root = tmp_path / 'projects'
     fallback_dir = managed_root / 'chartbrew-4.9.0'
     fallback_dir.mkdir(parents=True)
     (fallback_dir / 'README.md').write_text('fallback workspace', encoding='utf-8')
@@ -1273,14 +1272,16 @@ async def test_get_project_root_falls_back_to_managed_directory_when_zip_missing
         project_root = await agent_tasks_endpoint._get_project_root(project, 'zip-fallback-task')
         assert Path(project_root, 'README.md').read_text(encoding='utf-8') == 'fallback workspace'
         assert Path(project_root).resolve() != fallback_dir.resolve()
+        assert Path(project_root).resolve().is_relative_to(
+            managed_root.resolve() / '.auditai_workspaces' / 'projects' / project.id
+        )
     finally:
         agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = original_root
-        shutil.rmtree(managed_root.parent, ignore_errors=True)
 
 
 @pytest.mark.asyncio
-async def test_get_project_root_copies_persistent_zip_source_directory_when_available():
-    managed_root = Path('D:/Projects/AuditAI/backend/.pytest-managed-projects') / str(uuid4()) / 'projects'
+async def test_get_project_root_copies_persistent_zip_source_directory_when_available(tmp_path):
+    managed_root = tmp_path / 'projects'
     persistent_root = managed_root / 'zip-demo'
     persistent_root.mkdir(parents=True)
     (persistent_root / 'README.md').write_text('persistent workspace', encoding='utf-8')
@@ -1302,11 +1303,82 @@ async def test_get_project_root_copies_persistent_zip_source_directory_when_avai
         assert Path(project_root, 'README.md').read_text(encoding='utf-8') == 'persistent workspace'
         assert Path(project_root).resolve() != persistent_root.resolve()
         assert Path(project_root).resolve().is_relative_to(
-            managed_root.resolve() / '.auditai_workspaces' / 'zip-persistent-task'
+            managed_root.resolve() / '.auditai_workspaces' / 'projects' / project.id
         )
     finally:
         agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = original_root
-        shutil.rmtree(persistent_root.parents[2], ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_get_project_root_reuses_project_scoped_workspace_without_refresh(tmp_path):
+    managed_root = tmp_path / 'projects'
+    persistent_root = managed_root / 'zip-demo'
+    persistent_root.mkdir(parents=True)
+    (persistent_root / 'README.md').write_text('persistent workspace', encoding='utf-8')
+    original_root = agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT
+    agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
+
+    project = Project(
+        id='project-reuse-1',
+        name='zip-demo',
+        owner_id='user-1',
+        source_type='zip',
+        local_path=str(persistent_root.resolve()),
+        repository_type='other',
+        default_branch='main',
+    )
+
+    try:
+        first_root = Path(await agent_tasks_endpoint._get_project_root(project, 'task-a'))
+        marker = first_root / '.auditai' / 'tasks' / 'task-a' / 'marker.txt'
+        marker.parent.mkdir(parents=True)
+        marker.write_text('keep me', encoding='utf-8')
+
+        second_root = Path(await agent_tasks_endpoint._get_project_root(project, 'task-b'))
+
+        assert second_root.resolve() == first_root.resolve()
+        assert first_root.resolve().is_relative_to(
+            managed_root.resolve() / '.auditai_workspaces' / 'projects' / project.id
+        )
+        assert marker.read_text(encoding='utf-8') == 'keep me'
+    finally:
+        agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = original_root
+
+
+@pytest.mark.asyncio
+async def test_get_project_root_refresh_rebuilds_project_scoped_workspace(tmp_path):
+    managed_root = tmp_path / 'projects'
+    persistent_root = managed_root / 'zip-demo'
+    persistent_root.mkdir(parents=True)
+    (persistent_root / 'README.md').write_text('persistent workspace', encoding='utf-8')
+    original_root = agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT
+    agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
+
+    project = Project(
+        id='project-refresh-1',
+        name='zip-demo',
+        owner_id='user-1',
+        source_type='zip',
+        local_path=str(persistent_root.resolve()),
+        repository_type='other',
+        default_branch='main',
+    )
+
+    try:
+        project_root = Path(await agent_tasks_endpoint._get_project_root(project, 'task-a'))
+        marker = project_root / '.auditai' / 'tasks' / 'task-a' / 'marker.txt'
+        marker.parent.mkdir(parents=True)
+        marker.write_text('remove me', encoding='utf-8')
+
+        refreshed_root = Path(
+            await agent_tasks_endpoint._get_project_root(project, 'task-b', refresh=True)
+        )
+
+        assert refreshed_root.resolve() == project_root.resolve()
+        assert not marker.exists()
+        assert (refreshed_root / 'README.md').read_text(encoding='utf-8') == 'persistent workspace'
+    finally:
+        agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = original_root
 
 
 @pytest.mark.asyncio

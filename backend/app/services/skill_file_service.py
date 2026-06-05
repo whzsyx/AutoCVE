@@ -4,7 +4,10 @@ import json
 import os
 import re
 import shutil
+import tempfile
+import zipfile
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -176,6 +179,15 @@ class SkillFileService:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     @classmethod
+    def _merge_json(cls, path: Path, updates: Dict[str, Any]) -> Dict[str, Any]:
+        payload = cls._read_json(path, {})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.update(updates)
+        cls._write_json(path, payload)
+        return payload
+
+    @classmethod
     def _frontmatter_block(cls, metadata: Dict[str, Any]) -> str:
         lines = ["---"]
         for key in ("name", "description", "tags"):
@@ -327,6 +339,29 @@ class SkillFileService:
         cls._write_json(cls.installed_skills_index_file(), {"skills": sorted(records, key=lambda item: item["slug"])})
 
     @classmethod
+    def _refresh_installed_index_record(cls, slug: str) -> None:
+        normalized_slug = cls.slugify(slug)
+        existing_payload = cls._read_json(cls.installed_skills_index_file(), {"skills": []})
+        existing_items = existing_payload.get("skills", []) if isinstance(existing_payload, dict) else []
+        existing_records = [item for item in existing_items if isinstance(item, dict)]
+        existing_by_slug = {
+            str(item.get("slug")): item
+            for item in existing_records
+            if str(item.get("slug", "")).strip()
+        }
+        records = [item for item in existing_records if item.get("slug") != normalized_slug]
+        if (cls.library_root() / normalized_slug / "SKILL.md").exists():
+            records.append(cls._build_installed_record(normalized_slug, existing_by_slug.get(normalized_slug)))
+        cls._write_json(cls.installed_skills_index_file(), {"skills": sorted(records, key=lambda item: str(item.get("slug", "")))})
+
+    @classmethod
+    def sync_skill_runtime(cls, slug: str) -> None:
+        normalized_slug = cls.slugify(slug)
+        cls.ensure_agent_roots()
+        cls._write_json(cls.aggregated_bindings_file(normalized_slug), {"skills": cls._collect_bindings_for_slug(normalized_slug)})
+        cls._refresh_installed_index_record(normalized_slug)
+
+    @classmethod
     def ensure_agent_roots(cls) -> None:
         cls.runtime_root()
         for agent in AGENT_TYPES:
@@ -450,11 +485,22 @@ class SkillFileService:
     @classmethod
     def delete_skill(cls, slug: str) -> None:
         normalized_slug = cls.slugify(slug)
-        for agent_type in AGENT_TYPES:
-            cls.delete_binding(agent_type, normalized_slug, ignore_missing=True)
         skill_dir = cls.library_root() / normalized_slug
-        if skill_dir.exists():
-            shutil.rmtree(skill_dir)
+        if not skill_dir.exists() or not (skill_dir / "SKILL.md").exists():
+            raise FileNotFoundError(f"Skill '{normalized_slug}' not found")
+
+        for agent_type in AGENT_TYPES:
+            payload = cls.get_agent_bindings(agent_type)
+            skills = [
+                item
+                for item in payload.get("skills", [])
+                if cls.slugify(item.get("slug", "")) != normalized_slug
+            ]
+            if len(skills) != len(payload.get("skills", [])):
+                cls._write_json(cls.bindings_file(agent_type), {"agent_type": agent_type, "skills": skills})
+            cls._remove_agent_binding_mirror(agent_type, normalized_slug)
+
+        shutil.rmtree(skill_dir)
         cls.sync_all()
 
     @classmethod
@@ -510,7 +556,7 @@ class SkillFileService:
         payload["skills"] = sorted(payload["skills"], key=lambda item: (item["sort_order"], item["slug"]))
         cls._write_json(cls.bindings_file(agent_type), payload)
         cls._remove_agent_binding_mirror(agent_type, normalized_slug)
-        cls.sync_all()
+        cls.sync_skill_runtime(normalized_slug)
         return binding
 
     @classmethod
@@ -538,7 +584,7 @@ class SkillFileService:
         payload["skills"] = new_items
         cls._write_json(cls.bindings_file(agent_type), payload)
         cls._remove_agent_binding_mirror(agent_type, normalized_slug)
-        cls.sync_all()
+        cls.sync_skill_runtime(normalized_slug)
 
     @classmethod
     def sync_all(cls) -> None:
@@ -548,37 +594,221 @@ class SkillFileService:
         cls._refresh_installed_index()
 
     @classmethod
-    async def import_github_skill(cls, repo_url: str) -> Dict[str, Any]:
+    def _parse_github_skill_source(cls, repo_url: str) -> Dict[str, str]:
         parsed = urlparse(repo_url)
         if parsed.netloc not in {"github.com", "www.github.com", "raw.githubusercontent.com"}:
             raise ValueError("Only GitHub URLs are supported")
 
-        raw_url = repo_url
-        if parsed.netloc in {"github.com", "www.github.com"}:
+        if parsed.netloc == "raw.githubusercontent.com":
             parts = [part for part in parsed.path.strip("/").split("/") if part]
-            if len(parts) < 5 or parts[2] not in {"tree", "blob"}:
-                raise ValueError("GitHub skill URL must point to a tree/blob path")
-            owner, repo, _, branch = parts[:4]
-            subpath = "/".join(parts[4:])
-            if not subpath.endswith("SKILL.md"):
-                subpath = f"{subpath.rstrip('/')}/SKILL.md"
-            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{subpath}"
+            if len(parts) < 4:
+                raise ValueError("Invalid raw GitHub skill URL")
+            owner, repo, ref = parts[:3]
+            subpath = "/".join(parts[3:])
+            if subpath.endswith("SKILL.md"):
+                subpath = str(Path(subpath).parent).replace("\\", "/")
+                if subpath == ".":
+                    subpath = ""
+            return {"owner": owner, "repo": repo, "ref": ref, "subpath": subpath}
 
+        parts = [part for part in parsed.path.strip("/").split("/") if part]
+        if len(parts) == 2:
+            owner, repo = parts
+            return {
+                "owner": owner,
+                "repo": repo.removesuffix(".git"),
+                "ref": "",
+                "subpath": "",
+            }
+        if len(parts) < 5 or parts[2] not in {"tree", "blob"}:
+            raise ValueError("GitHub skill URL must point to a tree/blob path")
+        owner, repo, _, ref = parts[:4]
+        subpath = "/".join(parts[4:])
+        if subpath.endswith("SKILL.md"):
+            subpath = str(Path(subpath).parent).replace("\\", "/")
+            if subpath == ".":
+                subpath = ""
+        return {"owner": owner, "repo": repo, "ref": ref, "subpath": subpath}
+
+    @classmethod
+    async def _resolve_github_default_branch(cls, owner: str, repo: str) -> str:
+        api_url = f"https://api.github.com/repos/{owner}/{repo}"
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            response = await client.get(raw_url)
+            response = await client.get(api_url)
             response.raise_for_status()
-            content = response.text
+            payload = response.json()
+        default_branch = str(payload.get("default_branch") or "").strip()
+        return default_branch or "main"
 
-        frontmatter, body = parse_frontmatter(content)
-        slug = cls.slugify(frontmatter.get("name") or Path(raw_url).parent.name or "imported-skill")
-        return {
-            "slug": slug,
-            "name": str(frontmatter.get("name") or slug),
-            "description": str(frontmatter.get("description") or ""),
-            "content": body,
-            "tags": frontmatter.get("tags") if isinstance(frontmatter.get("tags"), list) else [],
-            "source_type": "github",
-            "source_url": repo_url,
-            "metadata_json": {"imported_from": repo_url},
-            "extension_payload": {},
-        }
+    @classmethod
+    def _safe_extract_zip(cls, archive: zipfile.ZipFile, dest_dir: Path) -> Path:
+        dest_root = dest_dir.resolve()
+        top_levels = set()
+        for info in archive.infolist():
+            extracted_path = (dest_dir / info.filename).resolve()
+            if extracted_path != dest_root and dest_root not in extracted_path.parents:
+                raise ValueError("Downloaded archive contains files outside the destination")
+            parts = Path(info.filename).parts
+            if parts:
+                top_levels.add(parts[0])
+        archive.extractall(dest_dir)
+        if len(top_levels) != 1:
+            raise ValueError("Unexpected GitHub archive layout")
+        return dest_dir / next(iter(top_levels))
+
+    @classmethod
+    def _safe_extract_skill_zip(cls, archive: zipfile.ZipFile, dest_dir: Path) -> Path:
+        dest_root = dest_dir.resolve()
+        dest_root.mkdir(parents=True, exist_ok=True)
+        for info in archive.infolist():
+            member_name = str(info.filename or "").replace("\\", "/").strip()
+            if not member_name or member_name.endswith("/"):
+                continue
+            destination = (dest_root / member_name).resolve()
+            if destination != dest_root and dest_root not in destination.parents:
+                raise ValueError("Archive contains files outside the destination")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info, "r") as src, open(destination, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+        if (dest_root / "SKILL.md").is_file():
+            return dest_root
+
+        candidates = [
+            path
+            for path in dest_root.rglob("SKILL.md")
+            if "__MACOSX" not in path.parts and path.is_file()
+        ]
+        if len(candidates) != 1:
+            raise ValueError("Archive must contain exactly one SKILL.md file")
+        return candidates[0].parent
+
+    @classmethod
+    async def _download_github_repo_zip(cls, owner: str, repo: str, ref: str) -> bytes:
+        zip_url = f"https://codeload.github.com/{owner}/{repo}/zip/{ref}"
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            response = await client.get(zip_url)
+            response.raise_for_status()
+            return response.content
+
+    @classmethod
+    def _install_skill_directory(
+        cls,
+        *,
+        repo_root: Path,
+        subpath: str,
+        source_url: str,
+        owner: str,
+        repo: str,
+        ref: str,
+    ) -> Dict[str, Any]:
+        safe_subpath = _safe_relative_path(subpath)
+        source_dir = repo_root / safe_subpath if safe_subpath else repo_root
+        if not source_dir.exists() or not source_dir.is_dir():
+            raise FileNotFoundError(f"Skill path not found: {safe_subpath or '.'}")
+        skill_file = source_dir / "SKILL.md"
+        if not skill_file.exists() or not skill_file.is_file():
+            raise ValueError("SKILL.md not found in selected skill directory")
+
+        content = skill_file.read_text(encoding="utf-8")
+        frontmatter, _ = parse_frontmatter(content)
+        slug = cls.slugify(frontmatter.get("name") or source_dir.name or "imported-skill")
+        destination = cls.library_root() / slug
+        if destination.exists():
+            raise FileExistsError(f"Skill '{slug}' already exists")
+
+        shutil.copytree(source_dir, destination)
+        tags = frontmatter.get("tags") if isinstance(frontmatter.get("tags"), list) else []
+        existing_metadata = cls._read_json(destination / "metadata.json", {})
+        installed_at = existing_metadata.get("installed_at") if isinstance(existing_metadata, dict) else None
+        nested_metadata = existing_metadata.get("metadata", {}) if isinstance(existing_metadata, dict) else {}
+        if not isinstance(nested_metadata, dict):
+            nested_metadata = {}
+        cls._merge_json(
+            destination / "metadata.json",
+            {
+                "name": str(frontmatter.get("name") or slug),
+                "slug": slug,
+                "description": str(frontmatter.get("description") or ""),
+                "tags": [str(tag) for tag in tags],
+                "source_type": "github",
+                "source_url": source_url,
+                "metadata": {
+                    **nested_metadata,
+                    "imported_from": source_url,
+                    "repo_slug": f"{owner}/{repo}",
+                    "branch": ref,
+                    "subdir": safe_subpath,
+                },
+                "extension_manifest": cls._build_extension_manifest(destination),
+                "is_system": False,
+                "is_active": True,
+                "installed_at": installed_at or cls._timestamp(),
+                "updated_at": cls._timestamp(),
+            },
+        )
+        cls.sync_all()
+        return cls.read_skill(slug)
+
+    @classmethod
+    async def import_github_skill(cls, repo_url: str) -> Dict[str, Any]:
+        source = cls._parse_github_skill_source(repo_url)
+        if not source["ref"]:
+            source["ref"] = await cls._resolve_github_default_branch(source["owner"], source["repo"])
+        with tempfile.TemporaryDirectory(prefix="auditai-skill-import-") as tmp_dir:
+            archive_bytes = await cls._download_github_repo_zip(source["owner"], source["repo"], source["ref"])
+            with zipfile.ZipFile(BytesIO(archive_bytes), "r") as archive:
+                repo_root = cls._safe_extract_zip(archive, Path(tmp_dir))
+            return cls._install_skill_directory(
+                repo_root=repo_root,
+                subpath=source["subpath"],
+                source_url=repo_url,
+                owner=source["owner"],
+                repo=source["repo"],
+                ref=source["ref"],
+            )
+
+    @classmethod
+    def import_skill_zip(cls, zip_path: Path, original_filename: str) -> Dict[str, Any]:
+        with tempfile.TemporaryDirectory(prefix="auditai-skill-upload-") as tmp_dir:
+            extract_root = Path(tmp_dir) / "archive"
+            with zipfile.ZipFile(zip_path, "r") as archive:
+                source_dir = cls._safe_extract_skill_zip(archive, extract_root)
+
+            skill_file = source_dir / "SKILL.md"
+            content = skill_file.read_text(encoding="utf-8")
+            frontmatter, _ = parse_frontmatter(content)
+            slug = cls.slugify(frontmatter.get("name") or source_dir.name or Path(original_filename).stem or "uploaded-skill")
+            destination = cls.library_root() / slug
+            if destination.exists():
+                raise FileExistsError(f"Skill '{slug}' already exists")
+
+            shutil.copytree(source_dir, destination)
+            tags = frontmatter.get("tags") if isinstance(frontmatter.get("tags"), list) else []
+            existing_metadata = cls._read_json(destination / "metadata.json", {})
+            installed_at = existing_metadata.get("installed_at") if isinstance(existing_metadata, dict) else None
+            nested_metadata = existing_metadata.get("metadata", {}) if isinstance(existing_metadata, dict) else {}
+            if not isinstance(nested_metadata, dict):
+                nested_metadata = {}
+            cls._merge_json(
+                destination / "metadata.json",
+                {
+                    "name": str(frontmatter.get("name") or slug),
+                    "slug": slug,
+                    "description": str(frontmatter.get("description") or ""),
+                    "tags": [str(tag) for tag in tags],
+                    "source_type": "local_zip",
+                    "source_url": original_filename,
+                    "metadata": {
+                        **nested_metadata,
+                        "imported_from": original_filename,
+                    },
+                    "extension_manifest": cls._build_extension_manifest(destination),
+                    "is_system": False,
+                    "is_active": True,
+                    "installed_at": installed_at or cls._timestamp(),
+                    "updated_at": cls._timestamp(),
+                },
+            )
+            cls.sync_all()
+            return cls.read_skill(slug)

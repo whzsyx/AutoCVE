@@ -380,6 +380,51 @@ def test_canonical_write_tool_treats_any_dot_auditai_path_as_managed_output():
         shutil.rmtree(project_root, ignore_errors=True)
 
 
+def test_canonical_write_tool_prefers_configured_project_root_over_session_payload(tmp_path):
+    store = build_store()
+    session_id = store.create_session(project_id="project-1")
+    turn_id = store.open_turn(session_id, model_name="gpt-test")
+    project_root = tmp_path / "current-project"
+    stale_root = tmp_path / "stale-project"
+    project_root.mkdir()
+    stale_root.mkdir()
+    registry = ToolRegistry([CanonicalWriteTool(project_root=str(project_root))])
+    orchestrator = ToolOrchestrator(session_store=store, tool_registry=registry, agent_type="finding")
+    records = asyncio.run(
+        orchestrator.execute_tool_calls(
+            session_id=session_id,
+            turn_id=turn_id,
+            session=type(
+                "SessionRef",
+                (),
+                {
+                    "recon_payload": {
+                        "project_info": {
+                            "workspace_root": str(stale_root),
+                            "name": "demo-project",
+                        }
+                    }
+                },
+            )(),
+            recon_payload={},
+            tool_calls=[
+                ToolCallRequest(
+                    id="tool-1",
+                    name="Write",
+                    input={"path": ".auditai/tasks/task-1/report.md", "content": "# report", "overwrite": True},
+                )
+            ],
+        )
+    )
+    written_file = project_root / ".auditai" / "tasks" / "task-1" / "report.md"
+    stale_file = stale_root / ".auditai" / "tasks" / "task-1" / "report.md"
+
+    assert records[0].status == AuditToolCallStatus.COMPLETED.value
+    assert written_file.read_text(encoding="utf-8") == "# report"
+    assert not stale_file.exists()
+    assert records[0].result.output_payload["resolved_path"] == str(written_file.resolve())
+
+
 def test_canonical_write_tool_requires_approval_for_source_tree_writes():
     store = build_store()
     session_id = store.create_session(project_id="project-1")

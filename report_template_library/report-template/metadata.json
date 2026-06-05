@@ -1,6 +1,6 @@
 {
   "name": "默认最终漏洞报告",
-  "description": "AuditAI 默认最终漏洞报告模板。",
+  "description": "AI Audit 默认最终漏洞报告模板。",
   "report_type": "final_vulnerability_report",
   "output_format": "markdown",
   "variables": {

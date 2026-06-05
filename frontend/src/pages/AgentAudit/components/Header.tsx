@@ -43,11 +43,10 @@ export function Header({
               )}
             </div>
           </div>
-          <div className="flex flex-col">
+          <div className="flex items-center">
             <span className="font-bold text-foreground tracking-[-0.03em] text-base leading-tight">
-              Audit<span className="text-primary">AI</span>
+              AIAudit
             </span>
-            <span className="text-[10px] text-muted-foreground tracking-[0.2em] uppercase">Security Workspace</span>
           </div>
         </div>
 
@@ -56,7 +55,7 @@ export function Header({
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2 px-2.5 py-1 rounded-md bg-muted/50 border border-border/50">
               <Radio className="w-3 h-3 text-muted-foreground" />
-              <span className="text-xs font-mono uppercase tracking-wider text-muted-foreground">Task</span>
+              <span className="text-xs font-medium text-muted-foreground">任务</span>
             </div>
             <div className="flex items-center gap-3">
               <span className="text-foreground text-sm font-mono truncate max-w-[200px] font-medium">
@@ -81,12 +80,12 @@ export function Header({
             {isCancelling ? (
               <>
                 <Loader2 className="w-3.5 h-3.5 mr-2 animate-spin" />
-                <span>Stopping</span>
+                <span>停止中</span>
               </>
             ) : (
               <>
                 <Square className="w-3.5 h-3.5 mr-2" />
-                <span>Abort</span>
+                <span>终止</span>
               </>
             )}
           </Button>
@@ -102,7 +101,7 @@ export function Header({
               className="h-9 px-4 text-xs font-mono uppercase tracking-wider text-amber-300 hover:text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 hover:border-amber-500/50 transition-all duration-300 rounded-md shadow-[0_0_15px_rgba(245,158,11,0.12)] hover:shadow-[0_0_20px_rgba(245,158,11,0.2)]"
             >
               <MessagesSquare className="w-3.5 h-3.5 mr-2" />
-              <span>Session</span>
+              <span>会话</span>
             </Button>
           </Link>
         )}
@@ -115,7 +114,7 @@ export function Header({
           className="h-9 px-4 text-xs font-mono uppercase tracking-wider text-cyan-400 hover:text-cyan-300 bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/30 hover:border-cyan-500/50 transition-all duration-300 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:border-transparent rounded-md shadow-[0_0_15px_rgba(6,182,212,0.1)] hover:shadow-[0_0_20px_rgba(6,182,212,0.2)]"
         >
           <Download className="w-3.5 h-3.5 mr-2" />
-          <span>Export</span>
+          <span>导出</span>
         </Button>
 
         <Button
@@ -125,7 +124,7 @@ export function Header({
           className="h-9 px-4 text-xs font-mono uppercase tracking-wider text-primary hover:text-primary/90 bg-primary/10 hover:bg-primary/20 border border-primary/30 hover:border-primary/50 transition-all duration-300 rounded-md shadow-[0_0_15px_rgba(255,107,44,0.15)] hover:shadow-[0_0_25px_rgba(255,107,44,0.25)]"
         >
           <Sparkles className="w-3.5 h-3.5 mr-2" />
-          <span>New Audit</span>
+          <span>新建审计</span>
         </Button>
       </div>
 

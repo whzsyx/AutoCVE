@@ -11,6 +11,7 @@ import {
   LayoutDashboard,
   ListTodo,
   Menu,
+  ScanSearch,
   Settings,
   ShieldAlert,
   UserCircle,
@@ -29,6 +30,7 @@ const routeIcons: Record<string, ReactNode> = {
   '/skills': <BookOpen className="h-[18px] w-[18px]" />,
   '/report-templates': <FileText className="h-[18px] w-[18px]" />,
   '/vulnerabilities': <ShieldAlert className="h-[18px] w-[18px]" />,
+  '/checkmarx-scan': <ScanSearch className="h-[18px] w-[18px]" />,
   '/admin': <Settings className="h-[18px] w-[18px]" />,
 };
 

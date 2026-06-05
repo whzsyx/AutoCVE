@@ -7,6 +7,8 @@ FROM node:20-slim AS builder
 
 WORKDIR /app
 
+ARG VITE_ENABLE_CHECKMARX_SCAN=false
+
 # 彻底清除代理设置
 ENV http_proxy=""
 ENV https_proxy=""
@@ -35,6 +37,7 @@ COPY . .
 
 # 🔥 构建时使用占位符 - 实现 Build Once Run Anywhere
 ENV VITE_API_BASE_URL=__API_BASE_URL__
+ENV VITE_ENABLE_CHECKMARX_SCAN=${VITE_ENABLE_CHECKMARX_SCAN}
 
 # 构建生产版本
 RUN pnpm build

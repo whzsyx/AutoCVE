@@ -7,6 +7,7 @@ from app.api.v1.endpoints.config import (
     _decrypt_config,
     _encrypt_config,
     _merge_user_config,
+    _normalize_model_profiles,
     get_default_config,
 )
 
@@ -15,6 +16,32 @@ def test_default_config_exposes_empty_model_profiles():
     config = get_default_config()
 
     assert config["llmConfig"]["modelProfiles"] == []
+
+
+def test_normalize_model_profiles_defaults_first_when_missing():
+    profiles = _normalize_model_profiles(
+        [
+            {"id": "claude-profile", "name": "Claude"},
+            {"id": "deepseek-profile", "name": "DeepSeek"},
+        ]
+    )
+
+    assert profiles[0]["isDefault"] is True
+    assert profiles[1]["isDefault"] is False
+
+
+def test_normalize_model_profiles_keeps_single_default():
+    profiles = _normalize_model_profiles(
+        [
+            {"id": "claude-profile", "name": "Claude", "isDefault": False},
+            {"id": "deepseek-profile", "name": "DeepSeek", "isDefault": True},
+            {"id": "openai-profile", "name": "OpenAI", "isDefault": True},
+        ]
+    )
+
+    assert profiles[0]["isDefault"] is False
+    assert profiles[1]["isDefault"] is True
+    assert profiles[2]["isDefault"] is False
 
 
 def test_encrypt_config_encrypts_model_profile_secrets():
@@ -39,6 +66,7 @@ def test_encrypt_config_encrypts_model_profile_secrets():
     )
 
     profile = encrypted["modelProfiles"][0]
+    assert profile["isDefault"] is True
     assert profile["llmApiKey"] != "plain-profile-key"
     assert profile["env"]["DEEPSEEK_API_KEY"] != "plain-env-key"
     assert "EMPTY" not in profile["env"]

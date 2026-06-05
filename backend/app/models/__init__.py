@@ -34,3 +34,4 @@ from .audit_session import (
 )
 from .report_template import AgentTaskReport
 from .managed_vulnerability import ManagedVulnerability, ManagedVulnerabilityReport
+from .checkmarx_scan import CheckmarxScanJob, CheckmarxScanResult

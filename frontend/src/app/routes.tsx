@@ -5,6 +5,7 @@ import AdminDashboard from '@/pages/AdminDashboard';
 import AgentAudit from '@/pages/AgentAudit';
 import AuditSession from '@/pages/AuditSession';
 import AuditTasks from '@/pages/AuditTasks';
+import CheckmarxScan from '@/pages/CheckmarxScan';
 import Dashboard from '@/pages/Dashboard';
 import ProjectDetail from '@/pages/ProjectDetail';
 import Projects from '@/pages/Projects';
@@ -20,6 +21,8 @@ export interface RouteConfig {
   visible?: boolean;
 }
 
+const enableCheckmarxScan = import.meta.env.VITE_ENABLE_CHECKMARX_SCAN === 'true';
+
 const routes: RouteConfig[] = [
   { name: '首页', path: '/', element: <AgentAudit />, visible: true },
   { name: 'Agent审计详情', path: '/agent-audit/:taskId', element: <AgentAudit />, visible: false },
@@ -30,9 +33,12 @@ const routes: RouteConfig[] = [
   { name: '审计任务', path: '/audit-tasks', element: <AuditTasks />, visible: true },
   { name: '任务详情', path: '/tasks/:id', element: <TaskDetail />, visible: false },
   { name: 'Skills管理', path: '/skills', element: <SkillsManager />, visible: true },
-  { name: '报告模板', path: '/report-templates', element: <ReportTemplatesPage />, visible: true },
+  { name: '报告模板', path: '/report-templates', element: <ReportTemplatesPage />, visible: false },
   { name: '漏洞管理', path: '/vulnerabilities', element: <VulnerabilityManagement />, visible: true },
-  { name: '模型管理', path: '/admin', element: <AdminDashboard />, visible: true },
+  ...(enableCheckmarxScan
+    ? [{ name: 'Checkmarx扫描', path: '/checkmarx-scan', element: <CheckmarxScan />, visible: true }]
+    : []),
+  { name: '系统设置', path: '/admin', element: <AdminDashboard />, visible: true },
   { name: '账号管理', path: '/account', element: <Account />, visible: false },
 ];
 

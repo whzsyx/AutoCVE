@@ -1,5 +1,5 @@
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Box, FileText, Loader2, SendHorizonal } from "lucide-react";
+import { Box, Loader2, SendHorizonal } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -144,7 +144,7 @@ export function FollowUpComposer({
 
   return (
     <form className="space-y-3" onSubmit={handleSubmit}>
-      <div className="rounded-[24px] border border-[rgba(154,180,163,.35)] bg-[linear-gradient(180deg,rgba(255,255,255,.96),rgba(241,247,243,.92))] p-3 shadow-[0_20px_60px_rgba(118,146,126,.08)]">
+      <div className="rounded-[28px] border border-[#dce8e1] bg-white p-3 shadow-[0_20px_60px_rgba(86,105,97,0.08)]">
         <div className="relative">
           {filteredSkills.length > 0 ? (
             <div className="absolute bottom-full left-0 right-0 z-20 mb-2 max-h-64 overflow-auto rounded-2xl border border-[rgba(154,180,163,.35)] bg-white/95 p-2 shadow-[0_18px_45px_rgba(65,86,70,.18)] backdrop-blur">
@@ -160,7 +160,7 @@ export function FollowUpComposer({
                     index === highlightedSkillIndex ? "bg-[rgba(137,169,141,.16)]" : "hover:bg-[rgba(137,169,141,.1)]"
                   }`}
                 >
-                  <Box className="mt-0.5 h-4 w-4 shrink-0 text-[#5E7A63]" />
+                  <Box className="mt-0.5 h-4 w-4 shrink-0 text-[#6fa27b]" />
                   <span className="min-w-0">
                     <span className="block text-sm font-semibold text-slate-800">{skill.name}</span>
                     <span className="block truncate text-xs text-muted-foreground">{skill.description || skill.slug}</span>
@@ -171,8 +171,8 @@ export function FollowUpComposer({
           ) : null}
           <Textarea
             ref={textareaRef}
-            className="min-h-[120px] resize-none rounded-[18px] border-0 bg-transparent px-3 py-3 text-[15px] leading-7 shadow-none focus-visible:ring-0"
-          placeholder="Ask a follow-up question, request a report, or ask the agent to summarize the latest finding."
+            className="min-h-[118px] resize-none rounded-[22px] border border-[#e2eae5] bg-[#fbfdfb] px-4 py-3 text-[15px] leading-7 shadow-none focus-visible:border-[#9fc4a7] focus-visible:ring-0"
+          placeholder=""
           value={content}
           onChange={(event) => {
             setContent(event.target.value);
@@ -184,30 +184,16 @@ export function FollowUpComposer({
           disabled={disabled || isSubmitting}
         />
         </div>
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-[rgba(154,180,163,.2)] px-2 pt-3 text-xs text-muted-foreground">
-          <span>Enter sends chat. Shift + Enter adds a new line.</span>
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-[#e6ede8] px-2 pt-3 text-xs text-muted-foreground">
+          <span>按 Enter 发送，Shift + Enter 换行。</span>
           <div className="flex flex-wrap items-center gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              disabled={disabled || isSubmitting || !content.trim()}
-              onClick={() => void submitContent("generate_report_and_sync")}
-              className="h-11 rounded-full border-[rgba(94,122,99,.22)] bg-white/85 px-5"
-            >
-              {submittingMode === "generate_report_and_sync" ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              ) : (
-                <FileText className="mr-2 h-4 w-4" />
-              )}
-              {submittingMode === "generate_report_and_sync" ? "Syncing..." : "Generate Report"}
-            </Button>
             <Button
               type="submit"
               disabled={disabled || isSubmitting || !content.trim()}
-              className="h-11 rounded-full bg-[linear-gradient(135deg,#89A98D,#5E7A63)] px-5 text-white shadow-[0_16px_35px_rgba(94,122,99,.22)] hover:opacity-95"
+              className="h-11 rounded-full bg-[linear-gradient(135deg,#7fa48a,#5f8069)] px-5 text-white shadow-[0_16px_35px_rgba(95,128,105,.22)] hover:opacity-95"
             >
               {submittingMode === "chat" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <SendHorizonal className="mr-2 h-4 w-4" />}
-              {submittingMode === "chat" ? "Sending..." : "Send Message"}
+              {submittingMode === "chat" ? "发送中..." : "发送消息"}
             </Button>
           </div>
         </div>

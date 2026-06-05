@@ -1,12 +1,11 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, ChevronLeft, ChevronRight, PanelRightClose, PanelRightOpen } from "lucide-react";
+import { ArrowLeft, PanelRightClose, PanelRightOpen, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { AuditSessionHeader } from "@/pages/AuditSession/components/AuditSessionHeader";
 import { AuditTimeline } from "@/pages/AuditSession/components/AuditTimeline";
-import { FindingsSidebar } from "@/pages/AuditSession/components/FindingsSidebar";
 import { FollowUpComposer } from "@/pages/AuditSession/components/FollowUpComposer";
 import { HandoffTracePanel } from "@/pages/AuditSession/components/HandoffTracePanel";
 import { MemoryTracePanel } from "@/pages/AuditSession/components/MemoryTracePanel";
@@ -38,20 +37,20 @@ export default function AuditSessionPage() {
       if (mode === "generate_report_and_sync") {
         const managed = result.synced_managed_vulnerability;
         if (managed) {
-          toast.success(`Report synced to vulnerability management: ${managed.vulnerability_name}`);
+          toast.success(`报告已同步到漏洞管理：${managed.vulnerability_name}`);
         } else {
-          toast.success("Report generation flow completed");
+          toast.success("报告生成流程已完成");
         }
         return;
       }
-      toast.success("Follow-up added to session");
+      toast.success("消息已加入会话");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Follow-up failed");
+      toast.error(error instanceof Error ? error.message : "发送失败");
     }
   }
 
   if (loading) {
-    return <div className="p-6 text-sm text-muted-foreground">Loading audit session...</div>;
+    return <div className="p-6 text-sm text-muted-foreground">正在加载审计会话...</div>;
   }
 
   if (error || !session) {
@@ -60,55 +59,82 @@ export default function AuditSessionPage() {
         <Button asChild variant="outline">
           <Link to="/audit-tasks">
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Tasks
+            返回任务
           </Link>
         </Button>
-        <div className="rounded-lg border p-4 text-sm text-destructive">{error || "Audit session not found."}</div>
+        <div className="rounded-lg border p-4 text-sm text-destructive">{error || "未找到审计会话。"}</div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen space-y-6 bg-[radial-gradient(circle_at_top_left,rgba(215,233,220,.45),transparent_32%),linear-gradient(180deg,rgba(247,250,248,.92),rgba(242,247,244,.98))] p-6">
-      <div className="flex items-center justify-between gap-4">
-        <Button asChild variant="outline" className="rounded-full border-[rgba(179,197,186,.8)] bg-white/80 shadow-sm backdrop-blur">
-          <Link to="/audit-tasks">
-            <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Tasks
-          </Link>
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => setSidebarCollapsed((value) => !value)}
-          className="rounded-full border-[rgba(179,197,186,.8)] bg-white/80 shadow-sm backdrop-blur"
-        >
-          {sidebarCollapsed ? <PanelRightOpen className="mr-2 h-4 w-4" /> : <PanelRightClose className="mr-2 h-4 w-4" />}
-          {sidebarCollapsed ? "Show Sidebar" : "Hide Sidebar"}
-          {sidebarCollapsed ? <ChevronLeft className="ml-2 h-4 w-4" /> : <ChevronRight className="ml-2 h-4 w-4" />}
-        </Button>
-      </div>
-      <AuditSessionHeader session={session} />
-      <div className={`grid gap-6 ${sidebarCollapsed ? "xl:grid-cols-1" : "xl:grid-cols-[minmax(0,1.7fr)_minmax(340px,0.9fr)]"}`}>
-        <div className="space-y-6">
-          <AuditTimeline
-            messages={messages}
-            isStreaming={isStreaming}
-            streamError={streamError}
-            onStopStreaming={stopStreaming}
-            activeStreamingMessageId={streamingAssistantId}
-            footer={<FollowUpComposer disabled={false} onSubmit={handleSubmit} />}
-          />
+    <div className="relative min-h-screen overflow-hidden bg-[linear-gradient(180deg,#f7f8f6_0%,#eef2ef_46%,#f8faf8_100%)] p-4 lg:p-6">
+      <div className="absolute inset-0 cyber-grid-subtle pointer-events-none opacity-28" />
+      <div className="relative z-10 mx-auto max-w-[1640px] space-y-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <AuditSessionHeader session={session} />
+          {sidebarCollapsed ? (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setSidebarCollapsed(false)}
+              aria-label="展开侧边栏"
+              title="展开侧边栏"
+              className="h-11 rounded-full border-[#cfded5] bg-white px-4 text-slate-700 shadow-[0_12px_30px_rgba(54,68,60,0.08)] hover:bg-[#f7faf8]"
+            >
+              <PanelRightOpen className="mr-2 h-4 w-4" />
+              展开记录
+            </Button>
+          ) : null}
         </div>
-        {!sidebarCollapsed ? (
-          <div className="space-y-6">
-            <FindingsSidebar session={session} />
-            <HandoffTracePanel handoffs={handoffs} />
-            <ToolTracePanel toolCalls={toolCalls} />
-            <SkillTracePanel skills={skills} skillInvocations={skillInvocations} />
-            <MemoryTracePanel memories={memories} />
+        <div className={`grid items-stretch gap-5 ${sidebarCollapsed ? "xl:grid-cols-1" : "xl:grid-cols-[minmax(0,1fr)_440px]"}`}>
+          <div className="min-h-[680px] min-w-0 xl:h-[calc(100vh-8.5rem)]">
+            <AuditTimeline
+              messages={messages}
+              isStreaming={isStreaming}
+              streamError={streamError}
+              onStopStreaming={stopStreaming}
+              activeStreamingMessageId={streamingAssistantId}
+              footer={<FollowUpComposer disabled={false} onSubmit={handleSubmit} />}
+            />
           </div>
-        ) : null}
+          {!sidebarCollapsed ? (
+            <aside className="min-h-[680px] min-w-0 self-start xl:sticky xl:top-4 xl:h-[calc(100vh-8.5rem)]">
+              <div className="flex h-full overflow-hidden rounded-[32px] border border-[#dce5df] bg-white shadow-[0_24px_70px_rgba(54,68,60,0.10)]">
+                <div className="flex min-h-0 flex-1 flex-col">
+                <div className="flex items-center justify-between gap-3 border-b border-[#e7ece9] bg-[linear-gradient(180deg,#ffffff,#fafcfb)] px-4 py-3">
+                  <div className="flex min-w-0 items-center gap-3">
+                    <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-[#dce8e1] bg-[linear-gradient(135deg,#ffffff,#f0f7f3)] text-[#5f8069] shadow-sm">
+                      <Sparkles className="h-5 w-5" />
+                    </span>
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-slate-950">审计记录</p>
+                      <p className="truncate text-xs text-slate-500">Trace、交接与记忆记录</p>
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setSidebarCollapsed(true)}
+                    aria-label="隐藏侧边栏"
+                    title="隐藏侧边栏"
+                    className="h-9 rounded-full border-[#d7e4dc] bg-white px-3 text-xs text-slate-600 shadow-sm hover:bg-[#f3f6f4] hover:text-slate-900"
+                  >
+                    <PanelRightClose className="mr-1.5 h-4 w-4" />
+                    隐藏
+                  </Button>
+                </div>
+                <div className="min-h-0 flex-1 divide-y divide-[#e7ece9] overflow-y-auto custom-scrollbar [overflow-wrap:anywhere]">
+                  <HandoffTracePanel handoffs={handoffs} />
+                  <ToolTracePanel toolCalls={toolCalls} />
+                  <SkillTracePanel skills={skills} skillInvocations={skillInvocations} />
+                  <MemoryTracePanel memories={memories} />
+                </div>
+                </div>
+              </div>
+            </aside>
+          ) : null}
+        </div>
       </div>
     </div>
   );

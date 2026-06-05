@@ -64,8 +64,8 @@ class GrepToolInput(BaseModel):
 
 
 class WriteToolInput(BaseModel):
-    path: str = Field(description="Target path relative to the project root. Managed outputs should go under .auditai/.")
-    content: str = Field(description="Text content to write.")
+    path: str = Field(description="Required target path relative to the project root. Managed outputs should go under .auditai/.")
+    content: str = Field(description="Required text content to write.")
     overwrite: bool = Field(default=False, description="Whether to overwrite an existing file.")
 
 
@@ -259,16 +259,19 @@ class CanonicalWriteTool(RuntimeTool):
     name = "Write"
     description = (
         "为当前审计会话写入文本产物。"
-        "托管输出允许写入 .auditai/ 目录。"
+        "调用时必须直接传 path 和 content，可选 overwrite；不要使用 raw_input、裸字符串或数组。"
+        "托管输出建议写入 .auditai/ 目录。"
         "启用护栏时，写入源码文件或项目根目录外的位置需要用户明确批准。"
     )
     input_model = WriteToolInput
 
-    def __init__(self, *, session_store=None):
+    def __init__(self, *, session_store=None, project_root: str | None = None):
         self._session_store = session_store
+        self._project_root = str(project_root or "").strip() or None
 
-    @staticmethod
-    def _resolve_project_root(context: ToolExecutionContext) -> Path:
+    def _resolve_project_root(self, context: ToolExecutionContext) -> Path:
+        if self._project_root:
+            return Path(self._project_root).resolve()
         payload = dict(context.recon_payload or {})
         if not payload and getattr(context.session, "recon_payload", None):
             payload = dict(context.session.recon_payload or {})
@@ -528,9 +531,8 @@ def build_runtime_tool_registry(
     if isinstance(search_tool, AgentTool):
         tools.append(CanonicalGrepTool(search_tool=search_tool))
 
-    tools.append(CanonicalWriteTool(session_store=session_store))
-
     project_root = _infer_project_root(agent_tools)
+    tools.append(CanonicalWriteTool(session_store=session_store, project_root=project_root))
     shell_backend = agent_tools.get("sandbox_exec") if isinstance(agent_tools.get("sandbox_exec"), AgentTool) else None
     if project_root:
         bash_executable = detect_bash_executable()

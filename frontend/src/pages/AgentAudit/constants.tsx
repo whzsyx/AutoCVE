@@ -175,27 +175,27 @@ export const TASK_STATUS_CONFIG: Record<string, {
   pending: {
     bg: "bg-muted",
     icon: React.createElement(Clock, { className: "w-3 h-3" }),
-    text: "PENDING"
+    text: "待处理"
   },
   running: {
     bg: "bg-emerald-600",
     icon: React.createElement(Loader2, { className: "w-3 h-3 animate-spin" }),
-    text: "RUNNING"
+    text: "运行中"
   },
   completed: {
     bg: "bg-emerald-600",
     icon: React.createElement(CheckCircle2, { className: "w-3 h-3" }),
-    text: "COMPLETED"
+    text: "已完成"
   },
   failed: {
     bg: "bg-rose-600",
     icon: React.createElement(XCircle, { className: "w-3 h-3" }),
-    text: "FAILED"
+    text: "失败"
   },
   cancelled: {
     bg: "bg-amber-600",
     icon: React.createElement(Square, { className: "w-3 h-3" }),
-    text: "CANCELLED"
+    text: "已取消"
   },
 };
 

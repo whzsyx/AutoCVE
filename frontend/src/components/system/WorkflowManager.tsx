@@ -1,17 +1,13 @@
 import { useEffect, useState } from 'react';
 import {
-  Activity,
-  Cpu,
   GitBranchPlus,
   Radar,
   RefreshCw,
   Route,
-  Save,
   SearchCheck,
   ShieldCheck,
   ShieldOff,
   Sparkles,
-  Zap,
 } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -66,16 +62,16 @@ const AGENT_META: Record<
 > = {
   orchestrator: {
     title: 'Orchestrator',
-    label: '调度核心',
-    description: '统一拆解任务、分发上下文，并决定后续路由分支。',
+    label: '流程编排',
+    description: '编排审计流程和阶段分发',
     icon: GitBranchPlus,
     x: 132,
     y: 220,
   },
   recon: {
     title: 'Recon',
-    label: '信息收集',
-    description: '采集目标特征、资产线索与先验信息，给后续节点提供基础输入。',
+    label: '入口发现',
+    description: '信息收集和入口发现',
     icon: Radar,
     x: 360,
     y: 220,
@@ -83,7 +79,7 @@ const AGENT_META: Record<
   scan: {
     title: 'Scan',
     label: '工具扫描',
-    description: '进行自动化探测、快速枚举和工具侧信号收集。',
+    description: '调用扫描工具',
     icon: SearchCheck,
     x: 610,
     y: 116,
@@ -91,23 +87,23 @@ const AGENT_META: Record<
   triage: {
     title: 'Triage',
     label: '误报过滤',
-    description: '过滤扫描结果中的低价值噪音，保留更可信的漏洞候选。',
+    description: '过滤误报',
     icon: ShieldCheck,
     x: 840,
     y: 116,
   },
   finding: {
     title: 'Finding',
-    label: '深度挖掘',
-    description: '沿着侦察线索聚焦漏洞成因、触发路径与利用价值。',
+    label: '漏洞深挖',
+    description: '漏洞深挖和报告生成',
     icon: Sparkles,
     x: 702,
     y: 324,
   },
   verification: {
     title: 'Verification',
-    label: '最终验证',
-    description: '对上游发现结果进行复核和确认，输出更稳定的结论。',
+    label: '闭环确认',
+    description: '问题验证和闭环确认',
     icon: ShieldOff,
     x: 1074,
     y: 220,
@@ -192,9 +188,6 @@ function computeEffectiveWorkflow(workflowConfig: WorkflowConfig) {
   return {
     graphNodes,
     activeEdges: ALL_EDGES.filter((edge) => activeEdgeKeys.has(`${edge.source}->${edge.target}`)),
-    enabledCount: graphNodes.filter((node) => node.configuredEnabled).length,
-    blockedCount: graphNodes.filter((node) => node.state === 'blocked').length,
-    branchCount: Number(effective.triage) + Number(effective.finding),
   };
 }
 
@@ -283,32 +276,28 @@ function getStateDescription(state: GraphNodeState) {
 
 function getCardTone(state: GraphNodeState) {
   if (state === 'active') {
-    return 'border-[rgba(182,221,206,.96)] bg-[linear-gradient(180deg,rgba(252,255,253,.98),rgba(243,250,247,.98))] shadow-[0_20px_38px_rgba(144,202,177,.12)]';
+    return 'border-[rgba(176,214,199,.78)] bg-[linear-gradient(180deg,rgba(255,255,255,.97),rgba(248,252,250,.94))] shadow-[0_18px_34px_rgba(94,142,114,.08)]';
   }
 
   if (state === 'blocked') {
-    return 'border-[rgba(210,222,216,.96)] bg-[linear-gradient(180deg,rgba(250,252,251,.98),rgba(244,247,246,.98))] shadow-[0_14px_28px_rgba(120,142,132,.06)]';
+    return 'border-[rgba(216,226,221,.88)] bg-[linear-gradient(180deg,rgba(255,255,255,.95),rgba(248,250,249,.92))] shadow-[0_12px_24px_rgba(120,142,132,.045)]';
   }
 
-  return 'border-[rgba(223,228,225,.96)] bg-[linear-gradient(180deg,rgba(246,248,247,.96),rgba(241,243,242,.98))] shadow-none';
+  return 'border-[rgba(226,231,228,.9)] bg-[linear-gradient(180deg,rgba(250,251,251,.94),rgba(245,247,246,.9))] shadow-none';
 }
 
 export function WorkflowManager() {
   const [workflowConfig, setWorkflowConfig] = useState<WorkflowConfig>(createDefaultWorkflowConfig());
-  const [initialSnapshot, setInitialSnapshot] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
   const effectiveWorkflow = computeEffectiveWorkflow(workflowConfig);
-  const isDirty = JSON.stringify(workflowConfig) !== initialSnapshot;
-
   const loadWorkflow = async () => {
     try {
       setLoading(true);
       const response = await getModelConfig();
       const nextWorkflow = normalizeWorkflowConfig(response.otherConfig?.workflowConfig);
       setWorkflowConfig(nextWorkflow);
-      setInitialSnapshot(JSON.stringify(nextWorkflow));
     } catch (error: any) {
       toast.error(error?.response?.data?.detail || error?.message || '读取工作流配置失败');
     } finally {
@@ -333,7 +322,6 @@ export function WorkflowManager() {
         },
       });
       setWorkflowConfig(normalized);
-      setInitialSnapshot(JSON.stringify(normalized));
       if (options?.successMessage) {
         toast.success(options.successMessage);
       }
@@ -375,25 +363,6 @@ export function WorkflowManager() {
     });
   };
 
-  const handleSave = async () => {
-    try {
-      setSaving(true);
-      const normalized = normalizeWorkflowConfig(workflowConfig);
-      await saveModelConfig({
-        otherConfig: {
-          workflowConfig: normalized,
-        },
-      });
-      setWorkflowConfig(normalized);
-      setInitialSnapshot(JSON.stringify(normalized));
-      toast.success('默认工作流已保存');
-    } catch (error: any) {
-      toast.error(error?.response?.data?.detail || error?.message || '保存工作流失败');
-    } finally {
-      setSaving(false);
-    }
-  };
-
   if (loading) {
     return (
       <div className="flex min-h-[360px] items-center justify-center text-[#6f8379]">
@@ -403,28 +372,28 @@ export function WorkflowManager() {
   }
 
   return (
-    <div className="space-y-6">
-      <section className="relative overflow-hidden rounded-[32px] border border-[rgba(214,223,218,.95)] bg-[linear-gradient(135deg,rgba(252,253,252,.98),rgba(244,248,246,.98)_55%,rgba(248,250,249,.98))] shadow-[0_24px_60px_rgba(108,131,119,.1)]">
-        <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(rgba(151,198,179,.08)_1px,transparent_1px),linear-gradient(90deg,rgba(151,198,179,.08)_1px,transparent_1px)] bg-[size:30px_30px] opacity-40" />
-        <div className="pointer-events-none absolute inset-y-0 right-0 w-[28rem] bg-[radial-gradient(circle_at_top_right,rgba(164,225,198,.22),transparent_68%)]" />
+    <div className="space-y-4">
+      <section className="relative overflow-hidden rounded-[28px] border border-slate-200 bg-[linear-gradient(135deg,rgba(241,253,248,.96),rgba(255,255,255,.98)_54%,rgba(248,251,250,.96))] shadow-[0_20px_52px_rgba(15,23,42,.06)]">
+        <div className="pointer-events-none absolute inset-0 cyber-grid-subtle opacity-35" />
+        <div className="pointer-events-none absolute inset-y-0 right-0 w-[28rem] bg-[radial-gradient(circle_at_top_right,rgba(164,225,198,.18),transparent_68%)]" />
 
-        <div className="relative space-y-6 p-7">
-          <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
-            <div className="max-w-4xl space-y-4">
+        <div className="relative p-7 md:p-8">
+          <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-start">
+            <div className="min-w-0 space-y-4">
               <div className="inline-flex items-center gap-2 rounded-full border border-[rgba(153,187,174,.42)] bg-white/82 px-4 py-1 text-xs uppercase tracking-[0.24em] text-[#6a877c]">
                 <Route className="h-3.5 w-3.5" />
                 Workflow Control Deck
               </div>
 
               <div className="space-y-3">
-                <h2 className="text-4xl font-black tracking-tight text-[#20352d]">工作流管理</h2>
-                <p className="max-w-4xl text-sm leading-8 text-[#577166]">
-                  用可视化方式直接控制漏洞挖掘路径。关闭某个调试节点后，后端新任务会自动跳过它，并根据剩余有效分支重新拼接执行链路，避免无效消耗 token。
+                <h2 className="text-4xl font-black tracking-normal text-slate-950">工作流管理</h2>
+                <p className="max-w-none text-sm leading-8 text-[#577166] xl:whitespace-nowrap">
+                  通过可视化流程图动态调整审计路径。关闭某个调试节点后，后端新任务会自动跳过该节点，并基于剩余有效分支重组执行链路。
                 </p>
               </div>
             </div>
 
-            <div className="flex flex-wrap gap-3 xl:justify-end">
+            <div className="flex flex-nowrap gap-3 xl:justify-end">
               <Button
                 variant="outline"
                 className="h-11 rounded-full border-[#d9e4de] bg-white/85"
@@ -440,78 +409,19 @@ export function WorkflowManager() {
                 onClick={handleReset}
                 disabled={saving}
               >
-                全部恢复默认
+                恢复默认
               </Button>
-              <Button
-                className="h-11 rounded-full border border-[#9ed0bb] bg-[linear-gradient(135deg,#8dcab1,#a8dcc8)] text-[#173128] shadow-[0_18px_32px_rgba(143,205,180,.28)] hover:bg-[linear-gradient(135deg,#84c4aa,#9dd5c0)]"
-                onClick={() => void handleSave()}
-                disabled={saving || !isDirty}
-              >
-                <Save className="mr-2 h-4 w-4" />
-                {saving ? '保存中...' : '保存为默认工作流'}
-              </Button>
-            </div>
-          </div>
-
-          <div className="grid gap-4 md:grid-cols-3">
-            <div className="rounded-[24px] border border-[rgba(208,223,216,.96)] bg-white/76 p-5 shadow-[0_16px_32px_rgba(110,129,120,.08)] backdrop-blur-sm">
-              <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[#7d9a8f]">
-                <Cpu className="h-4 w-4" />
-                已启用节点
-              </div>
-              <div className="mt-3 text-5xl font-black text-[#22352d]">{effectiveWorkflow.enabledCount}</div>
-              <div className="mt-2 text-sm text-[#668177]">当前配置中处于开启状态的节点数量</div>
-            </div>
-
-            <div className="rounded-[24px] border border-[rgba(208,223,216,.96)] bg-white/76 p-5 shadow-[0_16px_32px_rgba(110,129,120,.08)] backdrop-blur-sm">
-              <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[#7d9a8f]">
-                <Activity className="h-4 w-4" />
-                依赖跳过
-              </div>
-              <div className="mt-3 text-5xl font-black text-[#22352d]">{effectiveWorkflow.blockedCount}</div>
-              <div className="mt-2 text-sm text-[#668177]">节点开启但因上游关闭而被自动跳过</div>
-            </div>
-
-            <div className="rounded-[24px] border border-[rgba(208,223,216,.96)] bg-white/76 p-5 shadow-[0_16px_32px_rgba(110,129,120,.08)] backdrop-blur-sm">
-              <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[#7d9a8f]">
-                <Zap className="h-4 w-4" />
-                活跃分支
-              </div>
-              <div className="mt-3 text-5xl font-black text-[#22352d]">{effectiveWorkflow.branchCount}</div>
-              <div className="mt-2 text-sm text-[#668177]">本轮真正参与执行的漏洞挖掘分支数量</div>
             </div>
           </div>
         </div>
       </section>
 
-      <section className="overflow-hidden rounded-[32px] border border-[rgba(215,223,218,.96)] bg-[linear-gradient(180deg,rgba(249,252,251,.98),rgba(241,246,244,.98))] shadow-[0_24px_58px_rgba(102,126,115,.11)]">
-        <div className="flex flex-col gap-4 border-b border-[rgba(214,225,220,.92)] px-6 py-5 lg:flex-row lg:items-start lg:justify-between">
-          <div className="max-w-3xl space-y-2">
-            <h3 className="text-3xl font-black text-[#24372f]">动态图谱</h3>
-            <p className="text-sm leading-7 text-[#617d71]">
-              亮色链路表示后端本次会真实执行的有效路径。浅灰节点表示手动关闭，雾灰节点表示当前仍开启，但会因为依赖断开而在运行时被自动跳过。
-            </p>
-          </div>
-
-          <div className="flex flex-wrap gap-2">
-            <Badge
-              variant="outline"
-              className="rounded-full border-[#9dd0bc] bg-[#effaf5] px-3 normal-case tracking-normal text-[#4c7b6b]"
-            >
-              亮色 = 实际执行
-            </Badge>
-            <Badge
-              variant="outline"
-              className="rounded-full border-[#c9d9d2] bg-[#f8fbfa] px-3 normal-case tracking-normal text-[#7b948a]"
-            >
-              雾灰 = 依赖跳过
-            </Badge>
-            <Badge
-              variant="outline"
-              className="rounded-full border-[#d8e1dd] bg-[#f2f5f4] px-3 normal-case tracking-normal text-[#8f9f99]"
-            >
-              浅灰 = 手动关闭
-            </Badge>
+      <section className="relative -mt-1 overflow-hidden rounded-[30px] border border-[rgba(205,221,214,.88)] bg-[linear-gradient(180deg,rgba(255,255,255,.98),rgba(246,251,249,.96))] shadow-[0_22px_54px_rgba(61,85,75,.08)]">
+        <div className="pointer-events-none absolute inset-0 cyber-grid-subtle opacity-20" />
+        <div className="relative border-b border-[rgba(214,225,220,.78)] px-6 py-5">
+          <div className="flex items-center gap-3">
+            <span className="h-9 w-1.5 rounded-full bg-[#74a88d]" />
+            <h3 className="text-3xl font-black text-[#24372f]">动态流程图</h3>
           </div>
         </div>
 

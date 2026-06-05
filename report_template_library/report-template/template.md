@@ -1,4 +1,4 @@
-# AuditAI 最终漏洞报告
+# AI Audit 最终漏洞报告
 
 ## 基本信息
 - 生成时间: {{ report.generated_at }}
@@ -6,7 +6,6 @@
 - 任务名称: {{ task.name or '未命名任务' }}
 - 任务 ID: {{ task.id }}
 - 当前状态: {{ task.status }}
-- 使用模板: {{ template.name if template else '系统默认模板' }}
 
 ## 执行摘要
 - 安全评分: {{ summary.security_score if summary.security_score is not none else 'N/A' }}
@@ -60,7 +59,3 @@
 本次任务未生成可输出的漏洞结果。
 {% endif %}
 
-## 修复优先级建议
-1. 优先修复 Critical / High 严重等级问题。
-2. 结合 Scan/Triage 与 Finding 两条线索统一排期。
-3. 对已验证漏洞优先补充修复与回归验证。

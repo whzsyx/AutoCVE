@@ -1,7 +1,11 @@
+import os
 import re
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 
 from app.api import deps
 from app.models.user import User
@@ -144,23 +148,10 @@ async def import_github_skill(
 ) -> Any:
     del current_user
     try:
-        imported = await SkillService.import_github_skill(request.repo_url)
-    except ValueError as exc:
+        skill = await SkillService.import_github_skill(request.repo_url)
+    except (FileExistsError, FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    skill = SkillFileService.write_skill(
-        slug=imported["slug"],
-        name=imported["name"],
-        description=imported["description"],
-        content=imported["content"],
-        tags=imported.get("tags", []),
-        source_type=imported.get("source_type", "github"),
-        source_url=imported.get("source_url"),
-        metadata_json=imported.get("metadata_json", {}),
-        is_system=False,
-        is_active=True,
-        extension_payload=imported.get("extension_payload", {}),
-    )
     if request.bind_to_agent and request.agent_type:
         SkillFileService.upsert_binding(
             request.agent_type,
@@ -172,6 +163,38 @@ async def import_github_skill(
             match_config={},
         )
     return _skill_response(SkillFileService.read_skill(skill["slug"]))
+
+
+@router.post("/upload-zip", response_model=SkillResponse)
+async def upload_skill_zip(
+    file: UploadFile = File(...),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    del current_user
+    if not str(file.filename or "").lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Please upload a ZIP file")
+
+    temp_file_handle = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    temp_file_path = temp_file_handle.name
+    temp_file_handle.close()
+
+    try:
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        file_size = os.path.getsize(temp_file_path)
+        if file_size > 100 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="ZIP file size cannot exceed 100MB")
+
+        skill = SkillFileService.import_skill_zip(Path(temp_file_path), str(file.filename or "skill.zip"))
+        return _skill_response(skill)
+    except (FileExistsError, FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        try:
+            os.unlink(temp_file_path)
+        except OSError:
+            pass
 
 
 @router.put("/{skill_id}", response_model=SkillResponse)
@@ -214,7 +237,10 @@ async def delete_skill(
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     del current_user
-    SkillFileService.delete_skill(skill_id)
+    try:
+        SkillFileService.delete_skill(skill_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"ok": True}
 
 

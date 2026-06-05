@@ -190,7 +190,7 @@ export const LogEntry = memo(function LogEntry({ item, isExpanded, onToggle }: L
             {item.tool?.status === 'completed' && (
               <div className="flex items-center gap-1.5 flex-shrink-0 px-2 py-1 rounded-md bg-emerald-500/10 border border-emerald-500/30">
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-500" />
-                <span className="text-xs text-emerald-600 dark:text-emerald-500 font-mono uppercase">Done</span>
+                <span className="text-xs text-emerald-600 dark:text-emerald-500 font-medium">完成</span>
               </div>
             )}
 

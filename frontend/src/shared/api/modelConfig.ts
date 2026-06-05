@@ -31,6 +31,7 @@ export interface AgentModelConfig {
 export interface ModelProfileConfig {
   id: string;
   name: string;
+  isDefault?: boolean;
   llmProvider?: string;
   llmApiKey?: string;
   llmModel?: string;

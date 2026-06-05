@@ -7,7 +7,6 @@ import shutil
 import tempfile
 import time
 from types import SimpleNamespace
-import uuid
 import zipfile
 
 import pytest
@@ -24,9 +23,6 @@ import app.api.v1.endpoints.projects as projects_endpoint
 from app.models.project import Project
 from app.services.zip_storage import save_project_zip
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
-
-
 def build_test_app() -> FastAPI:
     app = FastAPI()
     app.include_router(projects_router, prefix="/api/v1/projects")
@@ -34,7 +30,7 @@ def build_test_app() -> FastAPI:
 
 
 def make_managed_root() -> Path:
-    managed_root = WORKSPACE_ROOT / ".pytest-managed-projects" / str(uuid.uuid4())
+    managed_root = Path(tempfile.mkdtemp(prefix="auditai-managed-projects-")).resolve()
     managed_root.mkdir(parents=True, exist_ok=True)
     return managed_root
 
@@ -86,7 +82,8 @@ async def test_delete_project_endpoint_permanently_deletes_project():
 
 @pytest.mark.asyncio
 async def test_list_managed_local_directories_creates_missing_root():
-    managed_root = WORKSPACE_ROOT / ".pytest-managed-projects" / str(uuid.uuid4()) / "projects"
+    managed_root = Path(tempfile.mkdtemp(prefix="auditai-managed-projects-")).resolve() / "projects"
+    shutil.rmtree(managed_root.parent, ignore_errors=True)
     original_root = projects_endpoint.settings.MANAGED_PROJECTS_ROOT
     projects_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
 
@@ -169,6 +166,14 @@ async def test_create_github_project_uses_remote_default_branch(monkeypatch):
 
     monkeypatch.setattr(projects_endpoint, "get_github_repository_metadata", fake_get_github_repository_metadata)
     monkeypatch.setattr(projects_endpoint, "get_github_branches", fake_get_github_branches)
+    prepared_workspaces: list[tuple[str, str, bool]] = []
+
+    async def fake_prepare_project_workspace(*, project: Project, db, user_id: str, refresh: bool = False):
+        del db, user_id
+        prepared_workspaces.append((project.id, project.default_branch, refresh))
+        return f"/tmp/auditai-workspaces/{project.id}"
+
+    monkeypatch.setattr(projects_endpoint, "_prepare_project_workspace", fake_prepare_project_workspace)
 
     async with session_factory() as db:
         created = await projects_endpoint.create_project(
@@ -185,6 +190,56 @@ async def test_create_github_project_uses_remote_default_branch(monkeypatch):
     await engine.dispose()
 
     assert created.default_branch == "master"
+    assert prepared_workspaces == [(created.id, "master", True)]
+
+
+@pytest.mark.asyncio
+async def test_create_local_directory_project_prepares_project_workspace(tmp_path):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as db:
+        db.add(
+            User(
+                id="user-1",
+                email="owner@example.com",
+                hashed_password="not-a-real-hash",
+                full_name="Owner",
+                is_active=True,
+            )
+        )
+        await db.commit()
+
+    managed_root = tmp_path / "projects"
+    project_path = managed_root / "managed-demo"
+    project_path.mkdir(parents=True)
+    (project_path / "app.py").write_text("print('prepared')\n", encoding="utf-8")
+    original_root = projects_endpoint.settings.MANAGED_PROJECTS_ROOT
+    projects_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
+
+    try:
+        async with session_factory() as db:
+            created = await projects_endpoint.create_project(
+                db=db,
+                project_in=projects_endpoint.ProjectCreate(
+                    name="Managed Demo",
+                    source_type="local_directory",
+                    local_path=str(project_path),
+                    programming_languages=["Python"],
+                ),
+                current_user=SimpleNamespace(id="user-1", is_active=True),
+            )
+    finally:
+        projects_endpoint.settings.MANAGED_PROJECTS_ROOT = original_root
+
+    await engine.dispose()
+
+    workspace_root = managed_root / ".auditai_workspaces" / "projects" / created.id
+    assert workspace_root.is_dir()
+    assert (workspace_root / "app.py").read_text(encoding="utf-8") == "print('prepared')\n"
 
 
 @pytest.mark.asyncio

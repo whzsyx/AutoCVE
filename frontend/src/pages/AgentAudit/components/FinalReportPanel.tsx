@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { AlertTriangle, CheckCircle2, FileCode, Link2, ShieldAlert } from "lucide-react";
+import { AlertTriangle, CheckCircle2, FileCode, Link2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import type { AgentFinding, AgentTask, RecoveredCandidate } from "@/shared/api/agentTasks";
 
@@ -48,6 +48,16 @@ function statusBadgeClass(status: string): string {
   return "bg-amber-500/15 text-amber-700 border border-amber-500/30";
 }
 
+function statusLabel(status: string): string {
+  const labelMap: Record<string, string> = {
+    confirmed: "已确认",
+    candidate: "候选",
+    recovered_candidate: "已恢复候选",
+    false_positive: "误报",
+  };
+  return labelMap[status] || status;
+}
+
 function hasConfidence(item: ReportItem): item is AgentFinding & { __kind: "finding" } {
   return item.__kind === "finding";
 }
@@ -94,38 +104,20 @@ export const FinalReportPanel = memo(function FinalReportPanel({
   });
 
   return (
-    <section className="mt-3 overflow-hidden rounded-[22px] border border-border/70 bg-white/72 shadow-[0_24px_60px_rgba(125,104,75,0.12)] backdrop-blur-xl">
-      <div className="border-b border-border/70 bg-card/80 px-6 py-4">
-        <div className="flex items-center gap-3">
-          <div className="rounded-xl border border-primary/30 bg-primary/10 p-2">
-            <ShieldAlert className="h-5 w-5 text-primary" />
-          </div>
-          <div>
-            <h2 className="text-lg font-semibold text-foreground">
-              {isRecoveredOnly ? "Recovered Candidate Findings" : "Final Vulnerability Report"}
-            </h2>
-            <p className="text-sm text-muted-foreground">
-              {isRecoveredOnly
-                ? "These candidates were recovered from the runtime transcript after finalization failed. They are not finalized findings yet."
-                : "Verified and persisted findings from the completed runtime audit are summarized here for triage and export."}
-            </p>
-          </div>
-        </div>
-      </div>
-
-      <div className="space-y-4 p-5">
+    <section className="mt-3 overflow-visible">
+      <div className="space-y-4 px-2 py-3">
         {orderedFindings.map((finding, index) => {
           const reportStatus = normalizeStatus(finding);
           const itemKey =
             finding.__kind === "finding" ? finding.id : `recovered-${index}-${finding.title}`;
 
           return (
-            <article key={itemKey} className="rounded-2xl border border-border/60 bg-card/80 p-4 shadow-sm">
-              <div className="flex flex-wrap items-start justify-between gap-3">
+            <article key={itemKey} className="rounded-[22px] border border-[#dbe6df] bg-white p-5 shadow-[0_12px_34px_rgba(48,68,58,0.08)]">
+              <div className="flex flex-wrap items-start gap-3">
                 <div className="space-y-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <h3 className="text-base font-semibold text-foreground">{finding.title}</h3>
-                    <Badge className={statusBadgeClass(reportStatus)}>{reportStatus}</Badge>
+                    <Badge className={statusBadgeClass(reportStatus)}>{statusLabel(reportStatus)}</Badge>
                     <Badge variant="outline" className="font-mono uppercase">{finding.severity}</Badge>
                     <Badge variant="outline" className="font-mono">{finding.vulnerability_type}</Badge>
                   </div>
@@ -139,15 +131,17 @@ export const FinalReportPanel = memo(function FinalReportPanel({
                       </span>
                     </div>
                   )}
-                </div>
 
-                <div className="text-right text-xs text-muted-foreground">
-                  {hasConfidence(finding) ? (
-                    <div>
-                      Confidence: {(finding.ai_confidence ?? finding.confidence ?? 0).toFixed?.(2) ?? finding.confidence}
+                  {(hasConfidence(finding) || finding.origin) ? (
+                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                      {hasConfidence(finding) ? (
+                        <div>
+                          Confidence: {(finding.ai_confidence ?? finding.confidence ?? 0).toFixed?.(2) ?? finding.confidence}
+                        </div>
+                      ) : null}
+                      {finding.origin ? <div>Origin: {finding.origin}</div> : null}
                     </div>
                   ) : null}
-                  {finding.origin ? <div>Origin: {finding.origin}</div> : null}
                 </div>
               </div>
 
@@ -234,8 +228,8 @@ export const FinalReportPanel = memo(function FinalReportPanel({
                 </div>
               ) : null}
 
-              {(finding.verification_notes || finding.evidence_gaps?.length) ? (
-                <div className="mt-3 grid gap-3 md:grid-cols-2">
+              {finding.verification_notes ? (
+                <div className="mt-3">
                   {finding.verification_notes ? (
                     <div className="rounded-xl border border-border/50 bg-muted/30 p-3 text-sm">
                       <div className="flex items-center gap-2 font-medium text-foreground">
@@ -243,18 +237,6 @@ export const FinalReportPanel = memo(function FinalReportPanel({
                         Verification Notes
                       </div>
                       <div className="mt-1 text-muted-foreground">{finding.verification_notes}</div>
-                    </div>
-                  ) : null}
-                  {finding.evidence_gaps && finding.evidence_gaps.length > 0 ? (
-                    <div className="rounded-xl border border-border/50 bg-muted/30 p-3 text-sm">
-                      <div className="font-medium text-foreground">Evidence Gaps</div>
-                      <div className="mt-2 flex flex-wrap gap-2">
-                        {finding.evidence_gaps.map((gap) => (
-                          <Badge key={`${itemKey}-${gap}`} variant="outline" className="font-mono text-[11px]">
-                            {gap}
-                          </Badge>
-                        ))}
-                      </div>
                     </div>
                   ) : null}
                 </div>

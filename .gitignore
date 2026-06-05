@@ -181,6 +181,7 @@ bandit_results.json
 semgrep_results.json
 gitleaks_results.json
 trufflehog_results.json
+backend/uploads/checkmarx/
 
 # Test files
 ttt/

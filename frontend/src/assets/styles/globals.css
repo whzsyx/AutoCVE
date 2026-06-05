@@ -984,6 +984,69 @@
     white-space: pre;
   }
 
+  .github-markdown .markdown-code-shell {
+    position: relative;
+    margin: 0 0 16px;
+    overflow: hidden;
+    border: 1px solid #d8dee4;
+    border-radius: 8px;
+    background: #f6f8fa;
+  }
+
+  .github-markdown .markdown-code-shell .markdown-code-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 34px;
+    padding: 0 14px;
+    border-bottom: 1px solid #d8dee4;
+    background: #f6f8fa;
+    color: #57606a;
+    font-family: var(--font-mono-real) !important;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .github-markdown .markdown-code-shell pre {
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: #f6f8fa;
+  }
+
+  .github-markdown .markdown-code-shell code {
+    color: #24292f;
+  }
+
+  .github-markdown .syntax-comment {
+    color: #6e7781;
+  }
+
+  .github-markdown .syntax-keyword {
+    color: #cf222e;
+  }
+
+  .github-markdown .syntax-string {
+    color: #0a3069;
+  }
+
+  .github-markdown .syntax-number {
+    color: #0550ae;
+  }
+
+  .github-markdown .syntax-function {
+    color: #8250df;
+  }
+
+  .github-markdown .syntax-method {
+    color: #116329;
+    font-weight: 600;
+  }
+
+  .github-markdown .syntax-punctuation {
+    color: #57606a;
+  }
+
   .github-markdown table {
     display: block;
     width: max-content;

@@ -201,6 +201,64 @@ async def _lookup_repository_branches(
     return {"branches": ordered_branches, "default_branch": default_branch}
 
 
+async def _get_repository_ssh_private_key(db: AsyncSession, user_id: str) -> Optional[str]:
+    from app.core.encryption import decrypt_sensitive_data
+
+    result = await db.execute(select(UserConfig).where(UserConfig.user_id == user_id))
+    config = result.scalar_one_or_none()
+    if not config or not config.other_config:
+        return None
+    other_config = json.loads(config.other_config)
+    encrypted_key = other_config.get("sshPrivateKey")
+    if not encrypted_key:
+        return None
+    try:
+        return decrypt_sensitive_data(encrypted_key)
+    except Exception:
+        return None
+
+
+async def _prepare_project_workspace(
+    *,
+    project: Project,
+    db: AsyncSession,
+    user_id: str,
+    refresh: bool = False,
+) -> Optional[str]:
+    if project.source_type == "repository" and not project.repository_url:
+        workspace_root = Path(settings.MANAGED_PROJECTS_ROOT).resolve() / ".auditai_workspaces" / "projects" / str(project.id)
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        return str(workspace_root)
+
+    if project.source_type == "zip" and not project.local_path:
+        workspace_root = Path(settings.MANAGED_PROJECTS_ROOT).resolve() / ".auditai_workspaces" / "projects" / str(project.id)
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        return str(workspace_root)
+
+    from app.api.v1.endpoints.agent_tasks import _get_project_root
+
+    tokens = await _get_repository_tokens(db, user_id)
+    ssh_private_key = await _get_repository_ssh_private_key(db, user_id)
+    return await _get_project_root(
+        project,
+        str(project.id),
+        project.default_branch,
+        github_token=tokens.get("github"),
+        gitlab_token=tokens.get("gitlab"),
+        gitea_token=tokens.get("gitea"),
+        ssh_private_key=ssh_private_key,
+        event_emitter=None,
+        workspace_scope="project",
+        refresh=refresh,
+    )
+
+
+def _delete_project_workspace(project_id: str) -> None:
+    workspace_root = Path(settings.MANAGED_PROJECTS_ROOT).resolve() / ".auditai_workspaces" / "projects" / str(project_id)
+    if workspace_root.exists() and workspace_root.is_dir():
+        shutil.rmtree(workspace_root, ignore_errors=True)
+
+
 def _get_managed_projects_root() -> Path:
     managed_root = Path(settings.MANAGED_PROJECTS_ROOT).resolve()
     managed_root.mkdir(parents=True, exist_ok=True)
@@ -431,6 +489,18 @@ async def create_project(
         owner_id=current_user.id
     )
     db.add(project)
+    await db.flush()
+    try:
+        await _prepare_project_workspace(
+            project=project,
+            db=db,
+            user_id=current_user.id,
+            refresh=True,
+        )
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"Failed to prepare project workspace: {exc}") from exc
+
     await db.commit()
     result = await db.execute(
         select(Project)
@@ -674,6 +744,7 @@ async def delete_project(
     if project.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="无权删除此项目")
     
+    _delete_project_workspace(project.id)
     await db.delete(project)
     await db.commit()
     return {"message": "项目已永久删除"}
@@ -719,6 +790,7 @@ async def permanently_delete_project(
     if project.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="无权永久删除此项目")
     
+    _delete_project_workspace(project.id)
     await db.delete(project)
     await db.commit()
     return {"message": "项目已永久删除"}
@@ -1223,6 +1295,12 @@ async def upload_project_zip(
         project.local_path = str(source_meta.get('path') or '')
         project.workspace_mode = 'persistent_source'
         project.updated_at = datetime.now(timezone.utc)
+        await _prepare_project_workspace(
+            project=project,
+            db=db,
+            user_id=current_user.id,
+            refresh=True,
+        )
         await db.commit()
         await db.refresh(project)
 

@@ -107,6 +107,15 @@ export async function importGithubSkill(data: SkillImportPayload): Promise<Skill
   return response.data;
 }
 
+export async function uploadSkillZip(file: File): Promise<Skill> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const response = await apiClient.post('/skills/upload-zip', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+  return response.data;
+}
+
 export async function createSkillBinding(skillId: string, data: Omit<AgentSkillBinding, 'id' | 'skill_id'>): Promise<AgentSkillBinding> {
   const response = await apiClient.post(`/skills/${skillId}/bindings`, data);
   return response.data;

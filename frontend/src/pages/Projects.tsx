@@ -41,7 +41,7 @@ import {
 import { api } from "@/shared/config/database";
 import { BranchSelector } from "@/components/ui/branch-selector";
 import { validateZipFile } from "@/features/projects/services";
-import type { Project, CreateProjectForm, ManagedLocalDirectory } from "@/shared/types";
+import type { Project, CreateProjectForm } from "@/shared/types";
 import {
   deleteProjectSourceArtifacts,
   formatFileSize,
@@ -67,13 +67,13 @@ export default function Projects() {
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [projectImportMessage, setProjectImportMessage] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
   const [showEditDialog, setShowEditDialog] = useState(false);
   const [projectToEdit, setProjectToEdit] = useState<Project | null>(null);
-  const [managedDirectories, setManagedDirectories] = useState<ManagedLocalDirectory[]>([]);
-  const [loadingManagedDirectories, setLoadingManagedDirectories] = useState(false);
   const [editForm, setEditForm] = useState<CreateProjectForm>({
     name: "",
     description: "",
@@ -97,7 +97,6 @@ export default function Projects() {
   const [createBranchError, setCreateBranchError] = useState<string | null>(null);
 
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [keepZipArchive, setKeepZipArchive] = useState(true);
 
   // 编辑对话框中的ZIP文件状态
   const [editZipInfo, setEditZipInfo] = useState<ZipFileMeta | null>(null);
@@ -131,12 +130,6 @@ export default function Projects() {
   useEffect(() => {
     loadProjects();
   }, []);
-
-  useEffect(() => {
-    if (showCreateDialog) {
-      void loadManagedDirectories();
-    }
-  }, [showCreateDialog]);
 
   useEffect(() => {
     if (!showCreateDialog || createForm.source_type !== "repository") {
@@ -202,19 +195,6 @@ export default function Projects() {
     }
   };
 
-  const loadManagedDirectories = async () => {
-    try {
-      setLoadingManagedDirectories(true);
-      const data = await api.getManagedLocalDirectories();
-      setManagedDirectories(data);
-    } catch (error) {
-      console.error('Failed to load managed directories:', error);
-      toast.error("加载受管本地目录失败");
-    } finally {
-      setLoadingManagedDirectories(false);
-    }
-  };
-
   const handleFastScanStarted = (taskId: string) => {
     setCurrentTaskId(taskId);
     setShowTerminal(true);
@@ -232,6 +212,12 @@ export default function Projects() {
     }
 
     try {
+      setCreatingProject(true);
+      setProjectImportMessage(
+        createForm.source_type === "local_directory"
+          ? "正在导入本地项目目录..."
+          : `正在从 ${createForm.repository_type === "github" ? "GitHub" : "远程"} 仓库导入源码...`
+      );
       await api.createProject({
         ...createForm,
       } as any);
@@ -255,6 +241,9 @@ export default function Projects() {
       });
       const errorMessage = error instanceof Error ? error.message : '未知错误';
       toast.error(`创建项目失败: ${errorMessage}`);
+    } finally {
+      setCreatingProject(false);
+      setProjectImportMessage("");
     }
   };
 
@@ -273,8 +262,8 @@ export default function Projects() {
     setCreateBranches([]);
     setCreateBranchError(null);
     setLoadingCreateBranches(false);
+    setProjectImportMessage("");
     setSelectedFile(null);
-    setKeepZipArchive(true);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -307,6 +296,7 @@ export default function Projects() {
 
     try {
       setUploading(true);
+      setProjectImportMessage("正在创建 ZIP 项目记录...");
       setUploadProgress(0);
 
       const progressInterval = setInterval(() => {
@@ -327,7 +317,8 @@ export default function Projects() {
       } as any);
 
       try {
-        await uploadZipFile(project.id, selectedFile, { keepArchive: keepZipArchive });
+        setProjectImportMessage("正在上传并解压 ZIP 源码...");
+        await uploadZipFile(project.id, selectedFile, { keepArchive: false });
       } catch (error) {
         console.error('保存ZIP文件失败:', error);
       }
@@ -361,6 +352,7 @@ export default function Projects() {
       toast.error(`上传失败: ${errorMessage}`);
     } finally {
       setUploading(false);
+      setProjectImportMessage("");
       setUploadProgress(0);
     }
   };
@@ -595,30 +587,20 @@ export default function Projects() {
             初始化项目
           </Button>
         </DialogTrigger>
-        <DialogContent className="!w-[min(90vw,700px)] !max-w-none max-h-[85vh] flex flex-col p-0 gap-0 cyber-dialog border border-border rounded-lg">
-          {/* Terminal Header */}
-          <div className="flex items-center gap-2 px-4 py-3 cyber-bg-elevated border-b border-border flex-shrink-0">
-            <div className="flex items-center gap-1.5">
-              <div className="w-3 h-3 rounded-full bg-red-500/80" />
-              <div className="w-3 h-3 rounded-full bg-yellow-500/80" />
-              <div className="w-3 h-3 rounded-full bg-green-500/80" />
-            </div>
-            <span className="ml-2 text-xs text-muted-foreground">
-              create@auditai
-            </span>
-          </div>
-
-          <DialogHeader className="px-6 pt-4 flex-shrink-0">
-            <DialogTitle className="font-mono text-lg uppercase tracking-wider flex items-center gap-2 text-foreground">
-              <Terminal className="w-5 h-5 text-primary" />
-              初始化新项目
+        <DialogContent className="!w-[min(92vw,760px)] !max-w-none max-h-[88vh] overflow-hidden flex flex-col gap-0 rounded-[28px] border border-slate-200/80 bg-white/95 p-0 shadow-[0_30px_90px_rgba(15,23,42,0.22)] backdrop-blur-xl">
+          <DialogHeader className="flex-shrink-0 border-b border-slate-200/70 bg-[radial-gradient(circle_at_12%_12%,rgba(52,211,153,0.16),transparent_32%),linear-gradient(135deg,rgba(240,253,244,0.98),rgba(255,255,255,0.96)_58%,rgba(248,250,252,0.98))] px-7 py-6">
+            <DialogTitle className="flex items-center gap-3 text-2xl font-black tracking-tight text-slate-950">
+              <span className="flex h-11 w-11 items-center justify-center rounded-2xl border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-sm">
+                <Terminal className="h-5 w-5" />
+              </span>
+              <span>初始化新项目</span>
             </DialogTitle>
           </DialogHeader>
 
-          <div className="flex-1 overflow-y-auto p-6">
+          <div className="flex-1 overflow-y-auto bg-slate-50/70 p-6">
             <Tabs
               defaultValue="repository"
-              className="w-full"
+              className="w-full space-y-5"
               onValueChange={(value) => {
                 if (value === "repository") {
                   setCreateForm((previous) => ({ ...previous, source_type: "repository" }));
@@ -628,59 +610,47 @@ export default function Projects() {
                   setCreateForm((previous) => ({ ...previous, source_type: "zip" }));
                   return;
                 }
-                setCreateForm((previous) => ({
-                  ...previous,
-                  source_type: "local_directory",
-                  workspace_mode: "in_place",
-                }));
               }}
             >
-              <TabsList className="flex w-full bg-muted border border-border p-1 h-auto gap-1 rounded">
+              <TabsList className="grid h-auto w-full grid-cols-2 gap-2 rounded-2xl border border-slate-200 bg-white p-1.5 shadow-sm">
                 <TabsTrigger
                   value="repository"
-                  className="flex-1 data-[state=active]:bg-primary data-[state=active]:text-foreground font-mono font-bold uppercase py-2 text-muted-foreground transition-all rounded-sm"
+                  className="h-11 rounded-xl text-sm font-bold text-slate-500 transition-all data-[state=active]:bg-emerald-700 data-[state=active]:text-white data-[state=active]:shadow-[0_12px_24px_rgba(5,150,105,0.22)]"
                 >
                   <GitBranch className="w-4 h-4 mr-2" />
                   Git 仓库
                 </TabsTrigger>
                 <TabsTrigger
                   value="upload"
-                  className="flex-1 data-[state=active]:bg-primary data-[state=active]:text-foreground font-mono font-bold uppercase py-2 text-muted-foreground transition-all rounded-sm"
+                  className="h-11 rounded-xl text-sm font-bold text-slate-500 transition-all data-[state=active]:bg-emerald-700 data-[state=active]:text-white data-[state=active]:shadow-[0_12px_24px_rgba(5,150,105,0.22)]"
                 >
                   <Upload className="w-4 h-4 mr-2" />
                   上传源码
                 </TabsTrigger>
-                <TabsTrigger
-                  value="local"
-                  className="flex-1 data-[state=active]:bg-primary data-[state=active]:text-foreground font-mono font-bold uppercase py-2 text-muted-foreground transition-all rounded-sm"
-                >
-                  <HardDrive className="w-4 h-4 mr-2" />
-                  本地目录
-                </TabsTrigger>
               </TabsList>
 
-              <TabsContent value="repository" className="flex flex-col gap-5 mt-5">
-                <div className="grid grid-cols-2 gap-5">
+              <TabsContent value="repository" className="m-0 space-y-5 rounded-[24px] border border-slate-200 bg-white p-5 shadow-sm data-[state=inactive]:hidden">
+                <div className="grid gap-4 md:grid-cols-2">
                   <div className="space-y-1.5">
-                    <Label htmlFor="name" className="font-mono font-bold uppercase text-xs text-muted-foreground">项目名称 *</Label>
+                    <Label htmlFor="name" className="text-xs font-bold text-slate-600">项目名称 *</Label>
                     <Input
                       id="name"
                       value={createForm.name}
                       onChange={(e) => setCreateForm({ ...createForm, name: e.target.value })}
                       placeholder="输入项目名称"
-                      className="cyber-input"
+                      className="h-11 rounded-2xl border-slate-200 bg-slate-50/80 shadow-inner focus-visible:ring-emerald-600"
                     />
                   </div>
                   <div className="space-y-1.5">
-                    <Label htmlFor="repository_type" className="font-mono font-bold uppercase text-xs text-muted-foreground">认证类型</Label>
+                    <Label htmlFor="repository_type" className="text-xs font-bold text-slate-600">认证类型</Label>
                     <Select
                       value={createForm.repository_type}
                       onValueChange={(value: any) => setCreateForm({ ...createForm, repository_type: value })}
                     >
-                      <SelectTrigger className="cyber-input">
+                      <SelectTrigger className="h-11 rounded-2xl border-slate-200 bg-slate-50/80 shadow-inner focus:ring-emerald-600">
                         <SelectValue />
                       </SelectTrigger>
-                      <SelectContent className="cyber-dialog border-border">
+                      <SelectContent className="rounded-2xl border-slate-200 bg-white">
                         {REPOSITORY_PLATFORMS.map((platform) => (
                           <SelectItem key={platform.value} value={platform.value}>
                             {platform.label}
@@ -692,20 +662,20 @@ export default function Projects() {
                 </div>
 
                 <div className="space-y-1.5">
-                  <Label htmlFor="description" className="font-mono font-bold uppercase text-xs text-muted-foreground">描述</Label>
+                  <Label htmlFor="description" className="text-xs font-bold text-slate-600">描述</Label>
                   <Textarea
                     id="description"
                     value={createForm.description}
                     onChange={(e) => setCreateForm({ ...createForm, description: e.target.value })}
                     placeholder="// 项目描述..."
                     rows={3}
-                    className="cyber-input min-h-[80px]"
+                    className="min-h-[92px] rounded-2xl border-slate-200 bg-slate-50/80 shadow-inner focus-visible:ring-emerald-600"
                   />
                 </div>
 
-                <div className="grid grid-cols-2 gap-5">
+                <div className="grid gap-4 md:grid-cols-2">
                   <div className="space-y-1.5">
-                    <Label htmlFor="repository_url" className="font-mono font-bold uppercase text-xs text-muted-foreground">仓库地址</Label>
+                    <Label htmlFor="repository_url" className="text-xs font-bold text-slate-600">仓库地址</Label>
                     <Input
                       id="repository_url"
                       value={createForm.repository_url}
@@ -715,23 +685,23 @@ export default function Projects() {
                           ? "git@github.com:user/repo.git"
                           : "https://github.com/user/repo"
                       }
-                      className="cyber-input"
+                      className="h-11 rounded-2xl border-slate-200 bg-slate-50/80 shadow-inner focus-visible:ring-emerald-600"
                     />
                     {createForm.repository_type === 'other' && (
-                      <p className="text-xs text-muted-foreground font-mono">
-                        💡 SSH Key认证请使用 git@ 格式的SSH URL
+                      <p className="text-xs text-slate-500">
+                        SSH Key 认证请使用 git@ 格式的 SSH URL
                       </p>
                     )}
                     {createForm.repository_type !== 'other' && (
-                      <p className="text-xs text-muted-foreground font-mono">
-                        💡 Token认证请使用 https:// 格式的URL
+                      <p className="text-xs text-slate-500">
+                        Token 认证请使用 https:// 格式的 URL
                       </p>
                     )}
                   </div>
                   <div className="space-y-1.5">
-                    <Label htmlFor="default_branch" className="font-mono font-bold uppercase text-xs text-muted-foreground">默认分支</Label>
+                    <Label htmlFor="default_branch" className="text-xs font-bold text-slate-600">默认分支</Label>
                     {loadingCreateBranches ? (
-                      <div className="flex h-10 items-center gap-2 rounded border border-border bg-muted/30 px-3 font-mono text-sm text-muted-foreground">
+                      <div className="flex h-11 items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50/80 px-3 text-sm text-slate-500 shadow-inner">
                         <Loader2 className="h-4 w-4 animate-spin" />
                         Loading remote branches...
                       </div>
@@ -741,7 +711,7 @@ export default function Projects() {
                         onChange={(value) => setCreateForm({ ...createForm, default_branch: value })}
                         branches={createBranches}
                         placeholder="Select default branch"
-                        className="h-10"
+                        className="h-11 rounded-2xl"
                       />
                     ) : (
                       <Input
@@ -749,16 +719,16 @@ export default function Projects() {
                         value={createForm.default_branch}
                         onChange={(e) => setCreateForm({ ...createForm, default_branch: e.target.value })}
                         placeholder="main"
-                        className="cyber-input"
+                        className="h-11 rounded-2xl border-slate-200 bg-slate-50/80 shadow-inner focus-visible:ring-emerald-600"
                       />
                     )}
                     {createBranches.length > 0 && (
-                      <p className="text-xs text-muted-foreground font-mono">
+                      <p className="text-xs text-slate-500">
                         Loaded {createBranches.length} branches; using the remote default_branch.
                       </p>
                     )}
                     {createBranchError && (
-                      <p className="text-xs text-amber-500 font-mono">
+                      <p className="text-xs text-amber-600">
                         Could not load remote branches. You can enter one manually: {createBranchError}
                       </p>
                     )}
@@ -766,12 +736,12 @@ export default function Projects() {
                 </div>
 
                 <div className="space-y-2">
-                  <Label className="font-mono font-bold uppercase text-xs text-muted-foreground">技术栈</Label>
+                  <Label className="text-xs font-bold text-slate-600">技术栈</Label>
                   <div className="flex flex-wrap gap-2">
                     {supportedLanguages.map((lang) => (
-                      <label key={lang} className={`flex items-center space-x-2 px-3 py-1.5 border cursor-pointer transition-all rounded ${createForm.programming_languages.includes(lang)
-                        ? 'border-primary bg-primary/10 text-primary'
-                        : 'border-border hover:border-border text-muted-foreground'
+                      <label key={lang} className={`flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-2 text-xs font-bold transition-all ${createForm.programming_languages.includes(lang)
+                        ? 'border-emerald-300 bg-emerald-50 text-emerald-800 shadow-sm'
+                        : 'border-slate-200 bg-white text-slate-500 hover:border-emerald-200 hover:bg-emerald-50/40'
                         }`}>
                         <input
                           type="checkbox"
@@ -789,55 +759,63 @@ export default function Projects() {
                               });
                             }
                           }}
-                          className="rounded border border-border w-3.5 h-3.5 text-primary focus:ring-0 bg-transparent"
+                          className="h-3.5 w-3.5 rounded border-slate-300 text-emerald-700 focus:ring-emerald-600"
                         />
-                        <span className="text-xs font-mono font-bold uppercase">{lang}</span>
+                        <span>{lang}</span>
                       </label>
                     ))}
                   </div>
                 </div>
 
-                <div className="flex justify-end space-x-4 pt-4 border-t border-border">
-                  <Button variant="outline" onClick={() => setShowCreateDialog(false)} className="cyber-btn-outline">
+                {creatingProject && projectImportMessage && (
+                  <div className="flex items-center gap-2 rounded-2xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-700">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>{projectImportMessage}</span>
+                  </div>
+                )}
+
+                <div className="flex justify-end gap-3 border-t border-slate-200 pt-4">
+                  <Button variant="outline" onClick={() => setShowCreateDialog(false)} className="rounded-2xl border-slate-200 bg-white px-6 shadow-sm" disabled={creatingProject}>
                     取消
                   </Button>
-                  <Button onClick={handleCreateProject} className="cyber-btn-primary">
+                  <Button onClick={handleCreateProject} className="rounded-2xl bg-emerald-700 px-7 font-bold text-white shadow-[0_14px_30px_rgba(5,150,105,0.22)] hover:bg-emerald-800" disabled={creatingProject}>
                     执行创建
                   </Button>
                 </div>
               </TabsContent>
 
-              <TabsContent value="upload" className="flex flex-col gap-5 mt-5">
-                <div className="space-y-1.5">
-                  <Label htmlFor="upload-name" className="font-mono font-bold uppercase text-xs text-muted-foreground">项目名称 *</Label>
-                  <Input
-                    id="upload-name"
-                    value={createForm.name}
-                    onChange={(e) => setCreateForm({ ...createForm, name: e.target.value })}
-                    placeholder="输入项目名称"
-                    className="cyber-input"
-                  />
-                </div>
-
-                <div className="space-y-1.5">
-                  <Label htmlFor="upload-description" className="font-mono font-bold uppercase text-xs text-muted-foreground">描述</Label>
-                  <Textarea
-                    id="upload-description"
-                    value={createForm.description}
-                    onChange={(e) => setCreateForm({ ...createForm, description: e.target.value })}
-                    placeholder="// 项目描述..."
-                    rows={3}
-                    className="cyber-input min-h-[80px]"
-                  />
+              <TabsContent value="upload" className="m-0 space-y-5 rounded-[24px] border border-slate-200 bg-white p-5 shadow-sm data-[state=inactive]:hidden">
+                <div className="flex flex-col gap-4">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="upload-name" className="text-xs font-bold text-slate-600">项目名称 *</Label>
+                    <Input
+                      id="upload-name"
+                      value={createForm.name}
+                      onChange={(e) => setCreateForm({ ...createForm, name: e.target.value })}
+                      placeholder="输入项目名称"
+                      className="h-11 rounded-2xl border-slate-200 bg-slate-50/80 shadow-inner focus-visible:ring-emerald-600"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="upload-description" className="text-xs font-bold text-slate-600">描述</Label>
+                    <Textarea
+                      id="upload-description"
+                      value={createForm.description}
+                      onChange={(e) => setCreateForm({ ...createForm, description: e.target.value })}
+                      placeholder="// 项目描述..."
+                      rows={3}
+                      className="min-h-[82px] rounded-2xl border-slate-200 bg-slate-50/80 shadow-inner focus-visible:ring-emerald-600"
+                    />
+                  </div>
                 </div>
 
                 <div className="space-y-2">
-                  <Label className="font-mono font-bold uppercase text-xs text-muted-foreground">技术栈</Label>
+                  <Label className="text-xs font-bold text-slate-600">技术栈</Label>
                   <div className="flex flex-wrap gap-2">
                     {supportedLanguages.map((lang) => (
-                      <label key={lang} className={`flex items-center space-x-2 px-3 py-1.5 border cursor-pointer transition-all rounded ${createForm.programming_languages.includes(lang)
-                        ? 'border-primary bg-primary/10 text-primary'
-                        : 'border-border hover:border-border text-muted-foreground'
+                      <label key={lang} className={`flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-2 text-xs font-bold transition-all ${createForm.programming_languages.includes(lang)
+                        ? 'border-emerald-300 bg-emerald-50 text-emerald-800 shadow-sm'
+                        : 'border-slate-200 bg-white text-slate-500 hover:border-emerald-200 hover:bg-emerald-50/40'
                         }`}>
                         <input
                           type="checkbox"
@@ -855,26 +833,29 @@ export default function Projects() {
                               });
                             }
                           }}
-                          className="rounded border border-border w-3.5 h-3.5 text-primary focus:ring-0 bg-transparent"
+                          className="h-3.5 w-3.5 rounded border-slate-300 text-emerald-700 focus:ring-emerald-600"
                         />
-                        <span className="text-xs font-mono font-bold uppercase">{lang}</span>
+                        <span>{lang}</span>
                       </label>
                     ))}
                   </div>
                 </div>
 
-                <div className="space-y-4">
-                  <Label className="font-mono font-bold uppercase text-xs text-muted-foreground">源代码</Label>
+                <div className="flex flex-col gap-4">
+                  <div className="space-y-3">
+                    <Label className="text-xs font-bold text-slate-600">源代码</Label>
 
                   {!selectedFile ? (
                     <div
-                      className="border border-dashed border-border bg-muted/50 rounded p-6 text-center hover:bg-muted hover:border-border transition-colors cursor-pointer group"
+                      className="group cursor-pointer rounded-[22px] border border-dashed border-emerald-300 bg-[linear-gradient(135deg,rgba(236,253,245,0.78),rgba(248,250,252,0.88))] p-6 text-center transition-all hover:border-emerald-500 hover:bg-emerald-50"
                       onClick={() => fileInputRef.current?.click()}
                     >
-                      <Upload className="w-10 h-10 text-muted-foreground mx-auto mb-3 group-hover:text-primary transition-colors" />
-                      <h3 className="text-base font-bold text-foreground uppercase mb-1">上传 ZIP 归档</h3>
-                      <p className="text-xs font-mono text-muted-foreground mb-3">
-                        最大: 500MB // 格式: .ZIP
+                      <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl border border-emerald-200 bg-white text-emerald-700 shadow-sm">
+                        <Upload className="h-6 w-6" />
+                      </div>
+                      <h3 className="mb-1 text-base font-black text-slate-950">上传 ZIP 归档</h3>
+                      <p className="mb-4 text-xs font-medium text-slate-500">
+                        最大 500MB / 格式 .ZIP
                       </p>
                       <input
                         ref={fileInputRef}
@@ -887,7 +868,7 @@ export default function Projects() {
                       <Button
                         type="button"
                         variant="outline"
-                        className="cyber-btn-outline h-8 text-xs"
+                        className="h-9 rounded-2xl border-slate-200 bg-white px-5 text-xs font-bold shadow-sm"
                         disabled={uploading || !createForm.name.trim()}
                         onClick={(e) => {
                           e.stopPropagation();
@@ -899,14 +880,14 @@ export default function Projects() {
                       </Button>
                     </div>
                   ) : (
-                    <div className="border border-border bg-muted/50 p-4 flex items-center justify-between rounded">
+                    <div className="flex items-center justify-between rounded-[22px] border border-emerald-200 bg-emerald-50/70 p-4">
                       <div className="flex items-center space-x-3 overflow-hidden">
-                        <div className="w-10 h-10 bg-muted border border-border rounded flex items-center justify-center flex-shrink-0">
-                          <FileText className="w-5 h-5 text-primary" />
+                        <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-2xl border border-emerald-200 bg-white">
+                          <FileText className="h-5 w-5 text-emerald-700" />
                         </div>
                         <div className="min-w-0">
-                          <p className="font-mono font-bold text-sm text-foreground truncate">{selectedFile.name}</p>
-                          <p className="font-mono text-xs text-muted-foreground">{(selectedFile.size / 1024 / 1024).toFixed(2)} MB</p>
+                          <p className="truncate text-sm font-bold text-slate-950">{selectedFile.name}</p>
+                          <p className="text-xs text-slate-500">{(selectedFile.size / 1024 / 1024).toFixed(2)} MB</p>
                         </div>
                       </div>
                       <Button
@@ -921,55 +902,50 @@ export default function Projects() {
                     </div>
                   )}
 
-                  <label className="flex items-start gap-3 rounded border border-border bg-muted/30 p-3">
-                    <input
-                      type="checkbox"
-                      checked={keepZipArchive}
-                      onChange={(event) => setKeepZipArchive(event.target.checked)}
-                      className="mt-0.5 h-4 w-4 rounded border border-border bg-transparent"
-                    />
-                    <div className="space-y-1">
-                      <p className="text-sm font-mono font-bold text-foreground">
-                        保留原始 ZIP 归档
-                      </p>
-                      <p className="text-xs font-mono text-muted-foreground">
-                        持久源码目录始终会保存到 `projects/`。关闭此项后，仅保留解压后的持久源码目录。
-                      </p>
-                    </div>
-                  </label>
-
                   {uploading && (
                     <div className="space-y-1.5">
-                      <div className="flex items-center justify-between text-xs font-mono text-muted-foreground">
-                        <span>上传并分析中...</span>
-                        <span className="text-primary">{uploadProgress}%</span>
+                      <div className="flex items-center justify-between text-xs font-medium text-slate-500">
+                        <span>{projectImportMessage || "上传并分析中..."}</span>
+                        <span className="text-emerald-700">{uploadProgress}%</span>
                       </div>
-                      <Progress value={uploadProgress} className="h-2 bg-muted [&>div]:bg-primary" />
+                      <Progress value={uploadProgress} className="h-2 bg-slate-100 [&>div]:bg-emerald-700" />
                     </div>
                   )}
+                  </div>
 
-                  <div className="bg-amber-500/10 border border-amber-500/30 p-3 rounded">
-                    <div className="flex items-start space-x-3">
-                      <AlertCircle className="w-4 h-4 text-amber-400 mt-0.5" />
-                      <div className="text-xs font-mono text-amber-300">
-                        <p className="font-bold mb-1 uppercase">上传协议:</p>
-                        <ul className="space-y-0.5 list-disc list-inside text-amber-400/80">
-                          <li>上传后会先生成持久源码目录，供 Agent 直审默认直接使用</li>
-                          <li>工作流审计会从持久源码目录复制临时工作副本后再执行</li>
-                          <li>是否保留原始 ZIP 归档由上方选项控制，可在项目管理中手动删除</li>
+                  <div className="rounded-[22px] border border-slate-200 bg-slate-50/85 p-4">
+                    <div className="flex items-start gap-3">
+                      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl border border-emerald-200 bg-white text-emerald-700">
+                        <AlertCircle className="h-4 w-4" />
+                      </span>
+                      <div className="text-xs leading-6 text-slate-600">
+                        <p className="mb-2 font-bold text-slate-800">上传说明</p>
+                        <ul className="space-y-2">
+                          <li className="flex gap-2">
+                            <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
+                            <span>上传后会先生成持久源码目录，供 Agent 直审默认直接使用</span>
+                          </li>
+                          <li className="flex gap-2">
+                            <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-sky-500" />
+                            <span>工作流审计会从持久源码目录复制临时工作副本后再执行</span>
+                          </li>
+                          <li className="flex gap-2">
+                            <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-400" />
+                            <span>原始 ZIP 归档不会保留，仅保存解压后的持久源码目录</span>
+                          </li>
                         </ul>
                       </div>
                     </div>
                   </div>
                 </div>
 
-                <div className="flex justify-end space-x-4 pt-4 border-t border-border mt-auto">
-                  <Button variant="outline" onClick={() => setShowCreateDialog(false)} disabled={uploading} className="cyber-btn-outline">
+                <div className="mt-auto flex justify-end gap-3 border-t border-slate-200 pt-4">
+                  <Button variant="outline" onClick={() => setShowCreateDialog(false)} disabled={uploading} className="rounded-2xl border-slate-200 bg-white px-6 shadow-sm">
                     取消
                   </Button>
                   <Button
                     onClick={handleUploadAndCreate}
-                    className="cyber-btn-primary"
+                    className="rounded-2xl bg-emerald-700 px-7 font-bold text-white shadow-[0_14px_30px_rgba(5,150,105,0.22)] hover:bg-emerald-800"
                     disabled={!selectedFile || uploading}
                   >
                     {uploading ? '上传中...' : '执行创建'}
@@ -977,133 +953,6 @@ export default function Projects() {
                 </div>
               </TabsContent>
 
-              <TabsContent value="local" className="flex flex-col gap-5 mt-5">
-                <div className="space-y-1.5">
-                  <Label htmlFor="local-name" className="font-mono font-bold uppercase text-xs text-muted-foreground">项目名称 *</Label>
-                  <Input
-                    id="local-name"
-                    value={createForm.name}
-                    onChange={(e) => setCreateForm({ ...createForm, name: e.target.value })}
-                    placeholder="输入项目名称"
-                    className="cyber-input"
-                  />
-                </div>
-
-                <div className="space-y-1.5">
-                  <Label htmlFor="local-description" className="font-mono font-bold uppercase text-xs text-muted-foreground">描述</Label>
-                  <Textarea
-                    id="local-description"
-                    value={createForm.description}
-                    onChange={(e) => setCreateForm({ ...createForm, description: e.target.value })}
-                    placeholder="// 本地目录项目描述..."
-                    rows={3}
-                    className="cyber-input min-h-[80px]"
-                  />
-                </div>
-
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <Label className="font-mono font-bold uppercase text-xs text-muted-foreground">受管本地目录</Label>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="cyber-btn-outline h-8 text-xs"
-                      onClick={() => void loadManagedDirectories()}
-                      disabled={loadingManagedDirectories}
-                    >
-                      {loadingManagedDirectories ? "刷新中..." : "刷新目录"}
-                    </Button>
-                  </div>
-
-                  {managedDirectories.length === 0 ? (
-                    <div className="rounded border border-dashed border-border bg-muted/50 p-4 text-sm text-muted-foreground">
-                      {loadingManagedDirectories
-                        ? "正在扫描 AuditAI/projects 目录..."
-                        : "未发现可导入目录。请先把项目解压到 AuditAI/projects/[项目名]/ 下。"}
-                    </div>
-                  ) : (
-                    <div className="space-y-2 rounded border border-border bg-muted/40 p-3">
-                      {managedDirectories.map((directory) => {
-                        const selected = createForm.local_path === directory.path;
-                        return (
-                          <button
-                            key={directory.path}
-                            type="button"
-                            onClick={() =>
-                              setCreateForm((previous) => ({
-                                ...previous,
-                                source_type: "local_directory",
-                                workspace_mode: "in_place",
-                                local_path: directory.path,
-                                name: previous.name || directory.name,
-                              }))
-                            }
-                            className={`w-full rounded border px-4 py-3 text-left transition ${selected ? "border-primary bg-primary/10 text-primary" : "border-border bg-white/80 text-foreground hover:bg-white"}`}
-                          >
-                            <div className="flex items-center gap-2">
-                              <HardDrive className="h-4 w-4" />
-                              <span className="font-mono font-bold text-sm">{directory.name}</span>
-                            </div>
-                            <p className="mt-1 truncate font-mono text-xs text-muted-foreground">{directory.path}</p>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  )}
-
-                  {createForm.local_path ? (
-                    <div className="rounded border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs font-mono text-emerald-300">
-                      已选择目录: {createForm.local_path}
-                    </div>
-                  ) : null}
-                </div>
-
-                <div className="space-y-2">
-                  <Label className="font-mono font-bold uppercase text-xs text-muted-foreground">技术栈</Label>
-                  <div className="flex flex-wrap gap-2">
-                    {supportedLanguages.map((lang) => (
-                      <label key={lang} className={`flex items-center space-x-2 px-3 py-1.5 border cursor-pointer transition-all rounded ${createForm.programming_languages.includes(lang)
-                        ? 'border-primary bg-primary/10 text-primary'
-                        : 'border-border hover:border-border text-muted-foreground'
-                        }`}>
-                        <input
-                          type="checkbox"
-                          checked={createForm.programming_languages.includes(lang)}
-                          onChange={(e) => {
-                            if (e.target.checked) {
-                              setCreateForm({
-                                ...createForm,
-                                programming_languages: [...createForm.programming_languages, lang]
-                              });
-                            } else {
-                              setCreateForm({
-                                ...createForm,
-                                programming_languages: createForm.programming_languages.filter(l => l !== lang)
-                              });
-                            }
-                          }}
-                          className="rounded border border-border w-3.5 h-3.5 text-primary focus:ring-0 bg-transparent"
-                        />
-                        <span className="text-xs font-mono font-bold uppercase">{lang}</span>
-                      </label>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="rounded border border-sky-500/30 bg-sky-500/10 p-3 text-xs font-mono text-sky-300">
-                  目录规范: 先将项目解压到 AuditAI/projects/[项目名]/，再在这里登记为正式项目。
-                </div>
-
-                <div className="flex justify-end space-x-4 pt-4 border-t border-border">
-                  <Button variant="outline" onClick={() => setShowCreateDialog(false)} className="cyber-btn-outline">
-                    取消
-                  </Button>
-                  <Button onClick={handleCreateProject} className="cyber-btn-primary" disabled={!createForm.local_path}>
-                    创建本地项目
-                  </Button>
-                </div>
-              </TabsContent>
             </Tabs>
           </div>
         </DialogContent>

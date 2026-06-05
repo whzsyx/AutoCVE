@@ -506,6 +506,8 @@ async def _resolve_workspace_root(
         gitea_token=gitea_token,
         ssh_private_key=ssh_private_key,
         event_emitter=None,
+        workspace_scope="task",
+        refresh=True,
     )
 
 

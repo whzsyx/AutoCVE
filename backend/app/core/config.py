@@ -78,6 +78,31 @@ class Settings(BaseSettings):
     MANAGED_PROJECTS_ROOT: str = DEFAULT_MANAGED_PROJECTS_ROOT
     OUTPUT_LANGUAGE: str = "zh-CN"
 
+    CHECKMARX_FEATURE_ENABLED: bool = False
+    CHECKMARX_BASE_URL: Optional[str] = None
+    CHECKMARX_CLIENT_ID: str = "resource_owner_sast_client"
+    CHECKMARX_CLIENT_SECRET: Optional[str] = None
+    CHECKMARX_SCOPE: str = "access_control_api sast_api"
+    CHECKMARX_PRESET_ID: int = 36
+    CHECKMARX_FORCE_SCAN: bool = True
+    CHECKMARX_IS_INCREMENTAL: bool = False
+    CHECKMARX_TIMEOUT_CONNECT: int = 10
+    CHECKMARX_TIMEOUT_READ: int = 30
+    CHECKMARX_SCAN_UPLOAD_READ_TIMEOUT: int = 300
+    CHECKMARX_SCAN_TIMEOUT: int = 3600
+    CHECKMARX_SCAN_POLL_INTERVAL: int = 10
+    CHECKMARX_SAST_ACCEPT_API_VERSION: str = "default"
+    CHECKMARX_HELP_SAST_ACCEPT_API_VERSION: str = "default"
+    CHECKMARX_HELP_RESULTS_DELAY: float = 0.25
+    CHECKMARX_HELP_RESULTS_429_RETRIES: int = 12
+    CHECKMARX_HELP_RESULTS_429_BASE_WAIT: float = 2.0
+    CHECKMARX_UPLOAD_DIR: str = "./uploads/checkmarx"
+    CHECKMARX_WORKFLOW_ENABLED: bool = True
+    WORKFLOW_URL: Optional[str] = None
+    WORKFLOW_API_TOKEN: Optional[str] = None
+    WORKFLOW_USER: str = "auditai"
+    WORKFLOW_TIMEOUT: float = 300.0
+
     EMBEDDING_PROVIDER: str = "openai"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_API_KEY: Optional[str] = None

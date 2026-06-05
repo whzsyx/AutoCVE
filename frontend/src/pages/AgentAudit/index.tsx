@@ -1450,7 +1450,7 @@ function AgentAuditPageContent() {
                     <FileText className="w-4 h-4 text-primary" />
                   )}
                   <span className="uppercase font-bold tracking-wider text-foreground text-sm">
-                    {activeDetailView === 'activity' ? 'Activity Log' : 'Final Report'}
+                    {activeDetailView === 'activity' ? '活动日志' : '漏洞报告'}
                   </span>
                 </div>
                 {activeDetailView === 'activity' && isConnected && (
@@ -1461,8 +1461,8 @@ function AgentAuditPageContent() {
                 )}
                 <Badge variant="outline" className="h-6 px-2 text-xs border-border text-muted-foreground font-mono bg-muted">
                   {activeDetailView === 'activity'
-                    ? `${filteredLogs.length}${!showAllLogs && logs.length !== filteredLogs.length ? ` / ${logs.length}` : ''} entries`
-                    : `${findings.length} findings`}
+                    ? `${filteredLogs.length}${!showAllLogs && logs.length !== filteredLogs.length ? ` / ${logs.length}` : ''} 条记录`
+                    : `${findings.length} 个漏洞`}
                 </Badge>
               </div>
 
@@ -1474,7 +1474,7 @@ function AgentAuditPageContent() {
                       onClick={() => setActiveDetailView('activity')}
                       className={`rounded-full px-3 py-1.5 text-xs font-medium transition ${activeDetailView === 'activity' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
                     >
-                      Activity Log
+                      活动日志
                     </button>
                     <button
                       type="button"
@@ -1482,7 +1482,7 @@ function AgentAuditPageContent() {
                       disabled={findings.length === 0}
                       className={`rounded-full px-3 py-1.5 text-xs font-medium transition ${activeDetailView === 'report' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'} disabled:cursor-not-allowed disabled:opacity-45`}
                     >
-                      最终报告
+                      初步报告
                     </button>
                   </div>
                 )}
@@ -1554,8 +1554,8 @@ function AgentAuditPageContent() {
               <div className="flex h-full items-center justify-center p-6 text-center text-muted-foreground">
                 <div>
                   <FileText className="mx-auto mb-3 h-8 w-8 text-muted-foreground/60" />
-                  <p className="text-sm font-medium">当前任务还没有可展示的最终漏洞报告</p>
-                  <p className="mt-2 text-xs">完成 verification 并产出 findings 后，这里会展示最终报告。</p>
+                    <p className="text-sm font-medium">当前任务还没有可展示的初步漏洞报告</p>
+                  <p className="mt-2 text-xs">完成 verification 并产出 findings 后，这里会展示初步报告。</p>
                 </div>
               </div>
             )}
@@ -1579,7 +1579,7 @@ function AgentAuditPageContent() {
                 ) : isComplete ? (
                   <span className="flex items-center gap-2 text-muted-foreground font-mono">
                     <span className={`w-2 h-2 rounded-full ${task.status === 'completed' ? 'bg-emerald-500' : task.status === 'failed' ? 'bg-rose-500' : 'bg-amber-500'}`} />
-                    AUDIT {task.status?.toUpperCase()}
+                    审计{task.status === 'completed' ? '已完成' : task.status === 'failed' ? '失败' : task.status === 'cancelled' ? '已取消' : '已结束'}
                     {task.finding_outcome && task.finding_outcome !== 'none' ? (
                       <Badge
                         variant="outline"
@@ -1592,10 +1592,10 @@ function AgentAuditPageContent() {
                         }`}
                       >
                         {task.finding_outcome === 'finalized'
-                          ? 'FINALIZED'
+                          ? '已确认'
                           : task.finding_outcome === 'recovered_only'
-                            ? 'RECOVERED ONLY'
-                            : 'INCOMPLETE'}
+                            ? '仅恢复候选'
+                            : '未完成'}
                       </Badge>
                     ) : null}
                   </span>
@@ -1612,12 +1612,12 @@ function AgentAuditPageContent() {
                 <div className="flex items-center gap-1.5">
                   <span className="text-foreground font-semibold">{task.analyzed_files}</span>
                   <span className="text-muted-foreground">/ {task.total_files}</span>
-                  <span className="text-muted-foreground text-xs">files</span>
+                  <span className="text-muted-foreground text-xs">文件</span>
                 </div>
                 <div className="w-px h-4 bg-border" />
                 <div className="flex items-center gap-1.5">
                   <span className="text-foreground font-semibold">{task.tool_calls_count || 0}</span>
-                  <span className="text-muted-foreground text-xs">tools</span>
+                  <span className="text-muted-foreground text-xs">工具</span>
                 </div>
               </div>
             </div>
@@ -1633,7 +1633,7 @@ function AgentAuditPageContent() {
               <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
                 <Bot className="w-4 h-4 text-violet-600 dark:text-violet-500" />
                 <span className="uppercase font-bold tracking-wider text-foreground text-sm">
-                  {selectedAgentId && !showAllLogs ? 'Agent Detail' : 'Agent Tree'}
+                  {selectedAgentId && !showAllLogs ? '智能体详情' : 'AGENT TREE'}
                 </span>
                 {!selectedAgentId && agentTree && (
                   <Badge variant="outline" className="h-5 px-2 text-xs border-violet-500/30 text-violet-600 dark:text-violet-500 font-mono bg-violet-500/10">
@@ -1647,7 +1647,7 @@ function AgentAuditPageContent() {
                     onClick={() => selectAgent(null)}
                     className="text-xs text-primary hover:text-primary/80 font-mono uppercase px-2 py-1 rounded hover:bg-primary/10"
                   >
-                    Back
+                    返回
                   </button>
                 )}
                 {!selectedAgentId && agentTree && agentTree.running_agents > 0 && (
@@ -1684,12 +1684,12 @@ function AgentAuditPageContent() {
                   {isRunning ? (
                     <div className="flex flex-col items-center gap-3 p-6">
                       <Loader2 className="w-6 h-6 animate-spin text-violet-600 dark:text-violet-500" />
-                      <span className="font-mono text-center">INITIALIZING<br/>AGENTS...</span>
+                      <span className="font-medium text-center">正在初始化<br/>智能体...</span>
                     </div>
                   ) : (
                     <div className="flex flex-col items-center gap-2 p-6 text-center">
                       <Bot className="w-8 h-8 text-muted-foreground/50" />
-                      <span className="font-mono">NO AGENTS YET</span>
+                      <span className="font-medium">暂无智能体</span>
                     </div>
                   )}
                 </div>

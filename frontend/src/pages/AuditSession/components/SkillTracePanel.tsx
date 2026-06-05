@@ -40,7 +40,7 @@ function SkillCatalogCard({ skill }: { skill: AuditSessionSkill }) {
   }
 
   return (
-    <div className="rounded-[20px] border border-[rgba(219,226,221,.9)] bg-white/92 p-4 shadow-[0_10px_25px_rgba(97,118,103,.06)]">
+    <div className="min-w-0 rounded-[20px] border border-[#e2eae5] bg-white p-4 shadow-[0_10px_25px_rgba(86,105,97,.05)] [overflow-wrap:anywhere]">
       <div className="flex items-start justify-between gap-3">
         <div>
           <div className="flex items-center gap-2">
@@ -70,7 +70,7 @@ function SkillCatalogCard({ skill }: { skill: AuditSessionSkill }) {
           {skill.description ? <p className="rounded-2xl bg-[rgba(248,244,255,.92)] px-3 py-2 text-sm leading-6 text-slate-700">{skill.description}</p> : null}
           <div>
             <div className="mb-1 font-medium text-slate-500">Skill JSON</div>
-            <pre className="overflow-x-auto rounded-2xl bg-[rgba(246,248,247,.95)] p-3 text-xs leading-6 text-slate-700">{JSON.stringify(detailJson, null, 2)}</pre>
+            <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-2xl bg-[rgba(246,248,247,.95)] p-3 text-xs leading-6 text-slate-700 [overflow-wrap:anywhere]">{JSON.stringify(detailJson, null, 2)}</pre>
           </div>
         </div>
       ) : (
@@ -107,7 +107,7 @@ function SkillInvocationCard({ invocation }: { invocation: AuditSessionSkillInvo
   }
 
   return (
-    <div className="rounded-[20px] border border-[rgba(219,226,221,.9)] bg-white/92 p-4 shadow-[0_10px_25px_rgba(97,118,103,.06)]">
+    <div className="min-w-0 rounded-[20px] border border-[#e2eae5] bg-white p-4 shadow-[0_10px_25px_rgba(86,105,97,.05)] [overflow-wrap:anywhere]">
       <div className="flex items-start justify-between gap-3">
         <div>
           <div className="flex items-center gap-2">
@@ -133,11 +133,11 @@ function SkillInvocationCard({ invocation }: { invocation: AuditSessionSkillInvo
         <div className="mt-4 space-y-3 text-xs">
           <div>
             <div className="mb-1 font-medium text-slate-500">Input</div>
-            <pre className="overflow-x-auto rounded-2xl bg-[rgba(246,248,247,.95)] p-3 text-xs leading-6 text-slate-700">{formatPayload(invocation.input_payload)}</pre>
+            <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-2xl bg-[rgba(246,248,247,.95)] p-3 text-xs leading-6 text-slate-700 [overflow-wrap:anywhere]">{formatPayload(invocation.input_payload)}</pre>
           </div>
           <div>
             <div className="mb-1 font-medium text-slate-500">Output</div>
-            <pre className="overflow-x-auto rounded-2xl bg-[rgba(246,248,247,.95)] p-3 text-xs leading-6 text-slate-700">{formatPayload(invocation.output_payload)}</pre>
+            <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-2xl bg-[rgba(246,248,247,.95)] p-3 text-xs leading-6 text-slate-700 [overflow-wrap:anywhere]">{formatPayload(invocation.output_payload)}</pre>
           </div>
           {invocation.error_message ? (
             <div className="rounded-2xl border border-rose-200 bg-rose-50 p-3 text-rose-700">
@@ -153,8 +153,8 @@ function SkillInvocationCard({ invocation }: { invocation: AuditSessionSkillInvo
 
 export function SkillTracePanel({ skills, skillInvocations }: SkillTracePanelProps) {
   return (
-    <Card className="overflow-hidden rounded-[26px] border border-[rgba(191,208,198,.72)] bg-[linear-gradient(180deg,rgba(255,255,255,.98),rgba(247,250,248,.96))] shadow-[0_18px_48px_rgba(84,110,93,.08)]">
-      <CardHeader className="border-b border-[rgba(186,203,193,.4)] pb-4">
+    <Card className="overflow-hidden rounded-none border-0 bg-white shadow-none">
+      <CardHeader className="border-b border-[#e6ede8] bg-[linear-gradient(90deg,#ffffff,#f6f2ff)] px-4 py-4">
         <CardTitle className="flex items-center gap-3 text-base font-semibold text-slate-900">
           <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[rgba(237,232,255,.95)] text-violet-700 shadow-sm">
             <Sparkles className="h-5 w-5" />
@@ -162,7 +162,7 @@ export function SkillTracePanel({ skills, skillInvocations }: SkillTracePanelPro
           Skill Trace
         </CardTitle>
       </CardHeader>
-      <CardContent className="space-y-5 p-4">
+      <CardContent className="max-h-[360px] space-y-5 overflow-y-auto p-4 custom-scrollbar">
         <section className="space-y-3">
           <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">已注册 Skills</div>
           {skills.length === 0 ? (

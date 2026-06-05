@@ -74,6 +74,7 @@ class AgentModelConfigSchema(BaseModel):
 class ModelProfileSchema(BaseModel):
     id: str
     name: str
+    isDefault: bool = False
     llmProvider: Optional[str] = None
     llmApiKey: Optional[str] = None
     llmModel: Optional[str] = None
@@ -253,6 +254,29 @@ def _merge_other_config_with_defaults(other_config: Dict[str, Any], defaults: Di
     return merged
 
 
+def _normalize_model_profiles(model_profiles: Any) -> list[dict[str, Any]]:
+    if not isinstance(model_profiles, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    default_seen = False
+    for item in model_profiles:
+        if not isinstance(item, dict):
+            continue
+        profile = deepcopy(item)
+        is_default = bool(profile.get("isDefault"))
+        if is_default and default_seen:
+            is_default = False
+        default_seen = default_seen or is_default
+        profile["isDefault"] = is_default
+        normalized.append(profile)
+
+    if normalized and not default_seen:
+        normalized[0]["isDefault"] = True
+
+    return normalized
+
+
 def _encrypt_config(config: Dict[str, Any], sensitive_fields: list[str]) -> Dict[str, Any]:
     encrypted = deepcopy(config)
     for field in sensitive_fields:
@@ -277,17 +301,16 @@ def _encrypt_config(config: Dict[str, Any], sensitive_fields: list[str]) -> Dict
                 }
     encrypted["agentConfigs"] = agent_configs
     if "modelProfiles" in encrypted:
-        model_profiles = encrypted.get("modelProfiles") or []
-        if isinstance(model_profiles, list):
-            for payload in model_profiles:
-                if isinstance(payload, dict) and payload.get("llmApiKey"):
-                    payload["llmApiKey"] = encrypt_sensitive_data(payload["llmApiKey"])
-                if isinstance(payload, dict) and isinstance(payload.get("env"), dict):
-                    payload["env"] = {
-                        key: encrypt_sensitive_data(str(value))
-                        for key, value in payload["env"].items()
-                        if value not in (None, "")
-                    }
+        model_profiles = _normalize_model_profiles(encrypted.get("modelProfiles"))
+        for payload in model_profiles:
+            if payload.get("llmApiKey"):
+                payload["llmApiKey"] = encrypt_sensitive_data(payload["llmApiKey"])
+            if isinstance(payload.get("env"), dict):
+                payload["env"] = {
+                    key: encrypt_sensitive_data(str(value))
+                    for key, value in payload["env"].items()
+                    if value not in (None, "")
+                }
         encrypted["modelProfiles"] = model_profiles
     return encrypted
 
@@ -316,17 +339,16 @@ def _decrypt_config(config: Dict[str, Any], sensitive_fields: list[str]) -> Dict
                 }
     decrypted["agentConfigs"] = agent_configs
     if "modelProfiles" in decrypted:
-        model_profiles = decrypted.get("modelProfiles") or []
-        if isinstance(model_profiles, list):
-            for payload in model_profiles:
-                if isinstance(payload, dict) and payload.get("llmApiKey"):
-                    payload["llmApiKey"] = decrypt_sensitive_data(payload["llmApiKey"])
-                if isinstance(payload, dict) and isinstance(payload.get("env"), dict):
-                    payload["env"] = {
-                        key: decrypt_sensitive_data(value)
-                        for key, value in payload["env"].items()
-                        if value not in (None, "")
-                    }
+        model_profiles = _normalize_model_profiles(decrypted.get("modelProfiles"))
+        for payload in model_profiles:
+            if payload.get("llmApiKey"):
+                payload["llmApiKey"] = decrypt_sensitive_data(payload["llmApiKey"])
+            if isinstance(payload.get("env"), dict):
+                payload["env"] = {
+                    key: decrypt_sensitive_data(value)
+                    for key, value in payload["env"].items()
+                    if value not in (None, "")
+                }
         decrypted["modelProfiles"] = model_profiles
     return decrypted
 
@@ -395,6 +417,7 @@ def _merge_user_config(record: Optional[UserConfig]) -> Dict[str, Any]:
         **defaults["llmConfig"]["agentConfigs"],
         **(llm_config.get("agentConfigs") or {}),
     }
+    merged_llm["modelProfiles"] = _normalize_model_profiles(merged_llm.get("modelProfiles"))
     merged_other = _merge_other_config_with_defaults(other_config, defaults["otherConfig"])
     return {"llmConfig": merged_llm, "otherConfig": merged_other}
 

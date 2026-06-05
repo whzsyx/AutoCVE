@@ -3127,6 +3127,8 @@ async def _get_project_root(
     gitea_token: Optional[str] = None,
     ssh_private_key: Optional[str] = None,
     event_emitter: Optional[Any] = None,
+    workspace_scope: str = "project",
+    refresh: bool = False,
 ) -> str:
     """Prepare a local working copy for the project."""
     import subprocess
@@ -3148,21 +3150,38 @@ async def _get_project_root(
             raise asyncio.CancelledError("Task cancelled")
 
     safe_task_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(task_id or "task")).strip(".-") or "task"
+    safe_project_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(project.id or project.name or "project")).strip(".-") or "project"
     workspace_root = os.path.join(settings.MANAGED_PROJECTS_ROOT, ".auditai_workspaces")
-    base_path = os.path.join(workspace_root, safe_task_id)
-    if os.path.exists(base_path):
+    if workspace_scope == "project":
+        base_path = os.path.join(workspace_root, "projects", safe_project_id)
+    else:
+        base_path = os.path.join(workspace_root, safe_task_id)
+
+    def select_effective_root(root_path: str) -> str:
+        items = [item for item in os.listdir(root_path) if not item.startswith("__") and not item.startswith(".")]
+        if len(items) == 1:
+            single_item_path = os.path.join(root_path, items[0])
+            if os.path.isdir(single_item_path):
+                return single_item_path
+        return root_path
+
+    if refresh and os.path.exists(base_path):
         shutil.rmtree(base_path, ignore_errors=True)
+    if os.path.isdir(base_path) and os.listdir(base_path):
+        await emit(f"Reusing project workspace at: {base_path}")
+        return select_effective_root(base_path)
+
     os.makedirs(base_path, exist_ok=True)
     check_cancelled()
 
-    if project.source_type == "zip":
+    if project.source_type in {"zip", "local_directory"}:
         persistent_source = str(getattr(project, "local_path", "") or "").strip()
         if persistent_source and os.path.isdir(persistent_source):
-            await emit("Copying persistent ZIP source directory into a temporary working copy...")
-            target_dir = os.path.join(base_path, os.path.basename(os.path.abspath(persistent_source)))
-            shutil.copytree(persistent_source, target_dir, dirs_exist_ok=True)
-            base_path = target_dir
+            await emit("Copying persistent project source directory into the project workspace...")
+            shutil.copytree(persistent_source, base_path, dirs_exist_ok=True)
         else:
+            if project.source_type == "local_directory":
+                raise RuntimeError("Local directory project is missing local_path")
             await emit("Extracting uploaded ZIP project...")
             zip_path = await load_project_zip(project.id)
             if not zip_path or not os.path.exists(zip_path):
@@ -3210,11 +3229,7 @@ async def _get_project_root(
     else:
         raise RuntimeError("Unsupported project source type")
 
-    items = [item for item in os.listdir(base_path) if not item.startswith("__") and not item.startswith(".")]
-    if len(items) == 1:
-        single_item_path = os.path.join(base_path, items[0])
-        if os.path.isdir(single_item_path):
-            base_path = single_item_path
+    base_path = select_effective_root(base_path)
 
     await emit(f"Project prepared at: {base_path}")
     return base_path
