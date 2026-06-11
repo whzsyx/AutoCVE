@@ -3222,7 +3222,7 @@ async def _get_project_root(
             if branch:
                 cmd.extend(["--branch", branch])
             cmd.extend([auth_url, target_dir])
-            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "git clone failed")
         base_path = target_dir

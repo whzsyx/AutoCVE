@@ -8,6 +8,7 @@ import {
   ChevronRight,
   FileText,
   FolderGit2,
+  WandSparkles,
   LayoutDashboard,
   ListTodo,
   Menu,
@@ -26,6 +27,7 @@ const routeIcons: Record<string, ReactNode> = {
   '/': <Bot className="h-[18px] w-[18px]" />,
   '/dashboard': <LayoutDashboard className="h-[18px] w-[18px]" />,
   '/projects': <FolderGit2 className="h-[18px] w-[18px]" />,
+  '/one-click-cve': <WandSparkles className="h-[18px] w-[18px]" />,
   '/audit-tasks': <ListTodo className="h-[18px] w-[18px]" />,
   '/skills': <BookOpen className="h-[18px] w-[18px]" />,
   '/report-templates': <FileText className="h-[18px] w-[18px]" />,
@@ -109,11 +111,12 @@ export default function Sidebar({ collapsed, setCollapsed }: SidebarProps) {
             <nav className="flex h-full flex-col gap-1 overflow-y-auto custom-scrollbar pr-1">
               {visibleRoutes.map((route) => {
                 const isActive = location.pathname === route.path;
+                const routeLabel = route.name;
                 return (
                   <Link
                     key={route.path}
                     to={route.path}
-                    title={collapsed ? route.name : undefined}
+                    title={collapsed ? routeLabel : undefined}
                     onClick={() => setMobileOpen(false)}
                     className={`group flex items-center gap-3 rounded-[20px] px-3 py-3 transition-all duration-200 ${isActive ? 'bg-[rgba(219,233,223,0.95)] text-slate-900 shadow-[0_12px_22px_rgba(111,167,132,0.14)]' : 'text-slate-500 hover:bg-white/70 hover:text-slate-900'}`}
                   >
@@ -122,7 +125,7 @@ export default function Sidebar({ collapsed, setCollapsed }: SidebarProps) {
                     </span>
                     {!collapsed && (
                       <div className="min-w-0 flex-1">
-                        <div className="truncate text-sm font-semibold">{route.name}</div>
+                        <div className="truncate text-sm font-semibold">{routeLabel}</div>
                       </div>
                     )}
                   </Link>

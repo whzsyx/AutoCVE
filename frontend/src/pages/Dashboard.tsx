@@ -3,6 +3,7 @@
  */
 
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import {
   Activity,
@@ -14,7 +15,6 @@ import {
   Clock,
   Code,
   FileText,
-  FolderGit2,
   GitBranch,
   Shield,
   ShieldAlert,
@@ -23,12 +23,12 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { api, isDemoMode } from "@/shared/config/database";
-import type { AuditTask, Project, ProjectStats, UnifiedTask } from "@/shared/types";
+import { Button } from "@/components/ui/button";
 import { getAgentTasks, type AgentTask } from "@/shared/api/agentTasks";
 import { listVulnerabilities, type ManagedVulnerability } from "@/shared/api/vulnerabilities";
+import { api, isDemoMode } from "@/shared/config/database";
+import type { AuditTask, Project, ProjectStats, UnifiedTask } from "@/shared/types";
 
 const runningStatuses = new Set([
   "running",
@@ -40,6 +40,77 @@ const runningStatuses = new Set([
   "reporting",
 ]);
 
+type Translate = (key: string, values?: Record<string, string | number>) => string;
+
+const dashboardText: Record<string, string> = {
+  "dashboard.loadFailed": "数据加载失败",
+  "dashboard.loading": "加载数据中...",
+  "dashboard.title": "工作台",
+  "dashboard.subtitle": "统一查看项目、审计任务与漏洞发现。",
+  "dashboard.coreEntry": "核心审计入口",
+  "dashboard.auditTrend": "审计运行态势",
+  "dashboard.totalProjects": "总项目数",
+  "dashboard.auditTasks": "审计任务",
+  "dashboard.issuesFound": "发现问题",
+  "dashboard.activeCount": "活跃: {{count}}",
+  "dashboard.completedCount": "已完成: {{count}}",
+  "dashboard.pendingCount": "待解决: {{count}}",
+  "dashboard.demoPrefix": "当前使用",
+  "dashboard.demoMode": "演示模式",
+  "dashboard.demoSuffix": "，显示的是模拟数据。",
+  "dashboard.configure": "前往配置",
+  "dashboard.projectOverview": "项目概览",
+  "dashboard.viewAll": "查看全部",
+  "dashboard.projectActive": "活跃",
+  "dashboard.projectPaused": "暂停",
+  "dashboard.noDescription": "暂无描述",
+  "dashboard.noProjects": "暂无项目",
+  "dashboard.noProjectsDescription": "创建您的第一个项目并进入审计流程",
+  "dashboard.recentTasks": "最近任务",
+  "dashboard.unknownProject": "未知项目",
+  "dashboard.qualityScore": "质量分: {{score}}",
+  "dashboard.noTasks": "暂无任务",
+  "dashboard.riskOverview": "漏洞风险概览",
+  "dashboard.highRiskFocus": "高风险待关注",
+  "dashboard.riskTotal": "共 {{count}} 项",
+  "dashboard.quickActions": "快速操作",
+  "dashboard.createProject": "创建新项目",
+  "dashboard.installSkill": "安装Skill",
+  "dashboard.viewAuditTasks": "查看审计任务",
+  "dashboard.viewVulnerabilities": "查看已发现漏洞",
+  "dashboard.latestActivity": "最新活动",
+  "dashboard.agentCompleted": "Agent任务完成",
+  "dashboard.agentRunning": "Agent任务运行中",
+  "dashboard.agentFailed": "Agent任务失败",
+  "dashboard.agentPending": "Agent任务待处理",
+  "dashboard.taskCompleted": "任务完成",
+  "dashboard.taskRunning": "任务运行中",
+  "dashboard.taskFailed": "任务失败",
+  "dashboard.taskPending": "任务待处理",
+  "dashboard.projectActivity": "项目 \"{{name}}\"",
+  "dashboard.issuesDiscovered": "发现 {{count}} 个问题",
+  "dashboard.noActivity": "暂无活动记录",
+  "dashboard.minutesAgo": "{{count}}分钟前",
+  "dashboard.hoursAgo": "{{count}}小时前",
+  "dashboard.daysAgo": "{{count}}天前",
+  "dashboard.status.completed": "已完成",
+  "dashboard.status.running": "运行中",
+  "dashboard.status.failed": "失败",
+  "dashboard.status.cancelled": "已取消",
+  "dashboard.status.paused": "已暂停",
+  "dashboard.status.pending": "待处理",
+};
+
+const t: Translate = (key, values) => {
+  let text = dashboardText[key] ?? key;
+  if (values) {
+    for (const [name, value] of Object.entries(values)) {
+      text = text.replaceAll(`{{${name}}}`, String(value));
+    }
+  }
+  return text;
+};
+
 export default function Dashboard() {
   const [stats, setStats] = useState<ProjectStats | null>(null);
   const [recentProjects, setRecentProjects] = useState<Project[]>([]);
@@ -48,8 +119,10 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    loadDashboardData();
+    void loadDashboardData();
   }, []);
+
+  const dateLocale = "zh-CN";
 
   const loadDashboardData = async () => {
     try {
@@ -77,15 +150,14 @@ export default function Dashboard() {
         });
       }
 
-      if (results[1].status === "fulfilled") {
-        setRecentProjects(Array.isArray(results[1].value) ? results[1].value.slice(0, 6) : []);
-      } else {
-        setRecentProjects([]);
-      }
+      setRecentProjects(
+        results[1].status === "fulfilled" && Array.isArray(results[1].value)
+          ? results[1].value.slice(0, 6)
+          : []
+      );
 
       const tasks: AuditTask[] =
         results[2].status === "fulfilled" && Array.isArray(results[2].value) ? results[2].value : [];
-
       const agentTasksList: AgentTask[] =
         results[3].status === "fulfilled" && Array.isArray(results[3].value) ? results[3].value : [];
 
@@ -96,23 +168,22 @@ export default function Dashboard() {
       unified.sort((a, b) => new Date(b.task.created_at).getTime() - new Date(a.task.created_at).getTime());
       setRecentTasks(unified.slice(0, 10));
 
-      if (results[4].status === "fulfilled") {
-        setVulnerabilities(Array.isArray(results[4].value) ? results[4].value : []);
-      } else {
-        setVulnerabilities([]);
-      }
+      setVulnerabilities(
+        results[4].status === "fulfilled" && Array.isArray(results[4].value) ? results[4].value : []
+      );
     } catch (error) {
-      console.error("仪表盘数据加载失败:", error);
-      toast.error("数据加载失败");
+      console.error("Dashboard data load failed:", error);
+      toast.error(t("dashboard.loadFailed"));
     } finally {
       setLoading(false);
     }
   };
 
   const getStatusBadge = (status: string) => {
+    const label = t(`dashboard.status.${statusLabelKey(status)}`);
     switch (status) {
       case "completed":
-        return <Badge className="cyber-badge-success">完成</Badge>;
+        return <Badge className="cyber-badge-success">{label}</Badge>;
       case "running":
       case "initializing":
       case "planning":
@@ -120,15 +191,14 @@ export default function Dashboard() {
       case "analyzing":
       case "verifying":
       case "reporting":
-        return <Badge className="cyber-badge-info">运行中</Badge>;
+        return <Badge className="cyber-badge-info">{label}</Badge>;
       case "failed":
-        return <Badge className="cyber-badge-danger">失败</Badge>;
+        return <Badge className="cyber-badge-danger">{label}</Badge>;
       case "cancelled":
-        return <Badge className="cyber-badge-muted">已取消</Badge>;
       case "paused":
-        return <Badge className="cyber-badge-muted">已暂停</Badge>;
+        return <Badge className="cyber-badge-muted">{label}</Badge>;
       default:
-        return <Badge className="cyber-badge-muted">待处理</Badge>;
+        return <Badge className="cyber-badge-muted">{label}</Badge>;
     }
   };
 
@@ -147,25 +217,25 @@ export default function Dashboard() {
 
   const summaryCards = [
     {
-      label: "总项目数",
+      label: t("dashboard.totalProjects"),
       value: stats?.total_projects || 0,
-      detail: `活跃: ${stats?.active_projects || 0}`,
+      detail: t("dashboard.activeCount", { count: stats?.active_projects || 0 }),
       icon: Code,
       tone: "text-[hsl(var(--primary))]",
       dot: "bg-emerald-500",
     },
     {
-      label: "审计任务",
+      label: t("dashboard.auditTasks"),
       value: stats?.total_tasks || 0,
-      detail: `已完成: ${stats?.completed_tasks || 0}`,
+      detail: t("dashboard.completedCount", { count: stats?.completed_tasks || 0 }),
       icon: Activity,
       tone: "text-emerald-600",
       dot: "bg-emerald-500",
     },
     {
-      label: "发现问题",
+      label: t("dashboard.issuesFound"),
       value: stats?.total_issues || 0,
-      detail: `待解决: ${pendingIssues}`,
+      detail: t("dashboard.pendingCount", { count: pendingIssues }),
       icon: AlertTriangle,
       tone: "text-amber-600",
       dot: "bg-amber-500",
@@ -178,7 +248,7 @@ export default function Dashboard() {
         <div className="absolute inset-0 cyber-grid-subtle pointer-events-none" />
         <div className="relative z-10 space-y-4 text-center">
           <div className="loading-spinner mx-auto" />
-          <p className="text-base text-muted-foreground">加载数据中...</p>
+          <p className="text-base text-muted-foreground">{t("dashboard.loading")}</p>
         </div>
       </div>
     );
@@ -199,9 +269,9 @@ export default function Dashboard() {
                     AIAudit Workspace
                   </span>
                   <div className="space-y-2">
-                    <h1 className="text-3xl font-semibold text-slate-900 md:text-4xl">工作台</h1>
+                    <h1 className="text-3xl font-semibold text-slate-900 md:text-4xl">{t("dashboard.title")}</h1>
                     <p className="max-w-2xl text-sm leading-7 text-slate-600 md:text-base">
-                      统一查看项目、审计任务与漏洞发现。
+                      {t("dashboard.subtitle")}
                     </p>
                   </div>
                 </div>
@@ -209,11 +279,11 @@ export default function Dashboard() {
                 <div className="flex flex-wrap items-center gap-3 text-sm text-slate-500">
                   <span className="inline-flex items-center gap-2 rounded-full border border-[#e2e8f0] bg-white px-3 py-2 shadow-sm">
                     <Calendar className="h-4 w-4 text-slate-400" />
-                    {new Date().toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric" })}
+                    {new Date().toLocaleDateString(dateLocale, { year: "numeric", month: "long", day: "numeric" })}
                   </span>
                   <span className="inline-flex items-center gap-2 rounded-full border border-[#c7decf] bg-[#f6fbf7] px-3 py-2 shadow-sm">
                     <Shield className="h-4 w-4 text-[hsl(var(--primary))]" />
-                    核心审计入口
+                    {t("dashboard.coreEntry")}
                   </span>
                 </div>
               </div>
@@ -223,7 +293,7 @@ export default function Dashboard() {
               <div className="flex h-full flex-col justify-between rounded-[24px] border border-[#dbe7df] bg-[#f8fbf9] p-5">
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-sm font-semibold text-slate-500">审计运行态势</p>
+                    <p className="text-sm font-semibold text-slate-500">{t("dashboard.auditTrend")}</p>
                     <p className="mt-1 text-2xl font-bold text-slate-900">{stats?.total_tasks || 0}</p>
                   </div>
                   <span className="flex h-12 w-12 items-center justify-center rounded-[18px] border border-[#dbe7df] bg-white text-[hsl(var(--primary))]">
@@ -231,10 +301,10 @@ export default function Dashboard() {
                   </span>
                 </div>
                 <div className="mt-6 grid grid-cols-2 gap-3 text-sm">
-                  <StatusPill label="已完成" value={completedTaskCount} tone="text-emerald-700" />
-                  <StatusPill label="运行中" value={runningTaskCount} tone="text-sky-700" />
-                  <StatusPill label="失败" value={failedTaskCount} tone="text-rose-700" />
-                  <StatusPill label="待处理" value={queuedTaskCount} tone="text-slate-700" />
+                  <StatusPill label={t("dashboard.status.completed")} value={completedTaskCount} tone="text-emerald-700" />
+                  <StatusPill label={t("dashboard.status.running")} value={runningTaskCount} tone="text-sky-700" />
+                  <StatusPill label={t("dashboard.status.failed")} value={failedTaskCount} tone="text-rose-700" />
+                  <StatusPill label={t("dashboard.status.pending")} value={queuedTaskCount} tone="text-slate-700" />
                 </div>
               </div>
             </div>
@@ -246,9 +316,11 @@ export default function Dashboard() {
             <div className="flex items-start gap-3">
               <AlertTriangle className="mt-0.5 h-5 w-5 text-amber-600" />
               <div className="text-sm text-slate-700">
-                当前使用<span className="font-bold text-amber-700">演示模式</span>，显示的是模拟数据。
+                {t("dashboard.demoPrefix")}
+                <span className="font-bold text-amber-700">{t("dashboard.demoMode")}</span>
+                {t("dashboard.demoSuffix")}
                 <Link to="/admin" className="ml-2 font-bold text-[hsl(var(--primary))] hover:underline">
-                  前往配置
+                  {t("dashboard.configure")}
                 </Link>
               </div>
             </div>
@@ -284,15 +356,7 @@ export default function Dashboard() {
         <section className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_340px]">
           <div className="space-y-5">
             <div className="rounded-[28px] border border-[#dbe7df] bg-white p-5 shadow-[0_18px_48px_rgba(84,110,93,0.08)]">
-              <div className="section-header">
-                <FileText className="h-5 w-5 text-[hsl(var(--primary))]" />
-                <h3 className="section-title">项目概览</h3>
-                <Link to="/projects" className="ml-auto">
-                  <Button variant="ghost" size="sm" className="rounded-full text-muted-foreground hover:text-foreground">
-                    查看全部 <ArrowUpRight className="ml-1 h-3 w-3" />
-                  </Button>
-                </Link>
-              </div>
+              <SectionHeader icon={<FileText className="h-5 w-5 text-[hsl(var(--primary))]" />} title={t("dashboard.projectOverview")} to="/projects" t={t} />
               <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
                 {recentProjects.length > 0 ? (
                   recentProjects.map((project) => (
@@ -306,38 +370,30 @@ export default function Dashboard() {
                           {project.name}
                         </h4>
                         <Badge className={`shrink-0 ${project.is_active ? "cyber-badge-success" : "cyber-badge-muted"}`}>
-                          {project.is_active ? "活跃" : "暂停"}
+                          {project.is_active ? t("dashboard.projectActive") : t("dashboard.projectPaused")}
                         </Badge>
                       </div>
                       <p className="mt-3 line-clamp-2 min-h-[48px] text-sm leading-6 text-slate-500">
-                        {project.description || "暂无描述"}
+                        {project.description || t("dashboard.noDescription")}
                       </p>
                       <div className="mt-4 flex items-center text-sm text-slate-500">
                         <Calendar className="mr-2 h-4 w-4" />
-                        {new Date(project.created_at).toLocaleDateString("zh-CN")}
+                        {new Date(project.created_at).toLocaleDateString(dateLocale)}
                       </div>
                     </Link>
                   ))
                 ) : (
                   <div className="col-span-full empty-state py-12">
                     <Code className="empty-state-icon" />
-                    <p className="empty-state-title">暂无项目</p>
-                    <p className="empty-state-description">创建您的第一个项目并进入审计流程</p>
+                    <p className="empty-state-title">{t("dashboard.noProjects")}</p>
+                    <p className="empty-state-description">{t("dashboard.noProjectsDescription")}</p>
                   </div>
                 )}
               </div>
             </div>
 
             <div className="rounded-[28px] border border-[#dbe7df] bg-white p-5 shadow-[0_18px_48px_rgba(84,110,93,0.08)]">
-              <div className="section-header">
-                <Clock className="h-5 w-5 text-emerald-600" />
-                <h3 className="section-title">最近任务</h3>
-                <Link to="/audit-tasks" className="ml-auto">
-                  <Button variant="ghost" size="sm" className="rounded-full text-muted-foreground hover:text-foreground">
-                    查看全部 <ArrowUpRight className="ml-1 h-3 w-3" />
-                  </Button>
-                </Link>
-              </div>
+              <SectionHeader icon={<Clock className="h-5 w-5 text-emerald-600" />} title={t("dashboard.recentTasks")} to="/audit-tasks" t={t} />
               <div className="space-y-3">
                 {recentTasks.length > 0 ? (
                   recentTasks.slice(0, 6).map((unified) => {
@@ -345,8 +401,8 @@ export default function Dashboard() {
                     const task = unified.task;
                     const taskLink = isAgent ? `/agent-audit/${task.id}` : `/tasks/${task.id}`;
                     const taskName = isAgent
-                      ? (task as AgentTask).name || "未知项目"
-                      : (task as AuditTask).project?.name || "未知项目";
+                      ? (task as AgentTask).name || t("dashboard.unknownProject")
+                      : (task as AuditTask).project?.name || t("dashboard.unknownProject");
                     const score = task.quality_score?.toFixed(1) || "0.0";
                     const isRunning = runningStatuses.has(task.status);
                     const isCompleted = task.status === "completed";
@@ -374,7 +430,7 @@ export default function Dashboard() {
                               {taskName}
                             </p>
                             <p className="mt-1 text-sm text-slate-500">
-                              质量分: <span className="font-semibold text-slate-700">{score}</span>
+                              {t("dashboard.qualityScore", { score })}
                               {isAgent && <span className="ml-2 rounded-full bg-violet-50 px-2 py-0.5 text-xs font-semibold text-violet-600">Agent</span>}
                             </p>
                           </div>
@@ -386,7 +442,7 @@ export default function Dashboard() {
                 ) : (
                   <div className="empty-state py-12">
                     <Activity className="empty-state-icon" />
-                    <p className="empty-state-title">暂无任务</p>
+                    <p className="empty-state-title">{t("dashboard.noTasks")}</p>
                   </div>
                 )}
               </div>
@@ -395,23 +451,15 @@ export default function Dashboard() {
 
           <aside className="space-y-5">
             <div className="rounded-[28px] border border-[#dbe7df] bg-white p-5 shadow-[0_18px_48px_rgba(84,110,93,0.08)]">
-              <div className="section-header">
-                <ShieldAlert className="h-5 w-5 text-rose-600" />
-                <h3 className="section-title">漏洞风险概览</h3>
-                <Link to="/vulnerabilities" className="ml-auto">
-                  <Button variant="ghost" size="sm" className="rounded-full text-muted-foreground hover:text-foreground">
-                    查看全部 <ArrowUpRight className="ml-1 h-3 w-3" />
-                  </Button>
-                </Link>
-              </div>
+              <SectionHeader icon={<ShieldAlert className="h-5 w-5 text-rose-600" />} title={t("dashboard.riskOverview")} to="/vulnerabilities" t={t} />
               <div className="rounded-[24px] border border-[#ead5d5] bg-[linear-gradient(180deg,#fffafa,#fff)] p-4">
                 <div className="flex items-end justify-between">
                   <div>
-                    <p className="text-sm font-semibold text-slate-500">高风险待关注</p>
+                    <p className="text-sm font-semibold text-slate-500">{t("dashboard.highRiskFocus")}</p>
                     <p className="mt-2 text-4xl font-bold leading-none text-slate-950">{highRiskTotal}</p>
                   </div>
                   <Badge className="rounded-full border border-rose-200 bg-rose-50 text-rose-700">
-                    共 {totalRisk} 项
+                    {t("dashboard.riskTotal", { count: totalRisk })}
                   </Badge>
                 </div>
                 <div className="mt-5 space-y-3">
@@ -427,40 +475,20 @@ export default function Dashboard() {
             <div className="rounded-[28px] border border-[#dbe7df] bg-white p-5 shadow-[0_18px_48px_rgba(84,110,93,0.08)]">
               <div className="section-header">
                 <Zap className="h-5 w-5 text-[hsl(var(--primary))]" />
-                <h3 className="section-title">快速操作</h3>
+                <h3 className="section-title">{t("dashboard.quickActions")}</h3>
               </div>
               <div className="space-y-2">
-                <Link to="/projects" className="block">
-                  <Button variant="outline" className="h-11 w-full justify-start rounded-full cyber-btn-outline">
-                    <GitBranch className="mr-2 h-4 w-4" />
-                    创建新项目
-                  </Button>
-                </Link>
-                <Link to="/skills" className="block">
-                  <Button variant="outline" className="h-11 w-full justify-start rounded-full cyber-btn-outline">
-                    <Wrench className="mr-2 h-4 w-4" />
-                    安装Skill
-                  </Button>
-                </Link>
-                <Link to="/audit-tasks" className="block">
-                  <Button variant="outline" className="h-11 w-full justify-start rounded-full cyber-btn-outline">
-                    <Shield className="mr-2 h-4 w-4" />
-                    查看审计任务
-                  </Button>
-                </Link>
-                <Link to="/vulnerabilities" className="block">
-                  <Button variant="outline" className="h-11 w-full justify-start rounded-full cyber-btn-outline">
-                    <ShieldAlert className="mr-2 h-4 w-4" />
-                    查看已发现漏洞
-                  </Button>
-                </Link>
+                <QuickAction to="/projects" icon={<GitBranch className="mr-2 h-4 w-4" />} label={t("dashboard.createProject")} />
+                <QuickAction to="/skills" icon={<Wrench className="mr-2 h-4 w-4" />} label={t("dashboard.installSkill")} />
+                <QuickAction to="/audit-tasks" icon={<Shield className="mr-2 h-4 w-4" />} label={t("dashboard.viewAuditTasks")} />
+                <QuickAction to="/vulnerabilities" icon={<ShieldAlert className="mr-2 h-4 w-4" />} label={t("dashboard.viewVulnerabilities")} />
               </div>
             </div>
 
             <div className="rounded-[28px] border border-[#dbe7df] bg-white p-5 shadow-[0_18px_48px_rgba(84,110,93,0.08)]">
               <div className="section-header">
                 <Activity className="h-5 w-5 text-amber-600" />
-                <h3 className="section-title">最新活动</h3>
+                <h3 className="section-title">{t("dashboard.latestActivity")}</h3>
               </div>
               <div className="space-y-2">
                 {recentTasks.length > 0 ? (
@@ -472,24 +500,10 @@ export default function Dashboard() {
                     const isCompleted = task.status === "completed";
                     const isFailed = task.status === "failed";
                     const taskName = isAgent
-                      ? (task as AgentTask).name || "未知项目"
-                      : (task as AuditTask).project?.name || "未知项目";
+                      ? (task as AgentTask).name || t("dashboard.unknownProject")
+                      : (task as AuditTask).project?.name || t("dashboard.unknownProject");
                     const issuesCount = isAgent ? (task as AgentTask).findings_count : (task as AuditTask).issues_count;
-                    const statusText = isAgent
-                      ? isCompleted
-                        ? "Agent任务完成"
-                        : isRunning
-                          ? "Agent任务运行中"
-                          : isFailed
-                            ? "Agent任务失败"
-                            : "Agent任务待处理"
-                      : isCompleted
-                        ? "任务完成"
-                        : isRunning
-                          ? "任务运行中"
-                          : isFailed
-                            ? "任务失败"
-                            : "任务待处理";
+                    const statusText = activityStatusText({ isAgent, isCompleted, isRunning, isFailed, t });
 
                     return (
                       <Link
@@ -507,17 +521,17 @@ export default function Dashboard() {
                       >
                         <p className="text-sm font-semibold text-slate-800">{statusText}</p>
                         <p className="mt-1 line-clamp-1 text-sm text-slate-500">
-                          项目 "{taskName}"
-                          {isCompleted && issuesCount > 0 ? ` - 发现 ${issuesCount} 个问题` : ""}
+                          {t("dashboard.projectActivity", { name: taskName })}
+                          {isCompleted && issuesCount > 0 ? ` - ${t("dashboard.issuesDiscovered", { count: issuesCount })}` : ""}
                         </p>
-                        <p className="mt-1 text-xs text-slate-400">{formatTimeAgo(task.created_at)}</p>
+                        <p className="mt-1 text-xs text-slate-400">{formatRelativeTime(task.created_at, t)}</p>
                       </Link>
                     );
                   })
                 ) : (
                   <div className="empty-state py-8">
                     <Clock className="mb-2 h-10 w-10 text-muted-foreground" />
-                    <p className="text-base text-muted-foreground">暂无活动记录</p>
+                    <p className="text-base text-muted-foreground">{t("dashboard.noActivity")}</p>
                   </div>
                 )}
               </div>
@@ -526,6 +540,41 @@ export default function Dashboard() {
         </section>
       </div>
     </div>
+  );
+}
+
+function SectionHeader({
+  icon,
+  title,
+  to,
+  t,
+}: {
+  icon: ReactNode;
+  title: string;
+  to: string;
+  t: Translate;
+}) {
+  return (
+    <div className="section-header">
+      {icon}
+      <h3 className="section-title">{title}</h3>
+      <Link to={to} className="ml-auto">
+        <Button variant="ghost" size="sm" className="rounded-full text-muted-foreground hover:text-foreground">
+          {t("dashboard.viewAll")} <ArrowUpRight className="ml-1 h-3 w-3" />
+        </Button>
+      </Link>
+    </div>
+  );
+}
+
+function QuickAction({ to, icon, label }: { to: string; icon: ReactNode; label: string }) {
+  return (
+    <Link to={to} className="block">
+      <Button variant="outline" className="h-11 w-full justify-start rounded-full cyber-btn-outline">
+        {icon}
+        {label}
+      </Button>
+    </Link>
   );
 }
 
@@ -586,7 +635,34 @@ function buildRiskCounts(vulnerabilities: ManagedVulnerability[]) {
   );
 }
 
-function formatTimeAgo(createdAt: string) {
+function statusLabelKey(status: string) {
+  if (runningStatuses.has(status)) return "running";
+  if (status === "completed") return "completed";
+  if (status === "failed") return "failed";
+  if (status === "cancelled") return "cancelled";
+  if (status === "paused") return "paused";
+  return "pending";
+}
+
+function activityStatusText({
+  isAgent,
+  isCompleted,
+  isRunning,
+  isFailed,
+  t,
+}: {
+  isAgent: boolean;
+  isCompleted: boolean;
+  isRunning: boolean;
+  isFailed: boolean;
+  t: Translate;
+}) {
+  const prefix = isAgent ? "agent" : "task";
+  const state = isCompleted ? "Completed" : isRunning ? "Running" : isFailed ? "Failed" : "Pending";
+  return t(`dashboard.${prefix}${state}`);
+}
+
+function formatRelativeTime(createdAt: string, t: Translate) {
   const now = new Date();
   const taskDate = new Date(createdAt);
   const diffMs = now.getTime() - taskDate.getTime();
@@ -594,7 +670,7 @@ function formatTimeAgo(createdAt: string) {
   const diffHours = Math.floor(diffMs / 3600000);
   const diffDays = Math.floor(diffMs / 86400000);
 
-  if (diffMins < 60) return `${diffMins}分钟前`;
-  if (diffHours < 24) return `${diffHours}小时前`;
-  return `${diffDays}天前`;
+  if (diffMins < 60) return t("dashboard.minutesAgo", { count: diffMins });
+  if (diffHours < 24) return t("dashboard.hoursAgo", { count: diffHours });
+  return t("dashboard.daysAgo", { count: diffDays });
 }

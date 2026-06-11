@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from types import SimpleNamespace
 
@@ -19,9 +19,9 @@ EN_REPORT = """# EN
 
 ## Summary
 
-## Vulnerability Description
+## Details
 
-## Exploitation
+## POC
 
 ## Impact
 
@@ -45,9 +45,9 @@ ZH_REPORT = """# ZH
 
 ## Summary
 
-## Vulnerability Description
+## Details
 
-## Exploitation
+## POC
 
 ## Impact
 
@@ -67,11 +67,7 @@ ZH_REPORT = """# ZH
 - CWE: CWE-918
 """
 
-CVE_REPORT = """# demo_cve.md
-
-## CVE Submission Helper
-
-## Vulnerability type
+CVE_REPORT = """## Vulnerability type
 """
 
 
@@ -184,7 +180,7 @@ async def seed_vulnerability_fixture(session_factory: async_sessionmaker):
                 source_type='auto_generated',
                 template_key='system:vulnerability-report:cve',
                 template_version='1',
-                template_snapshot='# <basename>_cve.md',
+                template_snapshot='## Vulnerability type',
             ),
         ]
         hidden_managed = ManagedVulnerability(

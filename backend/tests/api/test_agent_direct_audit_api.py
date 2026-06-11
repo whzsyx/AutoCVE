@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
@@ -27,7 +27,7 @@ EN_REPORT = """# SSRF in /api/fetch via untrusted target parameter (affected ver
 ## Summary
 An authenticated attacker can trigger server-side requests to internal resources through the `/api/fetch` endpoint by supplying an untrusted `target` value.
 
-## Vulnerability Description
+## Details
 The request handler forwards a user-controlled URL to the outbound HTTP client without an allowlist or scheme restriction.
 
 ```python
@@ -35,7 +35,7 @@ target = request.json["target"]
 response = httpx.get(target, timeout=5)
 ```
 
-## Exploitation
+## POC
 1. Authenticate to the application.
 2. Send a POST request to `/api/fetch` with `target` set to an internal resource.
 
@@ -72,22 +72,22 @@ The affected version range is still being confirmed.
 - CWE: CWE-918 Server-Side Request Forgery (SSRF)
 """
 
-ZH_REPORT = """# SSRF in /api/fetch（受影响版本待确认）
+ZH_REPORT = """# SSRF in /api/fetch锛堝彈褰卞搷鐗堟湰寰呯‘璁わ級
 
 ## Summary
-具备认证权限的攻击者可以通过向 `/api/fetch` 端点提交不受信任的 `target` 参数，让服务器向内部资源发起请求。
+鍏峰璁よ瘉鏉冮檺鐨勬敾鍑昏€呭彲浠ラ€氳繃鍚?`/api/fetch` 绔偣鎻愪氦涓嶅彈淇′换鐨?`target` 鍙傛暟锛岃鏈嶅姟鍣ㄥ悜鍐呴儴璧勬簮鍙戣捣璇锋眰銆?
 
-## Vulnerability Description
-请求处理逻辑会将用户可控 URL 直接传给出站 HTTP 客户端，且没有做 allowlist 或协议限制。
+## Details
+璇锋眰澶勭悊閫昏緫浼氬皢鐢ㄦ埛鍙帶 URL 鐩存帴浼犵粰鍑虹珯 HTTP 瀹㈡埛绔紝涓旀病鏈夊仛 allowlist 鎴栧崗璁檺鍒躲€?
 
 ```python
 target = request.json["target"]
 response = httpx.get(target, timeout=5)
 ```
 
-## Exploitation
-1. 登录应用。
-2. 向 `/api/fetch` 发送 POST 请求，并把 `target` 设为内部资源地址。
+## POC
+1. 鐧诲綍搴旂敤銆?
+2. 鍚?`/api/fetch` 鍙戦€?POST 璇锋眰锛屽苟鎶?`target` 璁句负鍐呴儴璧勬簮鍦板潃銆?
 
 ```http
 POST /api/fetch HTTP/1.1
@@ -98,15 +98,15 @@ Content-Type: application/json
 ```
 
 ## Impact
-攻击者可以借此访问本不应暴露的内部服务、元数据接口或管理接口。
+鏀诲嚮鑰呭彲浠ュ€熸璁块棶鏈笉搴旀毚闇茬殑鍐呴儴鏈嶅姟銆佸厓鏁版嵁鎺ュ彛鎴栫鐞嗘帴鍙ｃ€?
 
 ## Remediation
-对出站目标实施严格 allowlist，标准化 URL 后再校验，并阻止内部 IP 段和危险协议。
+瀵瑰嚭绔欑洰鏍囧疄鏂戒弗鏍?allowlist锛屾爣鍑嗗寲 URL 鍚庡啀鏍￠獙锛屽苟闃绘鍐呴儴 IP 娈靛拰鍗遍櫓鍗忚銆?
 
 ## Disclosure Notes
-受影响版本范围仍待确认。
+鍙楀奖鍝嶇増鏈寖鍥翠粛寰呯‘璁ゃ€?
 
-## 补充信息
+## 琛ュ厖淇℃伅
 ### Affected products
 - Ecosystem: self-hosted
 - Package name: demo-app
@@ -122,11 +122,7 @@ Content-Type: application/json
 - CWE: CWE-918 Server-Side Request Forgery (SSRF)
 """
 
-CVE_REPORT = """# demo_ssrf_cve.md
-
-## CVE Submission Helper
-
-## Vulnerability type
+CVE_REPORT = """## Vulnerability type
 - [x] SSRF
 
 ## CWE
@@ -167,7 +163,7 @@ Send a crafted POST request to `/api/fetch` with an internal URL in `target`.
 An authenticated SSRF vulnerability in `/api/fetch` allows attackers to make the server request internal resources via an untrusted `target` parameter.
 
 ## Discoverer(s)/Credits
-cil
+[Your Name]
 
 ## Reference(s)
 - [ ] TBD
@@ -321,7 +317,7 @@ async def test_create_direct_audit_session_and_list_project_sessions(monkeypatch
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         create_response = await client.post(
             "/api/v1/agent-direct-audit/sessions",
-            json={"project_id": "project-1", "content": "帮我看看有没有安全漏洞"},
+            json={"project_id": "project-1", "content": "Please check this project for vulnerabilities."},
         )
         list_response = await client.get("/api/v1/agent-direct-audit/sessions", params={"project_id": "project-1"})
 
@@ -370,7 +366,7 @@ async def test_post_direct_audit_message_appends_user_message_and_continues(monk
                 session_id=session.id,
                 sequence=2,
                 role="assistant",
-                content="继续审计后的回复",
+                content="缁х画瀹¤鍚庣殑鍥炲",
                 message_metadata={"kind": "direct_audit_assistant_message"},
                 payload={"continued": True},
             )
@@ -386,14 +382,14 @@ async def test_post_direct_audit_message_appends_user_message_and_continues(monk
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.post(
             "/api/v1/agent-direct-audit/sessions/session-1/messages",
-            json={"content": "再帮我看看还有没有遗漏的"},
+            json={"content": "鍐嶅府鎴戠湅鐪嬭繕鏈夋病鏈夐仐婕忕殑"},
         )
         messages = await client.get("/api/v1/agent-direct-audit/sessions/session-1/messages")
 
     await engine.dispose()
 
     assert response.status_code == 200
-    assert response.json()["content"] == "再帮我看看还有没有遗漏的"
+    assert response.json()["content"] == "鍐嶅府鎴戠湅鐪嬭繕鏈夋病鏈夐仐婕忕殑"
     assert response.json()["role"] == "user"
     assert len(messages.json()) == 2
 
@@ -461,7 +457,7 @@ async def test_stream_approve_direct_audit_tool_call_grants_write_and_continues(
             session_id=session.id,
             sequence=2,
             role="assistant",
-            content="宸叉敹鍒板啓鍏ユ壒鍑嗭紝姝ｅ湪缁х画瀹¤銆?",
+            content="瀹稿弶鏁归崚鏉垮晸閸忋儲澹掗崙鍡礉濮濓絽婀紒褏鐢荤€孤ゎ吀閵?",
             message_metadata={"kind": "direct_audit_assistant_message", "streaming": True},
             payload={"continued": True, "approval": True},
         )
@@ -481,7 +477,7 @@ async def test_stream_approve_direct_audit_tool_call_grants_write_and_continues(
                 "created_at": assistant.created_at.isoformat(),
             },
         }
-        yield {"type": "token", "content": "宸叉敹鍒板啓鍏ユ壒鍑?", "accumulated": "宸叉敹鍒板啓鍏ユ壒鍑?"}
+        yield {"type": "token", "content": "瀹稿弶鏁归崚鏉垮晸閸忋儲澹掗崙?", "accumulated": "瀹稿弶鏁归崚鏉垮晸閸忋儲澹掗崙?"}
         yield {
             "type": "done",
             "message": {
@@ -568,7 +564,7 @@ async def test_stream_direct_audit_message_emits_sse_events(monkeypatch):
             session_id=session.id,
             sequence=2,
             role="assistant",
-            content="流式审计回复",
+            content="娴佸紡瀹¤鍥炲",
             message_metadata={"kind": "direct_audit_assistant_message", "streaming": True},
             payload={"continued": True},
         )
@@ -588,8 +584,8 @@ async def test_stream_direct_audit_message_emits_sse_events(monkeypatch):
                 "created_at": assistant.created_at.isoformat(),
             },
         }
-        yield {"type": "token", "content": "流式", "accumulated": "流式"}
-        yield {"type": "token", "content": "审计回复", "accumulated": "流式审计回复"}
+        yield {"type": "token", "content": "娴佸紡", "accumulated": "娴佸紡"}
+        yield {"type": "token", "content": "瀹¤鍥炲", "accumulated": "娴佸紡瀹¤鍥炲"}
         yield {
             "type": "done",
             "message": {
@@ -618,7 +614,7 @@ async def test_stream_direct_audit_message_emits_sse_events(monkeypatch):
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.post(
             "/api/v1/agent-direct-audit/sessions/session-1/messages/stream",
-            json={"content": "继续审计"},
+            json={"content": "缁х画瀹¤"},
         )
         messages = await client.get("/api/v1/agent-direct-audit/sessions/session-1/messages")
 
@@ -627,11 +623,11 @@ async def test_stream_direct_audit_message_emits_sse_events(monkeypatch):
     assert response.status_code == 200
     events = parse_sse_events(response.text)
     assert [event["type"] for event in events] == ["user_message", "assistant_start", "token", "token", "done"]
-    assert events[0]["message"]["content"] == "继续审计"
-    assert events[-1]["message"]["content"] == "流式审计回复"
+    assert events[0]["message"]["content"] == "缁х画瀹¤"
+    assert events[-1]["message"]["content"] == "娴佸紡瀹¤鍥炲"
     assert len(messages.json()) == 2
-    assert messages.json()[0]["content"] == "继续审计"
-    assert messages.json()[1]["content"] == "流式审计回复"
+    assert messages.json()[0]["content"] == "缁х画瀹¤"
+    assert messages.json()[1]["content"] == "娴佸紡瀹¤鍥炲"
 
 
 @pytest.mark.asyncio
@@ -667,7 +663,7 @@ async def test_continue_direct_audit_session_stream_emits_runtime_error_from_che
                 state_payload={
                     "stop_reason": "model_error",
                     "phase": "model",
-                    "error": "无效的 API Key (使用了占位符): sk-your-api-key...",
+                    "error": "鏃犳晥鐨?API Key (浣跨敤浜嗗崰浣嶇): sk-your-api-key...",
                 },
             )
         )
@@ -703,7 +699,7 @@ async def test_continue_direct_audit_session_stream_emits_runtime_error_from_che
         events = []
         async for event in agent_direct_audit_endpoint.continue_direct_audit_session_stream(
             session=session,
-            content="继续审计",
+            content="缁х画瀹¤",
             db=db,
             current_user=SimpleNamespace(id="user-1", is_active=True),
         ):
@@ -714,7 +710,7 @@ async def test_continue_direct_audit_session_stream_emits_runtime_error_from_che
     assert events == [
         {
             "type": "error",
-            "message_text": "当前 LLM API Key 仍是占位符 `sk-your-api-key`，请先在模型配置或 backend/.env 中填入真实可用的 Key，再重试 Agent直审。",
+            "message_text": "The current LLM API Key is still a placeholder. Configure a real key before retrying direct audit.",
         }
     ]
 
@@ -759,7 +755,7 @@ async def test_stream_direct_audit_session_creation_emits_session_created_and_me
                 session_id=session.id,
                 sequence=2,
                 role="assistant",
-                content="首条流式审计回复",
+                content="棣栨潯娴佸紡瀹¤鍥炲",
                 message_metadata={"kind": "direct_audit_assistant_message", "streaming": True},
                 payload={"continued": False},
             )
@@ -792,8 +788,8 @@ async def test_stream_direct_audit_session_creation_emits_session_created_and_me
                 "created_at": session.created_at.isoformat(),
             },
         }
-        yield {"type": "token", "content": "首条", "accumulated": "首条"}
-        yield {"type": "token", "content": "流式审计回复", "accumulated": "首条流式审计回复"}
+        yield {"type": "token", "content": "棣栨潯", "accumulated": "棣栨潯"}
+        yield {"type": "token", "content": "娴佸紡瀹¤鍥炲", "accumulated": "棣栨潯娴佸紡瀹¤鍥炲"}
         yield {
             "type": "done",
             "message": {
@@ -801,7 +797,7 @@ async def test_stream_direct_audit_session_creation_emits_session_created_and_me
                 "session_id": session.id,
                 "sequence": 2,
                 "role": "assistant",
-                "content": "首条流式审计回复",
+                "content": "棣栨潯娴佸紡瀹¤鍥炲",
                 "metadata": {"kind": "direct_audit_assistant_message", "streaming": True},
                 "payload": {"continued": False},
                 "created_at": session.created_at.isoformat(),
@@ -822,7 +818,7 @@ async def test_stream_direct_audit_session_creation_emits_session_created_and_me
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.post(
             "/api/v1/agent-direct-audit/sessions/stream",
-            json={"project_id": "project-1", "content": "帮我实时审计这个项目"},
+            json={"project_id": "project-1", "content": "甯垜瀹炴椂瀹¤杩欎釜椤圭洰"},
         )
         messages = await client.get("/api/v1/agent-direct-audit/sessions/session-stream-1/messages")
 
@@ -1295,7 +1291,7 @@ async def test_start_direct_audit_session_finalizes_payload_and_generates_report
 
         session = await agent_direct_audit_endpoint.start_direct_audit_session(
             project=project,
-            content="请继续审计并收敛最终结论",
+            content="Continue the audit and summarize the final conclusion.",
             guardrails_enabled=False,
             db=db,
             current_user=current_user,
