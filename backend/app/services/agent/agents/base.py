@@ -472,8 +472,8 @@ class BaseAgent(ABC):
     async def emit_thinking_start(self) -> None:
         await self.emit_event("thinking_start", "Thinking...")
 
-    async def emit_thinking_token(self, token: str, accumulated: str) -> None:
-        await self.emit_event("thinking_token", "", metadata={"token": token, "accumulated": accumulated})
+    async def emit_thinking_token(self, token: str, accumulated: str = "") -> None:
+        await self.emit_event("thinking_token", "", metadata={"token": token})
 
     async def emit_thinking_end(self, full_response: str) -> None:
         await self.emit_event("thinking_end", "Thinking complete", metadata={"accumulated": full_response})
@@ -548,6 +548,29 @@ class BaseAgent(ABC):
 
         accumulated = ""
         total_tokens = 0
+        token_buffer: List[str] = []
+        token_buffer_count = 0
+        from app.core.config import settings
+        token_chunk_size = max(1, int(getattr(settings, "AGENT_TOKEN_EVENT_CHUNK_SIZE", 20)))
+        flush_interval = max(0.0, float(getattr(settings, "AGENT_TOKEN_EVENT_FLUSH_INTERVAL_MS", 100)) / 1000.0)
+        last_flush_at = time.monotonic()
+
+        async def flush_token_buffer(force: bool = False) -> None:
+            nonlocal token_buffer, token_buffer_count, last_flush_at
+            if not token_buffer:
+                return
+            now = time.monotonic()
+            if (
+                force
+                or token_buffer_count >= token_chunk_size
+                or (flush_interval > 0 and now - last_flush_at >= flush_interval)
+            ):
+                token_text = "".join(token_buffer)
+                token_buffer = []
+                token_buffer_count = 0
+                last_flush_at = now
+                await self.emit_thinking_token(token_text)
+
         await self.emit_thinking_start()
         try:
             stream = self.llm_service.chat_completion_stream(
@@ -575,14 +598,19 @@ class BaseAgent(ABC):
                     first_token = True
                     token = chunk.get("content", "")
                     accumulated = chunk.get("accumulated", accumulated + token)
-                    await self.emit_thinking_token(token, accumulated)
+                    if token:
+                        token_buffer.append(token)
+                        token_buffer_count += 1
+                        await flush_token_buffer()
                     await asyncio.sleep(0)
                 elif chunk.get("type") == "done":
+                    await flush_token_buffer(force=True)
                     accumulated = chunk.get("content", accumulated)
                     usage = chunk.get("usage") or {}
                     total_tokens = usage.get("total_tokens", 0)
                     break
                 elif chunk.get("type") == "error":
+                    await flush_token_buffer(force=True)
                     accumulated = chunk.get("accumulated", accumulated)
                     error_message = chunk.get("user_message") or chunk.get("error") or "Unknown error"
                     accumulated = accumulated or f"[API_ERROR:{chunk.get('error_type', 'unknown')}] {error_message}"
@@ -594,6 +622,7 @@ class BaseAgent(ABC):
             await self.emit_event("error", f"LLM call error: {exc}")
             accumulated = f"[LLM调用错误: {str(exc)}] 请重试。"
         finally:
+            await flush_token_buffer(force=True)
             await self.emit_thinking_end(accumulated)
         return accumulated, total_tokens
 

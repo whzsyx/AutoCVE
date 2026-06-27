@@ -71,6 +71,7 @@ class GitHubRepositoryCandidate:
     has_security_policy: bool
     score: float
     has_private_vulnerability_reporting: bool = False
+    repository_size_kb: int = 0
 
 
 class GitHubApiClient:
@@ -196,9 +197,10 @@ class GitHubCveDiscoveryService:
             return None
 
         stars = int(item.get("stargazers_count") or 0)
+        repository_size_kb = _repository_size_kb(item)
         pushed_at = _parse_github_datetime(item.get("pushed_at"))
         updated_at = _parse_github_datetime(item.get("updated_at"))
-        if stars <= 1000 or (pushed_at and pushed_at < cutoff):
+        if stars <= 1000 or not _is_repository_size_allowed(repository_size_kb) or (pushed_at and pushed_at < cutoff):
             return None
 
         owner, repo = full_name.split("/", 1)
@@ -239,6 +241,7 @@ class GitHubCveDiscoveryService:
             has_security_policy=has_security_policy,
             score=score,
             has_private_vulnerability_reporting=has_private_vulnerability_reporting,
+            repository_size_kb=repository_size_kb,
         )
 
     async def _safe_get_advisories(self, owner: str, repo: str) -> list[dict[str, Any]]:
@@ -315,6 +318,9 @@ class GitHubCveDiscoveryService:
 
 def _build_search_query(*, term: str, cutoff: datetime, prefer_security_advisory: bool = True) -> str:
     pieces = ["stars:>1000", f"pushed:>={cutoff.date().isoformat()}", "archived:false", "fork:false"]
+    max_size_kb = _max_repository_size_kb()
+    if max_size_kb > 0:
+        pieces.append(f"size:<={max_size_kb}")
     if term:
         pieces.append(term)
     return " ".join(pieces)
@@ -337,10 +343,32 @@ def _is_basic_candidate_item(item: dict[str, Any], cutoff: datetime, *, prefer_s
     if bool(item.get("archived")) or bool(item.get("fork")):
         return False
     stars = int(item.get("stargazers_count") or 0)
+    repository_size_kb = _repository_size_kb(item)
     pushed_at = _parse_github_datetime(item.get("pushed_at"))
     if stars <= 1000:
         return False
+    if not _is_repository_size_allowed(repository_size_kb):
+        return False
     return not (pushed_at and pushed_at < cutoff)
+
+
+def _repository_size_kb(item: dict[str, Any]) -> int:
+    try:
+        return max(0, int(item.get("size") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _max_repository_size_kb() -> int:
+    try:
+        return max(0, int(getattr(settings, "ONE_CLICK_CVE_MAX_REPOSITORY_SIZE_KB", 512000)))
+    except (TypeError, ValueError):
+        return 512000
+
+
+def _is_repository_size_allowed(repository_size_kb: int) -> bool:
+    max_size_kb = _max_repository_size_kb()
+    return max_size_kb <= 0 or repository_size_kb <= max_size_kb
 
 
 def _raw_candidate_sort_key(item: dict[str, Any], *, now: datetime, prefer_security_advisory: bool = True) -> tuple[float, datetime]:

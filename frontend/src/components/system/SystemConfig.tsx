@@ -818,6 +818,23 @@ export function SystemConfig() {
             />
           </div>
           <div className={cn(SOFT_PANEL_CLASS, 'p-4')}>
+            <Label className="text-sm font-bold text-slate-800">Temperature</Label>
+            <Input
+              type="number"
+              min={0}
+              max={2}
+              step="0.1"
+              className={cn(INPUT_CLASS, 'mt-2')}
+              value={(isGlobalScope ? globalConfig.llmTemperature : activeAgentConfig?.llmTemperature) ?? ''}
+              onChange={(event) =>
+                updateActiveConfig({
+                  llmTemperature: event.target.value === '' ? null : Number(event.target.value),
+                })
+              }
+              placeholder="0.1"
+            />
+          </div>
+          <div className={cn(SOFT_PANEL_CLASS, 'p-4')}>
             <Label className="text-sm font-bold text-slate-800">Endpoint Protocol</Label>
             <Select
               value={(isGlobalScope ? globalConfig.endpointProtocol : activeAgentConfig?.endpointProtocol) || 'openai_compatible'}

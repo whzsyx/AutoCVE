@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -10,11 +10,39 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api import deps
-from app.models.one_click_cve import OneClickCveBatch, OneClickCveBatchStatus
+from app.models.agent_task import AgentTask, AgentTaskStatus
+from app.models.one_click_cve import (
+    OneClickCveBatch,
+    OneClickCveBatchProject,
+    OneClickCveBatchStatus,
+    OneClickCveProjectStatus,
+)
 from app.models.user import User
+from app.services.agent.task_executor import request_agent_task_cancellation
 from app.services.one_click_cve.runner import run_one_click_cve_batch
+from app.services.one_click_cve.task_queue import (
+    enqueue_one_click_cve_batch,
+    should_use_one_click_cve_worker_queue,
+)
 
 router = APIRouter()
+
+ONE_CLICK_CVE_MODEL_PREFLIGHT_STEP = "\u6b63\u5728\u6d4b\u8bd5\u6a21\u578b\u8fde\u901a\u6027"
+ONE_CLICK_CVE_QUEUED_STEP = "\u7b49\u5f85\u4e00\u952e CVE worker \u6267\u884c"
+ACTIVE_ONE_CLICK_CVE_AGENT_TASK_STATUSES = {
+    AgentTaskStatus.PENDING,
+    AgentTaskStatus.INITIALIZING,
+    AgentTaskStatus.RUNNING,
+    AgentTaskStatus.PLANNING,
+    AgentTaskStatus.INDEXING,
+    AgentTaskStatus.ANALYZING,
+    AgentTaskStatus.VERIFYING,
+    AgentTaskStatus.REPORTING,
+}
+ACTIVE_ONE_CLICK_CVE_PROJECT_STATUSES = {
+    OneClickCveProjectStatus.IMPORTING,
+    OneClickCveProjectStatus.AUDITING,
+}
 
 
 class OneClickCveBatchCreate(BaseModel):
@@ -82,6 +110,25 @@ async def _get_owned_batch(batch_id: str, db: AsyncSession, current_user: User) 
     return batch
 
 
+async def _cancel_active_batch_agent_tasks(db: AsyncSession, batch_id: str) -> None:
+    result = await db.execute(
+        select(AgentTask)
+        .join(OneClickCveBatchProject, OneClickCveBatchProject.agent_task_id == AgentTask.id)
+        .where(
+            OneClickCveBatchProject.batch_id == batch_id,
+            OneClickCveBatchProject.status.in_(ACTIVE_ONE_CLICK_CVE_PROJECT_STATUSES),
+            AgentTask.status.in_(ACTIVE_ONE_CLICK_CVE_AGENT_TASK_STATUSES),
+        )
+    )
+    tasks = list(result.scalars().all())
+    completed_at = datetime.now(timezone.utc)
+    for task in tasks:
+        request_agent_task_cancellation(str(task.id))
+        task.status = AgentTaskStatus.CANCELLED
+        task.completed_at = completed_at
+        task.error_message = task.error_message or "Cancelled by one-click CVE batch cancellation"
+
+
 def _batch_response(batch: OneClickCveBatch) -> OneClickCveBatchResponse:
     projects = list(batch.projects) if "projects" in getattr(batch, "__dict__", {}) else []
     summary = batch.summary_json if isinstance(batch.summary_json, dict) else {}
@@ -109,19 +156,23 @@ async def create_one_click_cve_batch(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> OneClickCveBatchResponse:
+    use_worker_queue = should_use_one_click_cve_worker_queue()
     batch = OneClickCveBatch(
         user_id=current_user.id,
         requested_count=payload.target_count,
         found_count=0,
         status=OneClickCveBatchStatus.PENDING,
-        current_step="等待启动",
+        current_step=ONE_CLICK_CVE_QUEUED_STEP if use_worker_queue else ONE_CLICK_CVE_MODEL_PREFLIGHT_STEP,
         summary_json={"prefer_security_advisory": payload.prefer_security_advisory},
     )
     db.add(batch)
     await db.commit()
     await db.refresh(batch)
 
-    background_tasks.add_task(run_one_click_cve_batch, batch.id)
+    if use_worker_queue:
+        await enqueue_one_click_cve_batch(batch.id)
+    else:
+        background_tasks.add_task(run_one_click_cve_batch, batch.id)
     return _batch_response(batch)
 
 
@@ -160,7 +211,9 @@ async def cancel_one_click_cve_batch(
     batch = await _get_owned_batch(batch_id, db, current_user)
     if batch.status in {OneClickCveBatchStatus.COMPLETED, OneClickCveBatchStatus.FAILED, OneClickCveBatchStatus.EXHAUSTED}:
         return _batch_response(batch)
+    await _cancel_active_batch_agent_tasks(db, batch.id)
     batch.status = OneClickCveBatchStatus.CANCELLED
+    batch.completed_at = datetime.now(timezone.utc)
     batch.current_step = "用户已取消"
     await db.commit()
     await db.refresh(batch)

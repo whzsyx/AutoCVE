@@ -15,7 +15,110 @@ from app.models.project import Project
 from app.models.user import User
 from app.services.one_click_cve import runner as one_click_runner
 from app.services.one_click_cve.discovery import GitHubRepositoryCandidate
-from app.services.one_click_cve.runner import _audit_candidate
+from app.services.one_click_cve.runner import _audit_candidate, run_one_click_cve_batch
+
+
+MODEL_PREFLIGHT_STEP = "\u6b63\u5728\u6d4b\u8bd5\u6a21\u578b\u8fde\u901a\u6027"
+
+
+@pytest.mark.asyncio
+async def test_run_one_click_cve_batch_fails_in_background_when_llm_preflight_fails(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as db:
+        user = User(
+            id="user-1",
+            email="owner@example.com",
+            hashed_password="not-a-real-hash",
+            full_name="Owner",
+            is_active=True,
+        )
+        batch = OneClickCveBatch(
+            id="batch-1",
+            user_id="user-1",
+            requested_count=1,
+            found_count=0,
+            status="pending",
+            current_step=MODEL_PREFLIGHT_STEP,
+        )
+        db.add_all([user, batch])
+        await db.commit()
+
+    async def fail_preflight(db, batch):
+        raise RuntimeError("bad model")
+
+    class FakeDiscoveryService:
+        async def discover_candidates(self, *args, **kwargs):
+            return []
+
+    monkeypatch.setattr(one_click_runner, "AsyncSessionLocal", session_factory)
+    monkeypatch.setattr(one_click_runner, "_preflight_one_click_cve_llm", fail_preflight, raising=False)
+    monkeypatch.setattr(one_click_runner, "GitHubCveDiscoveryService", FakeDiscoveryService)
+
+    await run_one_click_cve_batch("batch-1")
+
+    async with session_factory() as db:
+        batch = await db.get(OneClickCveBatch, "batch-1")
+
+    await engine.dispose()
+
+    assert batch.status == "failed"
+    assert "bad model" in batch.error_message
+
+
+@pytest.mark.asyncio
+async def test_run_one_click_cve_batch_respects_cancel_after_llm_preflight(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as db:
+        user = User(
+            id="user-1",
+            email="owner@example.com",
+            hashed_password="not-a-real-hash",
+            full_name="Owner",
+            is_active=True,
+        )
+        batch = OneClickCveBatch(
+            id="batch-1",
+            user_id="user-1",
+            requested_count=1,
+            found_count=0,
+            status="pending",
+            current_step=MODEL_PREFLIGHT_STEP,
+        )
+        db.add_all([user, batch])
+        await db.commit()
+
+    async def cancel_during_preflight(db, user_id):
+        batch = await db.get(OneClickCveBatch, "batch-1")
+        batch.status = "cancelled"
+        batch.current_step = "用户已取消"
+        await db.commit()
+
+    class FailIfDiscoveryStarts:
+        async def discover_candidates(self, *args, **kwargs):
+            raise AssertionError("discovery must not start after batch cancellation")
+
+    monkeypatch.setattr(one_click_runner, "AsyncSessionLocal", session_factory)
+    monkeypatch.setattr(one_click_runner, "_preflight_one_click_cve_llm", cancel_during_preflight)
+    monkeypatch.setattr(one_click_runner, "GitHubCveDiscoveryService", FailIfDiscoveryStarts)
+
+    await run_one_click_cve_batch("batch-1")
+
+    async with session_factory() as db:
+        batch = await db.get(OneClickCveBatch, "batch-1")
+
+    await engine.dispose()
+
+    assert batch.status == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -215,3 +318,67 @@ async def test_wait_for_task_completion_reads_fresh_task_status():
             await one_click_runner._wait_for_task_completion(db, "task-1", run_task)
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_task_completion_cancels_agent_task_when_batch_is_cancelled(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as setup_db:
+        user = User(
+            id="user-1",
+            email="owner@example.com",
+            hashed_password="not-a-real-hash",
+            full_name="Owner",
+            is_active=True,
+        )
+        project = Project(
+            id="project-1",
+            name="gfx-rs/wgpu",
+            owner_id="user-1",
+            source_type="repository",
+            repository_url="https://github.com/gfx-rs/wgpu",
+        )
+        batch = OneClickCveBatch(
+            id="batch-1",
+            user_id="user-1",
+            requested_count=1,
+            found_count=0,
+            status="cancelled",
+        )
+        task = AgentTask(
+            id="task-1",
+            project_id="project-1",
+            created_by="user-1",
+            name="One-click CVE",
+            version_label="v1.0.0",
+            repository_url_snapshot="https://github.com/gfx-rs/wgpu",
+            status=AgentTaskStatus.RUNNING,
+        )
+        setup_db.add_all([user, project, batch, task])
+        await setup_db.commit()
+
+    cancelled_tasks: list[str] = []
+
+    def fake_request_agent_task_cancellation(task_id: str):
+        cancelled_tasks.append(task_id)
+
+    monkeypatch.setattr(one_click_runner, "request_agent_task_cancellation", fake_request_agent_task_cancellation)
+    monkeypatch.setattr(one_click_runner, "POLL_INTERVAL_SECONDS", 0)
+
+    async with session_factory() as db:
+        with pytest.raises(one_click_runner.OneClickCveBatchCancelled):
+            await one_click_runner._wait_for_task_completion(db, "task-1", batch_id="batch-1")
+
+    async with session_factory() as db:
+        task = await db.get(AgentTask, "task-1")
+
+    await engine.dispose()
+
+    assert cancelled_tasks == ["task-1"]
+    assert task.status == AgentTaskStatus.CANCELLED
+    assert "batch cancellation" in task.error_message

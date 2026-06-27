@@ -34,6 +34,7 @@ services:
       - autocve-network
 
   backend:
+    image: autocve-ui-rebrand-backend:latest
     build:
       context: ./backend
       args:
@@ -44,6 +45,8 @@ services:
         all_proxy: ''
         ALL_PROXY: ''
     restart: unless-stopped
+    cpus: '1.0'
+    mem_limit: 1g
     env_file:
       - path: ./backend/.env
         required: false
@@ -51,6 +54,13 @@ services:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/${POSTGRES_DB_NAME:-autocve}
       REDIS_URL: redis://redis:6379/0
       AGENT_ENABLED: 'true'
+      AGENT_TASK_EXECUTION_MODE: worker
+      AGENT_WORKER_CONCURRENCY: ${AGENT_WORKER_CONCURRENCY:-2}
+      AGENT_WORKER_JOB_TIMEOUT_SECONDS: ${AGENT_WORKER_JOB_TIMEOUT_SECONDS:-1800}
+      AGENT_WORKER_MAX_TRIES: ${AGENT_WORKER_MAX_TRIES:-2}
+      AGENT_EVENT_STREAM_ENABLED: 'true'
+      ONE_CLICK_CVE_EXECUTION_MODE: worker
+      ONE_CLICK_CVE_MAX_REPOSITORY_SIZE_KB: ${ONE_CLICK_CVE_MAX_REPOSITORY_SIZE_KB:-512000}
       SANDBOX_ENABLED: 'true'
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-autocve-sandbox:latest}
       MANAGED_PROJECTS_ROOT: /workspace/projects
@@ -81,6 +91,109 @@ services:
       start_period: 10s
     ports:
       - '8000:8000'
+    volumes:
+      - backend_uploads:/app/uploads
+      - ./skill_library:/app/skill_library
+      - ./report_template_library:/app/report_template_library
+      - ./projects:/workspace/projects
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - autocve-network
+
+  agent-worker:
+    image: autocve-ui-rebrand-backend:latest
+    restart: unless-stopped
+    cpus: '2.0'
+    mem_limit: 4g
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/${POSTGRES_DB_NAME:-autocve}
+      REDIS_URL: redis://redis:6379/0
+      AGENT_ENABLED: 'true'
+      AGENT_TASK_EXECUTION_MODE: worker
+      AGENT_WORKER_CONCURRENCY: ${AGENT_WORKER_CONCURRENCY:-2}
+      AGENT_WORKER_JOB_TIMEOUT_SECONDS: ${AGENT_WORKER_JOB_TIMEOUT_SECONDS:-1800}
+      AGENT_WORKER_MAX_TRIES: ${AGENT_WORKER_MAX_TRIES:-2}
+      AGENT_EVENT_STREAM_ENABLED: 'true'
+      ONE_CLICK_CVE_EXECUTION_MODE: worker
+      SANDBOX_ENABLED: 'true'
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-autocve-sandbox:latest}
+      MANAGED_PROJECTS_ROOT: /workspace/projects
+      HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:-}
+      CHECKMARX_FEATURE_ENABLED: ${CHECKMARX_FEATURE_ENABLED:-false}
+      CHECKMARX_BASE_URL: ${CHECKMARX_BASE_URL:-}
+      CHECKMARX_CLIENT_ID: ${CHECKMARX_CLIENT_ID:-resource_owner_sast_client}
+      CHECKMARX_CLIENT_SECRET: ${CHECKMARX_CLIENT_SECRET:-}
+      CHECKMARX_SCOPE: ${CHECKMARX_SCOPE:-access_control_api sast_api}
+      WORKFLOW_URL: ${WORKFLOW_URL:-}
+      WORKFLOW_API_TOKEN: ${WORKFLOW_API_TOKEN:-}
+      HTTP_PROXY: ''
+      HTTPS_PROXY: ''
+      http_proxy: ''
+      https_proxy: ''
+      NO_PROXY: '*'
+    command: .venv/bin/arq app.worker.agent_worker.WorkerSettings
+    depends_on:
+      backend:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - backend_uploads:/app/uploads
+      - ./skill_library:/app/skill_library
+      - ./report_template_library:/app/report_template_library
+      - ./projects:/workspace/projects
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - autocve-network
+
+  one-click-cve-worker:
+    image: autocve-ui-rebrand-backend:latest
+    restart: unless-stopped
+    cpus: '1.0'
+    mem_limit: 2g
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/${POSTGRES_DB_NAME:-autocve}
+      REDIS_URL: redis://redis:6379/0
+      AGENT_ENABLED: 'true'
+      AGENT_TASK_EXECUTION_MODE: worker
+      AGENT_EVENT_STREAM_ENABLED: 'true'
+      ONE_CLICK_CVE_EXECUTION_MODE: worker
+      ONE_CLICK_CVE_MAX_REPOSITORY_SIZE_KB: ${ONE_CLICK_CVE_MAX_REPOSITORY_SIZE_KB:-512000}
+      ONE_CLICK_CVE_WORKER_CONCURRENCY: ${ONE_CLICK_CVE_WORKER_CONCURRENCY:-1}
+      ONE_CLICK_CVE_WORKER_JOB_TIMEOUT_SECONDS: ${ONE_CLICK_CVE_WORKER_JOB_TIMEOUT_SECONDS:-7200}
+      ONE_CLICK_CVE_WORKER_MAX_TRIES: ${ONE_CLICK_CVE_WORKER_MAX_TRIES:-1}
+      SANDBOX_ENABLED: 'true'
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-autocve-sandbox:latest}
+      MANAGED_PROJECTS_ROOT: /workspace/projects
+      HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:-}
+      CHECKMARX_FEATURE_ENABLED: ${CHECKMARX_FEATURE_ENABLED:-false}
+      CHECKMARX_BASE_URL: ${CHECKMARX_BASE_URL:-}
+      CHECKMARX_CLIENT_ID: ${CHECKMARX_CLIENT_ID:-resource_owner_sast_client}
+      CHECKMARX_CLIENT_SECRET: ${CHECKMARX_CLIENT_SECRET:-}
+      CHECKMARX_SCOPE: ${CHECKMARX_SCOPE:-access_control_api sast_api}
+      WORKFLOW_URL: ${WORKFLOW_URL:-}
+      WORKFLOW_API_TOKEN: ${WORKFLOW_API_TOKEN:-}
+      HTTP_PROXY: ''
+      HTTPS_PROXY: ''
+      http_proxy: ''
+      https_proxy: ''
+      NO_PROXY: '*'
+    command: .venv/bin/arq app.worker.one_click_cve_worker.WorkerSettings
+    depends_on:
+      backend:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - backend_uploads:/app/uploads
       - ./skill_library:/app/skill_library

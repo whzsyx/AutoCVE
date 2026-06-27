@@ -11,7 +11,19 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 import uuid
 
+from app.core.config import settings
+
 logger = logging.getLogger(__name__)
+
+LOW_PRIORITY_EVENT_TYPES = {"thinking_token", "heartbeat", "debug", "progress"}
+CRITICAL_EVENT_TYPES = {
+    "task_complete",
+    "task_error",
+    "task_cancel",
+    "tool_result",
+    "finding_new",
+    "finding_verified",
+}
 
 
 @dataclass
@@ -259,8 +271,10 @@ class EventManager:
     负责事件的存储和检索
     """
     
-    def __init__(self, db_session_factory=None):
+    def __init__(self, db_session_factory=None, queue_max_size: Optional[int] = None, event_stream=None):
         self.db_session_factory = db_session_factory
+        self.queue_max_size = max(1, int(queue_max_size or settings.AGENT_EVENT_QUEUE_MAX_SIZE))
+        self.event_stream = event_stream
         self._event_queues: Dict[str, asyncio.Queue] = {}
         self._event_callbacks: Dict[str, List[Callable]] = {}
     
@@ -282,6 +296,7 @@ class EventManager:
         """添加事件"""
         event_id = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc)
+        metadata = self._normalize_event_metadata(event_type, metadata)
         
         event_data = {
             "id": event_id,
@@ -307,19 +322,25 @@ class EventManager:
                 await self._save_event_to_db(event_data)
             except Exception as e:
                 logger.error(f"Failed to save event to database: {e}")
+
+        if self.event_stream:
+            try:
+                await self.event_stream.publish_event(task_id, event_data)
+            except Exception as e:
+                logger.warning(f"Failed to publish event stream for task {task_id}: {e}")
         
         # 推送到队列（非阻塞）
         if task_id in self._event_queues:
-            try:
-                self._event_queues[task_id].put_nowait(event_data)
+            queue = self._event_queues[task_id]
+            if self._enqueue_event(queue, event_data):
                 # 🔥 DEBUG: 记录重要事件被添加到队列
                 if event_type in ["thinking_start", "thinking_end", "dispatch", "task_complete", "task_error", "tool_call", "tool_result", "llm_action"]:
-                    logger.info(f"[EventQueue] Added {event_type} to queue for task {task_id}, queue size: {self._event_queues[task_id].qsize()}")
+                    logger.info(f"[EventQueue] Added {event_type} to queue for task {task_id}, queue size: {queue.qsize()}")
                 elif event_type == "thinking_token":
                     # 每10个token记录一次
                     if sequence % 10 == 0:
-                        logger.debug(f"[EventQueue] Added thinking_token #{sequence} to queue, size: {self._event_queues[task_id].qsize()}")
-            except asyncio.QueueFull:
+                        logger.debug(f"[EventQueue] Added thinking_token #{sequence} to queue, size: {queue.qsize()}")
+            else:
                 logger.warning(f"Event queue full for task {task_id}, dropping event: {event_type}")
         
         # 调用回调
@@ -334,6 +355,46 @@ class EventManager:
                     logger.error(f"Event callback error: {e}")
         
         return event_id
+
+    def _normalize_event_metadata(self, event_type: str, metadata: Optional[Dict]) -> Optional[Dict]:
+        if not isinstance(metadata, dict):
+            return metadata
+        if event_type == "thinking_token":
+            normalized = dict(metadata)
+            normalized.pop("accumulated", None)
+            return normalized
+        return metadata
+
+    def _enqueue_event(self, queue: asyncio.Queue, event_data: Dict[str, Any]) -> bool:
+        try:
+            queue.put_nowait(event_data)
+            return True
+        except asyncio.QueueFull:
+            event_type = str(event_data.get("event_type") or "")
+            if event_type not in CRITICAL_EVENT_TYPES:
+                return False
+
+            retained: List[Dict[str, Any]] = []
+            dropped_low_priority = False
+            while not queue.empty():
+                queued_event = queue.get_nowait()
+                queued_type = str(queued_event.get("event_type") or "")
+                if not dropped_low_priority and queued_type in LOW_PRIORITY_EVENT_TYPES:
+                    dropped_low_priority = True
+                    continue
+                retained.append(queued_event)
+
+            for retained_event in retained:
+                queue.put_nowait(retained_event)
+
+            if not dropped_low_priority:
+                return False
+
+            try:
+                queue.put_nowait(event_data)
+                return True
+            except asyncio.QueueFull:
+                return False
     
     async def _save_event_to_db(self, event_data: Dict):
         """保存事件到数据库"""
@@ -387,7 +448,7 @@ class EventManager:
         """创建或获取事件队列"""
         if task_id not in self._event_queues:
             # 🔥 使用较大的队列容量，缓存更多 token 事件
-            self._event_queues[task_id] = asyncio.Queue(maxsize=5000)
+            self._event_queues[task_id] = asyncio.Queue(maxsize=self.queue_max_size)
         return self._event_queues[task_id]
     
     def remove_queue(self, task_id: str):
@@ -542,6 +603,9 @@ class EventManager:
         
         # 清理所有回调
         self._event_callbacks.clear()
-        
+
+        if self.event_stream and hasattr(self.event_stream, "close"):
+            await self.event_stream.close()
+
         logger.debug("EventManager closed")
 

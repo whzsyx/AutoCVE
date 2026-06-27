@@ -107,6 +107,72 @@ async def test_discovers_recent_starred_repositories_and_prioritizes_advisories(
     assert candidates[1].has_security_policy is True
 
 
+class RepositorySizeLimitClient:
+    def __init__(self):
+        self.search_queries: list[str] = []
+
+    async def get_json(self, path: str, params: dict | None = None):
+        if path == "/search/repositories":
+            self.search_queries.append(str((params or {}).get("q") or ""))
+            return {
+                "items": [
+                    {
+                        "full_name": "too-big/platform",
+                        "html_url": "https://github.com/too-big/platform",
+                        "description": "Self-hosted platform",
+                        "stargazers_count": 9000,
+                        "pushed_at": "2026-05-18T12:00:00Z",
+                        "updated_at": "2026-05-18T12:00:00Z",
+                        "archived": False,
+                        "fork": False,
+                        "default_branch": "main",
+                        "language": "TypeScript",
+                        "size": 512001,
+                    },
+                    {
+                        "full_name": "right-sized/platform",
+                        "html_url": "https://github.com/right-sized/platform",
+                        "description": "Self-hosted platform",
+                        "stargazers_count": 8000,
+                        "pushed_at": "2026-05-18T12:00:00Z",
+                        "updated_at": "2026-05-18T12:00:00Z",
+                        "archived": False,
+                        "fork": False,
+                        "default_branch": "main",
+                        "language": "TypeScript",
+                        "size": 512000,
+                    },
+                ]
+            }
+        if path.endswith("/security-advisories"):
+            return []
+        if path.endswith("/private-vulnerability-reporting"):
+            return {"enabled": False}
+        if path.endswith("/releases/latest"):
+            return None
+        if path.endswith("/tags"):
+            return []
+        raise AssertionError(f"unexpected path: {path}")
+
+    async def exists(self, path: str) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_discovery_limits_repositories_to_configured_size(monkeypatch):
+    client = RepositorySizeLimitClient()
+    monkeypatch.setattr("app.services.one_click_cve.discovery.settings.ONE_CLICK_CVE_MAX_REPOSITORY_SIZE_KB", 512000)
+    service = GitHubCveDiscoveryService(
+        client=client,
+        now_provider=lambda: datetime(2026, 6, 6, tzinfo=timezone.utc),
+    )
+
+    candidates = await service.discover_candidates(target_count=2)
+
+    assert all("size:<=512000" in query for query in client.search_queries)
+    assert [candidate.full_name for candidate in candidates] == ["right-sized/platform"]
+
+
 class RateLimitedPolicyClient:
     async def get_json(self, path: str, params: dict | None = None):
         if path == "/search/repositories":
