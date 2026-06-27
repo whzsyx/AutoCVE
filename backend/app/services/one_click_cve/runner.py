@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -8,6 +9,7 @@ from uuid import uuid4
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.endpoints.config import _build_test_user_config, _get_user_config_record, _merge_user_config
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.agent_task import AgentFinding, AgentTask, AgentTaskPhase, AgentTaskStatus, FindingStatus
@@ -20,10 +22,18 @@ from app.models.one_click_cve import (
 )
 from app.models.project import Project
 from app.models.user_config import UserConfig
+from app.services.agent.task_executor import request_agent_task_cancellation
+from app.services.agent.task_queue import enqueue_agent_task, should_use_worker_queue
+from app.services.llm.service import LLMService
 from app.services.one_click_cve.discovery import GitHubCveDiscoveryService, GitHubRepositoryCandidate
 
 
 POLL_INTERVAL_SECONDS = 5
+ONE_CLICK_CVE_PREFLIGHT_AGENT = "finding"
+
+
+class OneClickCveBatchCancelled(Exception):
+    pass
 
 
 def _format_exception_message(exc: Exception) -> str:
@@ -36,6 +46,15 @@ async def run_one_click_cve_batch(batch_id: str) -> None:
         if batch is None:
             return
         try:
+            if batch.status == OneClickCveBatchStatus.CANCELLED:
+                await _finish_batch(db, batch, status=OneClickCveBatchStatus.CANCELLED, step="用户已取消")
+                return
+            await _mark_batch_preflight(db, batch)
+            await _preflight_one_click_cve_llm(db, str(batch.user_id))
+            await db.refresh(batch)
+            if batch.status == OneClickCveBatchStatus.CANCELLED:
+                await _finish_batch(db, batch, status=OneClickCveBatchStatus.CANCELLED, step="用户已取消")
+                return
             await _mark_batch_running(db, batch)
             token = await _github_token_for_user(db, batch.user_id)
             if token:
@@ -77,6 +96,11 @@ async def run_one_click_cve_batch(batch_id: str) -> None:
                 status=final_status,
                 step="已达到目标漏洞数量" if final_status == OneClickCveBatchStatus.COMPLETED else "候选项目已扫描完毕",
             )
+        except OneClickCveBatchCancelled:
+            await db.rollback()
+            fresh = await db.get(OneClickCveBatch, batch_id)
+            if fresh is not None:
+                await _finish_batch(db, fresh, status=OneClickCveBatchStatus.CANCELLED, step="用户已取消")
         except Exception as exc:
             await db.rollback()
             fresh = await db.get(OneClickCveBatch, batch_id)
@@ -86,6 +110,47 @@ async def run_one_click_cve_batch(batch_id: str) -> None:
                 fresh.completed_at = datetime.now(timezone.utc)
                 fresh.current_step = "一键CVE执行失败"
                 await db.commit()
+
+
+async def _mark_batch_preflight(db: AsyncSession, batch: OneClickCveBatch) -> None:
+    batch.status = OneClickCveBatchStatus.RUNNING
+    batch.started_at = batch.started_at or datetime.now(timezone.utc)
+    batch.current_step = "正在测试模型连通性"
+    await db.commit()
+    await db.refresh(batch)
+
+
+async def _preflight_one_click_cve_llm(db: AsyncSession, user_id: str) -> None:
+    record = await _get_user_config_record(db, user_id)
+    merged = _merge_user_config(record)
+    test_user_config = _build_test_user_config(merged, ONE_CLICK_CVE_PREFLIGHT_AGENT)
+    llm_service = LLMService(user_config=test_user_config)
+
+    await llm_service.chat_completion(
+        messages=[
+            {"role": "system", "content": "你是模型连通性测试助手，请简短回复。"},
+            {"role": "user", "content": "请只回复：一键 CVE 模型连接成功。"},
+        ],
+        max_tokens=32,
+        agent_type=ONE_CLICK_CVE_PREFLIGHT_AGENT,
+    )
+
+
+async def _raise_if_batch_cancelled(db: AsyncSession, batch_id: str) -> None:
+    batch = await db.get(OneClickCveBatch, batch_id, populate_existing=True)
+    if batch is not None and batch.status == OneClickCveBatchStatus.CANCELLED:
+        raise OneClickCveBatchCancelled()
+
+
+async def _cancel_agent_task_for_batch_cancellation(db: AsyncSession, task_id: str) -> None:
+    request_agent_task_cancellation(str(task_id))
+    task = await db.get(AgentTask, task_id, populate_existing=True)
+    if task is None:
+        return
+    task.status = AgentTaskStatus.CANCELLED
+    task.completed_at = datetime.now(timezone.utc)
+    task.error_message = task.error_message or "Cancelled by one-click CVE batch cancellation"
+    await db.commit()
 
 
 async def _mark_batch_running(db: AsyncSession, batch: OneClickCveBatch) -> None:
@@ -149,6 +214,7 @@ async def _audit_candidate(db: AsyncSession, batch: OneClickCveBatch, candidate:
 
     try:
         project = await _get_or_create_project(db, user_id, candidate)
+        await _raise_if_batch_cancelled(db, batch_id)
         item.project_id = project.id
         item.status = OneClickCveProjectStatus.AUDITING
         batch.current_step = f"正在审计 {candidate.full_name}"
@@ -158,16 +224,31 @@ async def _audit_candidate(db: AsyncSession, batch: OneClickCveBatch, candidate:
         item.agent_task_id = task.id
         await db.commit()
 
-        from app.api.v1.endpoints.agent_tasks import _execute_agent_task
+        if should_use_worker_queue():
+            await enqueue_agent_task(task.id)
+            await _wait_for_task_completion(db, task.id, batch_id=batch_id)
+        else:
+            from app.services.agent.task_executor import execute_agent_task
 
-        run_task = asyncio.create_task(_execute_agent_task(task.id))
-        await _wait_for_task_completion(db, task.id, run_task)
+            run_task = asyncio.create_task(execute_agent_task(task.id))
+            await _wait_for_task_completion(db, task.id, run_task, batch_id=batch_id)
         findings_count = await _count_task_findings(db, task.id)
         item.findings_count = findings_count
         item.status = OneClickCveProjectStatus.COMPLETED
         batch.found_count = await _count_batch_findings(db, batch_id)
         await _refresh_batch_summary(db, batch)
         await db.commit()
+    except OneClickCveBatchCancelled:
+        await db.rollback()
+        item_ref = await db.get(OneClickCveBatchProject, item_id) if item_id else None
+        batch_ref = await db.get(OneClickCveBatch, batch_id)
+        if item_ref is not None:
+            item_ref.status = OneClickCveProjectStatus.CANCELLED
+            item_ref.error_message = "Cancelled by one-click CVE batch cancellation"
+        if batch_ref is not None:
+            batch_ref.current_step = "用户已取消"
+        await db.commit()
+        raise
     except Exception as exc:
         await db.rollback()
         item_ref = await db.get(OneClickCveBatchProject, item_id) if item_id else None
@@ -269,11 +350,33 @@ async def _create_agent_task(
     return task
 
 
-async def _wait_for_task_completion(db: AsyncSession, task_id: str, run_task: asyncio.Task) -> None:
-    while not run_task.done():
+async def _wait_for_task_completion(
+    db: AsyncSession,
+    task_id: str,
+    run_task: asyncio.Task | None = None,
+    *,
+    batch_id: str | None = None,
+) -> None:
+    while run_task is None or not run_task.done():
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
         await db.commit()
-    await run_task
+        if batch_id is not None:
+            try:
+                await _raise_if_batch_cancelled(db, batch_id)
+            except OneClickCveBatchCancelled:
+                await _cancel_agent_task_for_batch_cancellation(db, task_id)
+                if run_task is not None and not run_task.done():
+                    run_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await run_task
+                raise
+        task = await db.get(AgentTask, task_id, populate_existing=True)
+        if task is None:
+            raise RuntimeError("Agent task disappeared during one-click CVE run")
+        if task.status in {AgentTaskStatus.COMPLETED, AgentTaskStatus.FAILED, AgentTaskStatus.CANCELLED}:
+            break
+    if run_task is not None:
+        await run_task
     await db.commit()
     task = await db.get(AgentTask, task_id, populate_existing=True)
     if task is None:

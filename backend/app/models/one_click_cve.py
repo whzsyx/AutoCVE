@@ -23,6 +23,7 @@ class OneClickCveProjectStatus:
     COMPLETED = "completed"
     SKIPPED = "skipped"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class OneClickCveBatch(Base):

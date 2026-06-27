@@ -1,9 +1,7 @@
-"""
-AutoCVE Agent 闂佽楠搁婵嬪Χ鎼粹剝鍊庡┑鐐差嚟婵箖顢氳閹?API
-闂備胶纭堕弲鐐差浖閵娧嗗С?LangGraph 闂?Agent 闂佽楠搁婵嬪Χ鎼粹剝鍊?
-"""
+"""AutoCVE Agent task API."""
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -40,6 +38,18 @@ from app.models.project import Project
 from app.models.user import User
 from app.models.user_config import UserConfig
 from app.services.agent.event_manager import EventManager
+from app.services.agent.event_stream import create_agent_event_stream, event_stream_enabled
+from app.services.agent.task_queue import enqueue_agent_task, should_use_worker_queue
+from app.services.agent.task_executor import (
+    _cancelled_tasks,
+    _running_asyncio_tasks,
+    _running_tasks,
+    _watch_task_cancellation,
+    clear_task_cancellation,
+    execute_agent_task,
+    is_task_cancelled,
+    request_agent_task_cancellation,
+)
 from app.services.agent.streaming import StreamHandler, StreamEvent, StreamEventType
 from app.services.git_ssh_service import GitSSHOperations
 from app.services.skill_file_service import SkillFileService
@@ -54,10 +64,7 @@ router = APIRouter()
 AUTO_MANAGED_REPORT_POSTPROCESSING_ENABLED = True
 
 # Running task registry kept for cancellation and legacy task lookups.
-_running_tasks: Dict[str, Any] = {}
 
-# 婵☆偓绲介崯顖炲汲?闂佸搫顦弲婊堝礉濮椻偓閵嗕線骞嬮悙纰樻灃濡炪倖鎸炬慨鐢告偩?asyncio Tasks闂備焦瀵х粙鎴︽偋韫囨稑鏋侀柕鍫濇椤╂煡骞栫划鍏夊亾瀹曞洨鐣抽梻浣告啞鐢喎鈻斿☉婧夸汗闁搞儜鈧Σ鍫ユ煕椤愵偄澧扮紒鈧?
-_running_asyncio_tasks: Dict[str, asyncio.Task] = {}
 
 
 # ============ Schemas ============
@@ -109,51 +116,43 @@ class AgentTaskResponse(BaseModel):
     commit_sha: Optional[str] = None
     repository_url_snapshot: Optional[str] = None
     
-    # 闂佸搫顦弲婊呯矙閹寸姭鍋撻悷鎵紞缂佽鲸甯￠幃銏犆虹拠鍙夊€?
     total_files: int = 0
     indexed_files: int = 0
     analyzed_files: int = 0
     files_with_findings: int = 0
     total_chunks: int = 0
     
-    # Agent 缂傚倸鍊烽懗鍫曞窗閺囥埄鏁?
     total_iterations: int = 0
     tool_calls_count: int = 0
     tokens_used: int = 0
     
-    # 闂備礁鎲￠悷锕傚垂瑜版帞宓侀柛銉㈡櫇绾惧ジ鏌ｉ弮鈧鍧楀触閳ь剟姊洪幐搴ｂ槈闁绘妫濆畷銉р偓锝庡厴閸嬫捁銇愰幒鍡椾壕婵炴垶澹曢幏锛勭磽娴ｅ壊妲哥紒澶嬫尦楠炲﹪鏁撻悩鑼缎曢悗骞垮劚缁绘帞绮?
     findings_count: int = 0
-    total_findings: int = 0  # 闂備胶顭堢换鎺楀储瑜旈、娆撳箛椤旂懓浜炬繛鎴炵懐濞堟洘銇?
+    total_findings: int = 0
     verified_count: int = 0
-    verified_findings: int = 0  # 闂備胶顭堢换鎺楀储瑜旈、娆撳箛椤旂懓浜炬繛鎴炵懐濞堟洘銇?
+    verified_findings: int = 0
     false_positive_count: int = 0
     
-    # 濠电偞鍨堕幐鍫曞磿閻㈢闂柛婵勫劤閻瑩鎮楅敐搴濈盎妞ゆ柨锕︾槐鎾存媴閸濆嫭鐏嗗?
     critical_count: int = 0
     high_count: int = 0
     medium_count: int = 0
     low_count: int = 0
     
-    # 闂佽崵濮村ú銈団偓姘煎墴瀹?
     quality_score: float = 0.0
     security_score: Optional[float] = None
     
     # Progress metrics
     progress_percentage: float = 0.0
     
-    # 闂備礁鎼崯顐︽偉閻撳宫?
     created_at: datetime
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     
-    # 闂傚倷鐒﹀妯肩矓閸洘鍋?
     audit_scope: Optional[dict] = None
     target_vulnerabilities: Optional[List[str]] = None
     verification_level: Optional[str] = None
     exclude_patterns: Optional[List[str]] = None
     target_files: Optional[List[str]] = None
     
-    # 闂傚倷鐒︾€笛囨偡閵娾晩鏁嬮柕鍫濇閳瑰秹鏌嶉埡浣告殨缂?
     error_message: Optional[str] = None
     runtime_session_id: Optional[str] = None
     finding_runtime_stack: str = FindingRuntimeStack.RUNTIME.value
@@ -271,33 +270,54 @@ class DebugTraceResponse(BaseModel):
     handoffs: List[Dict[str, Any]]
 
 
-# ============ 闂備礁鎲￠懝鐐殽濮濆被浜归悗娑欘焽椤╃兘鎮归崶銊ョ祷妞ゎ偁鍊濋弻鐔虹箔濞戞ɑ锛嶉柡鈧?============
 
-# 闂佸搫顦弲婊堝礉濮椻偓閵嗕線骞嬮悙纰樻灃濡炪倖鎸炬慨鐢告偩闁秵鐓曢柡鍌濐嚙婵′粙鏌嶈閸忔盯鎮為敂鑺ユ珷闁伙絽鏈崑姗€鎮橀悙璺盒撻柣?
 _running_orchestrators: Dict[str, Any] = {}
-# 闂佸搫顦弲婊堝礉濮椻偓閵嗕線骞嬮悙纰樻灃濡炪倖鎸炬慨鐢告偩閸楃伝鐟邦煥閸愭儳鍓┑鐐叉閸ㄨ崵鍒掓繝姘櫖闁告洦鍓欓埀顒傚仱閺屾盯鏁愭惔锝呭辅缂備浇椴搁悷鈺呭箖娴犲惟闁靛牆娲╂竟?SSE 婵犵數鍋熺换婵堟閵堝洦顫?
 _running_event_managers: Dict[str, EventManager] = {}
-# 婵☆偓绲介崯顖炲汲?闁诲海鎳撻幉陇銇愰崘顓滀汗闁搞儜鈧Σ鍫ユ煕椤愮姴鐏柣锝呭船闇夐柣妯硅閸ゆ瑥鈹戦鎯ф灈婵﹤娼″畷鍗炍旀担绯曞亾閵堝鐓ユ繛鎴烆焽婢с垽鏌℃担闈涒偓鏍矉瀹ュ棙鍎熼柍銉﹀墯閺嬧偓缂傚倸鍊搁崰姘跺窗濡ゅ懎绠归梺鍨儐婵瓨绻濇繝鍌涘櫤闁伙綁浜堕弻娑樷枎閹邦喖顫х紓浣割槸閸㈣尪鐏嬮梺閫炲苯澧寸€殿喖顭锋俊鐑筋敍濠婂拋妲?
-_cancelled_tasks: Set[str] = set()
+ONE_CLICK_CVE_DEFAULT_DISABLED_AGENTS = {"scan", "triage", "verification"}
+ONE_CLICK_CVE_DEFAULT_ENABLED_AGENTS = {"finding"}
 
 
-def is_task_cancelled(task_id: str) -> bool:
-    """Check whether a task has been cancelled."""
-    return task_id in _cancelled_tasks
+async def _schedule_agent_task(background_tasks: BackgroundTasks, task_id: str) -> None:
+    if should_use_worker_queue():
+        await enqueue_agent_task(task_id)
+        return
+    background_tasks.add_task(_execute_agent_task, task_id)
+
+
+def _is_one_click_cve_scope(audit_scope: Optional[Dict[str, Any]]) -> bool:
+    return isinstance(audit_scope, dict) and isinstance(audit_scope.get("one_click_cve"), dict)
+
+
+def _apply_workflow_agent_states(target: Dict[str, Any], states: Any, *, missing_enabled_value: bool = True) -> None:
+    if isinstance(states, dict):
+        for agent in WORKFLOW_AGENT_TYPES:
+            raw_state = states.get(agent)
+            if isinstance(raw_state, dict):
+                target["agentStates"][agent]["enabled"] = bool(raw_state.get("enabled", missing_enabled_value))
+            elif isinstance(raw_state, bool):
+                target["agentStates"][agent]["enabled"] = raw_state
+
+
+def _enforce_one_click_cve_workflow(target: Dict[str, Any]) -> None:
+    for agent in ONE_CLICK_CVE_DEFAULT_DISABLED_AGENTS:
+        target["agentStates"][agent]["enabled"] = False
+    for agent in ONE_CLICK_CVE_DEFAULT_ENABLED_AGENTS:
+        target["agentStates"][agent]["enabled"] = True
 
 
 def _merge_task_workflow_config(global_workflow: Optional[Dict[str, Any]], audit_scope: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    merged = _normalize_workflow_config(global_workflow)
-    task_workflow = audit_scope.get("workflow") if isinstance(audit_scope, dict) else None
-    incoming_states = task_workflow.get("agentStates", {}) if isinstance(task_workflow, dict) else {}
+    one_click_cve_scope = _is_one_click_cve_scope(audit_scope)
+    if one_click_cve_scope:
+        merged = _normalize_workflow_config({})
+    else:
+        merged = _normalize_workflow_config(global_workflow)
 
-    if isinstance(incoming_states, dict):
-        for agent in WORKFLOW_AGENT_TYPES:
-            raw_state = incoming_states.get(agent)
-            if isinstance(raw_state, dict):
-                merged["agentStates"][agent]["enabled"] = bool(raw_state.get("enabled", True))
-            elif isinstance(raw_state, bool):
-                merged["agentStates"][agent]["enabled"] = raw_state
+    task_workflow = audit_scope.get("workflow") if isinstance(audit_scope, dict) else None
+    task_states = task_workflow.get("agentStates", {}) if isinstance(task_workflow, dict) else {}
+    _apply_workflow_agent_states(merged, task_states)
+
+    if one_click_cve_scope:
+        _enforce_one_click_cve_workflow(merged)
 
     for agent in WORKFLOW_LOCKED_AGENTS:
         merged["agentStates"][agent]["enabled"] = True
@@ -1003,7 +1023,7 @@ def _disabled_managed_report_stats(findings: Optional[List[AgentFinding]] = None
 
 
 
-async def _execute_agent_task(task_id: str):
+async def _execute_agent_task_impl(task_id: str):
     """Execute an agent audit task in the background."""
     import time
     from app.core.config import settings
@@ -1025,7 +1045,11 @@ async def _execute_agent_task(task_id: str):
     sandbox_manager = SandboxManager()
     await sandbox_manager.initialize()
 
-    event_manager = EventManager(db_session_factory=async_session_factory)
+    event_stream = create_agent_event_stream() if event_stream_enabled() else None
+    event_manager = EventManager(
+        db_session_factory=async_session_factory,
+        event_stream=event_stream,
+    )
     event_manager.create_queue(task_id)
     event_emitter = AgentEventEmitter(task_id, event_manager)
     _running_event_managers[task_id] = event_manager
@@ -1043,6 +1067,9 @@ async def _execute_agent_task(task_id: str):
             if not project:
                 logger.error(f"Project not found for task {task_id}")
                 return
+
+            if task.status == AgentTaskStatus.CANCELLED or is_task_cancelled(task_id):
+                raise asyncio.CancelledError("Task cancelled before execution")
 
             task.status = AgentTaskStatus.RUNNING
             task.started_at = datetime.now(timezone.utc)
@@ -1230,7 +1257,10 @@ async def _execute_agent_task(task_id: str):
 
             runtime_agent_config = dict(task.agent_config or {})
             finding_runtime_stack = runtime_agent_config.get("finding_runtime_stack") or "legacy"
-            workflow_config = _merge_task_workflow_config((other_config or {}).get("workflowConfig", {}), task.audit_scope)
+            global_workflow_config = (other_config or {}).get("workflowConfig", {})
+            if _is_one_click_cve_scope(task.audit_scope):
+                global_workflow_config = await _get_raw_user_workflow_config(db, task.created_by)
+            workflow_config = _merge_task_workflow_config(global_workflow_config, task.audit_scope)
             workflow_config["finding_runtime_stack"] = finding_runtime_stack
             input_data = {
                 "project_id": str(project.id),
@@ -1257,9 +1287,19 @@ async def _execute_agent_task(task_id: str):
 
             run_task = asyncio.create_task(orchestrator.run(input_data))
             _running_asyncio_tasks[task_id] = run_task
+            cancel_watch_task = asyncio.create_task(
+                _watch_task_cancellation(
+                    task_id=task_id,
+                    run_task=run_task,
+                    session_factory=async_session_factory,
+                )
+            )
             try:
                 result = await run_task
             finally:
+                cancel_watch_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await cancel_watch_task
                 _running_asyncio_tasks.pop(task_id, None)
 
             await db.refresh(task)
@@ -1378,6 +1418,13 @@ async def _execute_agent_task(task_id: str):
                 await sandbox_manager.cleanup()
             except Exception:
                 logger.debug("Sandbox cleanup skipped", exc_info=True)
+            try:
+                await event_manager.close()
+            except Exception:
+                logger.debug("Event manager cleanup skipped", exc_info=True)
+
+
+_execute_agent_task = execute_agent_task
 
 
 async def _get_user_config(db: AsyncSession, user_id: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -1394,6 +1441,25 @@ async def _get_user_config(db: AsyncSession, user_id: Optional[str]) -> Optional
         logger.warning(f"Failed to get user config: {e}")
 
     return None
+
+
+async def _get_raw_user_workflow_config(db: AsyncSession, user_id: Optional[str]) -> Dict[str, Any]:
+    """Load only workflow settings explicitly persisted by the user."""
+    if not user_id:
+        return {}
+
+    try:
+        from app.api.v1.endpoints.config import _get_user_config_record
+
+        record = await _get_user_config_record(db, user_id)
+        if record is None or not record.other_config:
+            return {}
+        other_config = json.loads(record.other_config)
+        workflow_config = other_config.get("workflowConfig")
+        return workflow_config if isinstance(workflow_config, dict) else {}
+    except Exception as exc:
+        logger.warning(f"Failed to get raw user workflow config: {exc}")
+        return {}
 
 
 async def _initialize_tools(
@@ -2357,7 +2423,7 @@ async def create_agent_task(
     db.add(task)
     await db.commit()
     await db.refresh(task)
-    background_tasks.add_task(_execute_agent_task, task.id)
+    await _schedule_agent_task(background_tasks, task.id)
     logger.info(f"Created agent task {task.id} for project {project.name}")
     return task
 
@@ -2624,7 +2690,7 @@ async def resume_agent_task(
     _cancelled_tasks.discard(task_id)
     _prepare_task_for_resume(task)
     await db.commit()
-    background_tasks.add_task(_execute_agent_task, task.id)
+    await _schedule_agent_task(background_tasks, task.id)
     logger.info(f"Resumed agent task {task.id}")
     return {
         "message": "Task resumed",
@@ -2651,23 +2717,7 @@ async def cancel_agent_task(
     if task.status in [AgentTaskStatus.COMPLETED, AgentTaskStatus.FAILED, AgentTaskStatus.CANCELLED]:
         raise HTTPException(status_code=400, detail="Task is already finished")
 
-    _cancelled_tasks.add(task_id)
-    runner = _running_tasks.get(task_id)
-    if runner and hasattr(runner, "cancel"):
-        runner.cancel()
-
-    from app.services.agent.core.graph_controller import stop_all_agents
-
-    try:
-        stop_result = stop_all_agents(exclude_root=False)
-        logger.info(f"[Cancel] Stopped all agents: {stop_result}")
-    except Exception as exc:
-        logger.warning(f"[Cancel] Failed to stop agents via registry: {exc}")
-
-    asyncio_task = _running_asyncio_tasks.get(task_id)
-    if asyncio_task and not asyncio_task.done():
-        asyncio_task.cancel()
-
+    request_agent_task_cancellation(task_id)
     task.status = AgentTaskStatus.CANCELLED
     task.completed_at = datetime.now(timezone.utc)
     await db.commit()
@@ -2779,6 +2829,22 @@ async def stream_agent_with_thinking(
             skip_types.update({"thinking_start", "thinking_token", "thinking_end"})
         if not include_tool_calls:
             skip_types.update({"tool_call_start", "tool_call_input", "tool_call_output", "tool_call_end"})
+
+        if event_stream_enabled():
+            event_stream = create_agent_event_stream()
+            try:
+                async for event in event_stream.stream_events(task_id, after_sequence=after_sequence):
+                    event_type = event.get("event_type") or event.get("type")
+                    if event_type in skip_types:
+                        continue
+                    yield format_sse_event(event)
+                    if event_type == "thinking_token":
+                        await asyncio.sleep(0.01)
+                return
+            except Exception as exc:
+                logger.error(f"Redis event stream error: {exc}", exc_info=True)
+            finally:
+                await event_stream.close()
 
         if event_manager:
             logger.debug(f"Stream {task_id}: Using in-memory event manager")
