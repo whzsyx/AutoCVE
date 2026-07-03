@@ -232,6 +232,27 @@ After the services start, access them through the following addresses:
 
 ---
 
+## 🙏 Acknowledgements
+
+> [!NOTE]
+>
+> In its early development stage, AutoCVE referenced and learned from the engineering architecture of [DeepAudit](https://github.com/lintsinghua/DeepAudit), which provided important support for the project’s rapid start.
+>
+> We would like to express our sincere gratitude to the DeepAudit project and its developers.
+
+<details>
+<summary><strong>🧩 About AutoCVE’s Engineering Design</strong></summary>
+
+<br>
+
+Building on engineering experience from relevant open-source projects, AutoCVE has been redesigned and customized for the automated CVE discovery scenario at the overall Agent engineering level. Key work includes audit workflow orchestration, ReAct Loop engineering reconstruction, state machine scheduling, loop control and termination judgment, tool orchestration, report generation, the Skill mechanism, and conversational interaction capabilities.
+
+Going forward, AutoCVE will continue to iterate and improve, further enhancing its automation, audit depth, and practical effectiveness in vulnerability discovery scenarios.
+
+</details>
+
+---
+
 ## License
 
 This project is released under [AGPL-3.0](./LICENSE).
