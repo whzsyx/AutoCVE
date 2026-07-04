@@ -13,6 +13,10 @@ export interface ZipFileMeta {
   has_persistent_source?: boolean;
   persistent_source_path?: string;
   persistent_source_updated_at?: string;
+  import_status?: 'processing' | 'ready' | 'error' | string;
+  import_error?: string | null;
+  import_started_at?: string;
+  import_completed_at?: string;
 }
 
 /**
@@ -33,6 +37,7 @@ export async function getZipFileInfo(projectId: string): Promise<ZipFileMeta> {
  */
 export async function uploadZipFile(projectId: string, file: File, options?: {
   keepArchive?: boolean;
+  onUploadProgress?: (progress: number) => void;
 }): Promise<{
   success: boolean;
   message?: string;
@@ -42,6 +47,8 @@ export async function uploadZipFile(projectId: string, file: File, options?: {
   has_persistent_source?: boolean;
   persistent_source_path?: string;
   persistent_source_updated_at?: string;
+  import_status?: string;
+  import_error?: string | null;
 }> {
   const formData = new FormData();
   formData.append('file', file);
@@ -51,6 +58,10 @@ export async function uploadZipFile(projectId: string, file: File, options?: {
     const response = await apiClient.post(`/projects/${projectId}/zip`, formData, {
       headers: {
         'Content-Type': 'multipart/form-data',
+      },
+      onUploadProgress: (event) => {
+        if (!options?.onUploadProgress || !event.total) return;
+        options.onUploadProgress(Math.round((event.loaded / event.total) * 100));
       },
     });
     return {
@@ -62,6 +73,8 @@ export async function uploadZipFile(projectId: string, file: File, options?: {
       has_persistent_source: response.data.has_persistent_source,
       persistent_source_path: response.data.persistent_source_path,
       persistent_source_updated_at: response.data.persistent_source_updated_at,
+      import_status: response.data.import_status,
+      import_error: response.data.import_error,
     };
   } catch (error: any) {
     console.error('上传ZIP文件失败:', error);
@@ -70,6 +83,43 @@ export async function uploadZipFile(projectId: string, file: File, options?: {
       message: error.response?.data?.detail || '上传失败',
     };
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+export async function waitForZipImport(
+  projectId: string,
+  options?: {
+    intervalMs?: number;
+    timeoutMs?: number;
+    onStatus?: (info: ZipFileMeta) => void;
+  }
+): Promise<ZipFileMeta> {
+  const intervalMs = options?.intervalMs ?? 1200;
+  const timeoutMs = options?.timeoutMs ?? 10 * 60 * 1000;
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const info = await getZipFileInfo(projectId);
+    options?.onStatus?.(info);
+
+    if (info.import_status === 'error') {
+      throw new Error(info.import_error || 'ZIP source import failed');
+    }
+    if (info.import_status === 'processing') {
+      await sleep(intervalMs);
+      continue;
+    }
+    if (info.import_status === 'ready' || info.has_persistent_source) {
+      return info;
+    }
+
+    await sleep(intervalMs);
+  }
+
+  throw new Error('ZIP source import timed out');
 }
 
 /**

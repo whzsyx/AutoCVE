@@ -39,6 +39,14 @@ class AgentEventData:
     finding_id: Optional[str] = None
     tokens_used: int = 0
     metadata: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        if self.tokens_used or not isinstance(self.metadata, dict):
+            return
+        try:
+            self.tokens_used = int(self.metadata.get("tokens_used") or 0)
+        except (TypeError, ValueError):
+            self.tokens_used = 0
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -297,6 +305,11 @@ class EventManager:
         event_id = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc)
         metadata = self._normalize_event_metadata(event_type, metadata)
+        if not tokens_used and isinstance(metadata, dict):
+            try:
+                tokens_used = int(metadata.get("tokens_used") or 0)
+            except (TypeError, ValueError):
+                tokens_used = 0
         
         event_data = {
             "id": event_id,

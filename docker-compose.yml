@@ -64,6 +64,7 @@ services:
       SANDBOX_ENABLED: 'true'
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-autocve-sandbox:latest}
       MANAGED_PROJECTS_ROOT: /workspace/projects
+      PROJECT_SOURCE_STORAGE_PATH: /app/uploads/project_sources
       HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:-}
       CHECKMARX_FEATURE_ENABLED: ${CHECKMARX_FEATURE_ENABLED:-false}
       CHECKMARX_BASE_URL: ${CHECKMARX_BASE_URL:-}
@@ -121,6 +122,7 @@ services:
       SANDBOX_ENABLED: 'true'
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-autocve-sandbox:latest}
       MANAGED_PROJECTS_ROOT: /workspace/projects
+      PROJECT_SOURCE_STORAGE_PATH: /app/uploads/project_sources
       HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:-}
       CHECKMARX_FEATURE_ENABLED: ${CHECKMARX_FEATURE_ENABLED:-false}
       CHECKMARX_BASE_URL: ${CHECKMARX_BASE_URL:-}
@@ -173,6 +175,7 @@ services:
       SANDBOX_ENABLED: 'true'
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-autocve-sandbox:latest}
       MANAGED_PROJECTS_ROOT: /workspace/projects
+      PROJECT_SOURCE_STORAGE_PATH: /app/uploads/project_sources
       HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT:-}
       CHECKMARX_FEATURE_ENABLED: ${CHECKMARX_FEATURE_ENABLED:-false}
       CHECKMARX_BASE_URL: ${CHECKMARX_BASE_URL:-}
@@ -214,6 +217,7 @@ services:
         all_proxy: ''
         ALL_PROXY: ''
         VITE_ENABLE_CHECKMARX_SCAN: ${VITE_ENABLE_CHECKMARX_SCAN:-false}
+        VITE_APP_VERSION: ${VITE_APP_VERSION:-}
     restart: unless-stopped
     environment:
       VITE_API_BASE_URL: /api/v1

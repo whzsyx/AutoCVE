@@ -1,8 +1,8 @@
 # =============================================
-# AutoCVE V1.0.0 生产环境一键部署配置（国内加速版）
+# AutoCVE V1.0.4 生产环境一键部署配置（国内加速版）
 # =============================================
 # 使用南京大学镜像站加速拉取 GHCR 镜像
-# 部署命令: curl -fsSL https://raw.githubusercontent.com/larlarua/AutoCVE/v1.0.0/docker-compose.prod.cn.yml | docker compose -f - up -d
+# 部署命令: curl -fsSL https://raw.githubusercontent.com/larlarua/AutoCVE/v1.0.4/docker-compose.prod.cn.yml | docker compose -f - up -d
 # 镜像加速说明：
 # - 原始地址：ghcr.io
 # - 加速地址：ghcr.nju.edu.cn（南京大学开源镜像站）
@@ -16,7 +16,7 @@ services:
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=autocve
+      - POSTGRES_DB=${POSTGRES_DB_NAME:-autocve}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -39,17 +39,20 @@ services:
       - autocve-network
 
   backend:
-    image: ghcr.nju.edu.cn/larlarua/autocve-backend:v1.0.0
+    image: ghcr.nju.edu.cn/larlarua/autocve-backend:v1.0.4
     restart: unless-stopped
     cpus: "1.0"
     mem_limit: 1g
     volumes:
       - backend_uploads:/app/uploads
+      - skill_library:/app/skill_library
+      - report_template_library:/app/report_template_library
+      - ./projects:/workspace/projects
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/autocve
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/${POSTGRES_DB_NAME:-autocve}
       - REDIS_URL=redis://redis:6379/0
       - AGENT_ENABLED=true
       - AGENT_TASK_EXECUTION_MODE=worker
@@ -60,7 +63,17 @@ services:
       - ONE_CLICK_CVE_EXECUTION_MODE=worker
       - ONE_CLICK_CVE_MAX_REPOSITORY_SIZE_KB=${ONE_CLICK_CVE_MAX_REPOSITORY_SIZE_KB:-512000}
       - SANDBOX_ENABLED=true
-      - SANDBOX_IMAGE=ghcr.nju.edu.cn/larlarua/autocve-sandbox:v1.0.0
+      - SANDBOX_IMAGE=ghcr.nju.edu.cn/larlarua/autocve-sandbox:v1.0.4
+      - MANAGED_PROJECTS_ROOT=/workspace/projects
+      - PROJECT_SOURCE_STORAGE_PATH=/app/uploads/project_sources
+      - HOST_PROJECT_ROOT=${HOST_PROJECT_ROOT:-}
+      - CHECKMARX_FEATURE_ENABLED=${CHECKMARX_FEATURE_ENABLED:-false}
+      - CHECKMARX_BASE_URL=${CHECKMARX_BASE_URL:-}
+      - CHECKMARX_CLIENT_ID=${CHECKMARX_CLIENT_ID:-resource_owner_sast_client}
+      - CHECKMARX_CLIENT_SECRET=${CHECKMARX_CLIENT_SECRET:-}
+      - CHECKMARX_SCOPE=${CHECKMARX_SCOPE:-access_control_api sast_api}
+      - WORKFLOW_URL=${WORKFLOW_URL:-}
+      - WORKFLOW_API_TOKEN=${WORKFLOW_API_TOKEN:-}
       # LLM 配置 - 请根据需要修改
       - LLM_PROVIDER=${LLM_PROVIDER:-openai}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o}
@@ -69,7 +82,10 @@ services:
       # 禁用代理
       - HTTP_PROXY=
       - HTTPS_PROXY=
+      - http_proxy=
+      - https_proxy=
       - NO_PROXY=*
+      - no_proxy=*
     depends_on:
       db:
         condition: service_healthy
@@ -82,15 +98,18 @@ services:
 
   # 数据库迁移服务 - 在后端启动前自动执行
   agent-worker:
-    image: ghcr.nju.edu.cn/larlarua/autocve-backend:v1.0.0
+    image: ghcr.nju.edu.cn/larlarua/autocve-backend:v1.0.4
     restart: unless-stopped
     cpus: "2.0"
     mem_limit: 4g
     volumes:
       - backend_uploads:/app/uploads
+      - skill_library:/app/skill_library
+      - report_template_library:/app/report_template_library
+      - ./projects:/workspace/projects
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/autocve
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/${POSTGRES_DB_NAME:-autocve}
       - REDIS_URL=redis://redis:6379/0
       - AGENT_ENABLED=true
       - AGENT_TASK_EXECUTION_MODE=worker
@@ -100,14 +119,27 @@ services:
       - AGENT_EVENT_STREAM_ENABLED=true
       - ONE_CLICK_CVE_EXECUTION_MODE=worker
       - SANDBOX_ENABLED=true
-      - SANDBOX_IMAGE=ghcr.nju.edu.cn/larlarua/autocve-sandbox:v1.0.0
+      - SANDBOX_IMAGE=ghcr.nju.edu.cn/larlarua/autocve-sandbox:v1.0.4
+      - MANAGED_PROJECTS_ROOT=/workspace/projects
+      - PROJECT_SOURCE_STORAGE_PATH=/app/uploads/project_sources
+      - HOST_PROJECT_ROOT=${HOST_PROJECT_ROOT:-}
+      - CHECKMARX_FEATURE_ENABLED=${CHECKMARX_FEATURE_ENABLED:-false}
+      - CHECKMARX_BASE_URL=${CHECKMARX_BASE_URL:-}
+      - CHECKMARX_CLIENT_ID=${CHECKMARX_CLIENT_ID:-resource_owner_sast_client}
+      - CHECKMARX_CLIENT_SECRET=${CHECKMARX_CLIENT_SECRET:-}
+      - CHECKMARX_SCOPE=${CHECKMARX_SCOPE:-access_control_api sast_api}
+      - WORKFLOW_URL=${WORKFLOW_URL:-}
+      - WORKFLOW_API_TOKEN=${WORKFLOW_API_TOKEN:-}
       - LLM_PROVIDER=${LLM_PROVIDER:-openai}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o}
       - LLM_API_KEY=${LLM_API_KEY:-your-api-key-here}
       - LLM_BASE_URL=${LLM_BASE_URL:-}
       - HTTP_PROXY=
       - HTTPS_PROXY=
+      - http_proxy=
+      - https_proxy=
       - NO_PROXY=*
+      - no_proxy=*
     command: [".venv/bin/arq", "app.worker.agent_worker.WorkerSettings"]
     depends_on:
       db:
@@ -120,15 +152,18 @@ services:
       - autocve-network
 
   one-click-cve-worker:
-    image: ghcr.nju.edu.cn/larlarua/autocve-backend:v1.0.0
+    image: ghcr.nju.edu.cn/larlarua/autocve-backend:v1.0.4
     restart: unless-stopped
     cpus: "1.0"
     mem_limit: 2g
     volumes:
       - backend_uploads:/app/uploads
+      - skill_library:/app/skill_library
+      - report_template_library:/app/report_template_library
+      - ./projects:/workspace/projects
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/autocve
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/${POSTGRES_DB_NAME:-autocve}
       - REDIS_URL=redis://redis:6379/0
       - AGENT_ENABLED=true
       - AGENT_TASK_EXECUTION_MODE=worker
@@ -139,14 +174,27 @@ services:
       - ONE_CLICK_CVE_WORKER_JOB_TIMEOUT_SECONDS=${ONE_CLICK_CVE_WORKER_JOB_TIMEOUT_SECONDS:-7200}
       - ONE_CLICK_CVE_WORKER_MAX_TRIES=${ONE_CLICK_CVE_WORKER_MAX_TRIES:-1}
       - SANDBOX_ENABLED=true
-      - SANDBOX_IMAGE=ghcr.nju.edu.cn/larlarua/autocve-sandbox:v1.0.0
+      - SANDBOX_IMAGE=ghcr.nju.edu.cn/larlarua/autocve-sandbox:v1.0.4
+      - MANAGED_PROJECTS_ROOT=/workspace/projects
+      - PROJECT_SOURCE_STORAGE_PATH=/app/uploads/project_sources
+      - HOST_PROJECT_ROOT=${HOST_PROJECT_ROOT:-}
+      - CHECKMARX_FEATURE_ENABLED=${CHECKMARX_FEATURE_ENABLED:-false}
+      - CHECKMARX_BASE_URL=${CHECKMARX_BASE_URL:-}
+      - CHECKMARX_CLIENT_ID=${CHECKMARX_CLIENT_ID:-resource_owner_sast_client}
+      - CHECKMARX_CLIENT_SECRET=${CHECKMARX_CLIENT_SECRET:-}
+      - CHECKMARX_SCOPE=${CHECKMARX_SCOPE:-access_control_api sast_api}
+      - WORKFLOW_URL=${WORKFLOW_URL:-}
+      - WORKFLOW_API_TOKEN=${WORKFLOW_API_TOKEN:-}
       - LLM_PROVIDER=${LLM_PROVIDER:-openai}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o}
       - LLM_API_KEY=${LLM_API_KEY:-your-api-key-here}
       - LLM_BASE_URL=${LLM_BASE_URL:-}
       - HTTP_PROXY=
       - HTTPS_PROXY=
+      - http_proxy=
+      - https_proxy=
       - NO_PROXY=*
+      - no_proxy=*
     command: [".venv/bin/arq", "app.worker.one_click_cve_worker.WorkerSettings"]
     depends_on:
       db:
@@ -159,10 +207,10 @@ services:
       - autocve-network
 
   db-migrate:
-    image: ghcr.nju.edu.cn/larlarua/autocve-backend:v1.0.0
+    image: ghcr.nju.edu.cn/larlarua/autocve-backend:v1.0.4
     restart: "no"
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/autocve
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/${POSTGRES_DB_NAME:-autocve}
     command: [".venv/bin/alembic", "upgrade", "head"]
     depends_on:
       db:
@@ -171,7 +219,7 @@ services:
       - autocve-network
 
   frontend:
-    image: ghcr.nju.edu.cn/larlarua/autocve-frontend:v1.0.0
+    image: ghcr.nju.edu.cn/larlarua/autocve-frontend:v1.0.4
     restart: unless-stopped
     ports:
       - "3000:80"
@@ -189,7 +237,7 @@ services:
 
   # 预拉取沙箱镜像（后端会按需调用）
   sandbox-pull:
-    image: ghcr.nju.edu.cn/larlarua/autocve-sandbox:v1.0.0
+    image: ghcr.nju.edu.cn/larlarua/autocve-sandbox:v1.0.4
     restart: "no"
     command: echo "Sandbox image ready"
 
@@ -200,4 +248,6 @@ networks:
 volumes:
   postgres_data:
   backend_uploads:
+  skill_library:
+  report_template_library:
   redis_data:

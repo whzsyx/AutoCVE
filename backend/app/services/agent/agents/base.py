@@ -321,6 +321,17 @@ class BaseAgent(ABC):
             return True
         return False
 
+    @property
+    def total_tokens_used(self) -> int:
+        return int(self._total_tokens or 0)
+
+    def get_stats(self) -> Dict[str, int]:
+        return {
+            "iterations": int(self._iteration or 0),
+            "tool_calls": int(self._tool_calls or 0),
+            "tokens_used": self.total_tokens_used,
+        }
+
     def receive_handoff(self, handoff: TaskHandoff) -> None:
         self._incoming_handoff = handoff
 
@@ -608,6 +619,12 @@ class BaseAgent(ABC):
                     accumulated = chunk.get("content", accumulated)
                     usage = chunk.get("usage") or {}
                     total_tokens = usage.get("total_tokens", 0)
+                    if total_tokens:
+                        await self.emit_event(
+                            "llm_usage",
+                            "LLM token usage recorded",
+                            metadata={"tokens_used": total_tokens, "usage": usage},
+                        )
                     break
                 elif chunk.get("type") == "error":
                     await flush_token_buffer(force=True)
@@ -616,6 +633,12 @@ class BaseAgent(ABC):
                     accumulated = accumulated or f"[API_ERROR:{chunk.get('error_type', 'unknown')}] {error_message}"
                     usage = chunk.get("usage") or {}
                     total_tokens = usage.get("total_tokens", 0)
+                    if total_tokens:
+                        await self.emit_event(
+                            "llm_usage",
+                            "LLM token usage recorded",
+                            metadata={"tokens_used": total_tokens, "usage": usage},
+                        )
                     break
         except Exception as exc:
             logger.error("[%s] Unexpected error in stream_llm_call: %s", self.name, exc, exc_info=True)

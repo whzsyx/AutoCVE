@@ -11,7 +11,9 @@ import zipfile
 
 import pytest
 from fastapi import FastAPI
+from fastapi import BackgroundTasks
 from fastapi import HTTPException
+from fastapi import UploadFile
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -767,10 +769,15 @@ async def test_upload_project_zip_extracts_persistent_source_and_can_skip_archiv
 
     managed_root = make_managed_root()
     zip_root = managed_root / "zip-storage"
+    source_root = managed_root / "project-sources"
     original_managed_root = projects_endpoint.settings.MANAGED_PROJECTS_ROOT
     original_zip_root = projects_endpoint.settings.ZIP_STORAGE_PATH
+    original_source_root = projects_endpoint.settings.PROJECT_SOURCE_STORAGE_PATH
+    original_session_factory = projects_endpoint.AsyncSessionLocal
     projects_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
     projects_endpoint.settings.ZIP_STORAGE_PATH = str(zip_root)
+    projects_endpoint.settings.PROJECT_SOURCE_STORAGE_PATH = str(source_root)
+    projects_endpoint.AsyncSessionLocal = session_factory
 
     app = build_test_app()
 
@@ -818,6 +825,229 @@ async def test_upload_project_zip_extracts_persistent_source_and_can_skip_archiv
     assert info_response.json()["has_file"] is False
     assert info_response.json()["has_persistent_source"] is True
     assert info_response.json()["persistent_source_path"] == str(Path(project.local_path).resolve())
+
+
+@pytest.mark.asyncio
+async def test_upload_project_zip_does_not_prepare_agent_workspace_inline(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as db:
+        db.add(
+            User(
+                id="user-1",
+                email="owner@example.com",
+                hashed_password="not-a-real-hash",
+                full_name="Owner",
+                is_active=True,
+            )
+        )
+        db.add(
+            Project(
+                id="project-zip-no-prewarm",
+                name="Zip No Prewarm",
+                owner_id="user-1",
+                source_type="zip",
+                repository_type="other",
+                default_branch="main",
+            )
+        )
+        await db.commit()
+
+    managed_root = make_managed_root()
+    zip_root = managed_root / "zip-storage"
+    original_managed_root = projects_endpoint.settings.MANAGED_PROJECTS_ROOT
+    original_zip_root = projects_endpoint.settings.ZIP_STORAGE_PATH
+    original_session_factory = projects_endpoint.AsyncSessionLocal
+    projects_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
+    projects_endpoint.settings.ZIP_STORAGE_PATH = str(zip_root)
+    projects_endpoint.AsyncSessionLocal = session_factory
+
+    async def fail_if_workspace_prepared(*, project: Project, db, user_id: str, refresh: bool = False):
+        raise AssertionError("ZIP upload must not prepare the Agent workspace inline")
+
+    monkeypatch.setattr(projects_endpoint, "_prepare_project_workspace", fail_if_workspace_prepared)
+
+    zip_bytes = build_zip_bytes({"demo/app.py": "print('zip source')\n"})
+
+    try:
+        async with session_factory() as db:
+            response = await projects_endpoint.upload_project_zip(
+                id="project-zip-no-prewarm",
+                background_tasks=BackgroundTasks(),
+                file=UploadFile(file=io.BytesIO(zip_bytes), filename="demo.zip"),
+                keep_archive=False,
+                db=db,
+                current_user=SimpleNamespace(id="user-1", is_active=True),
+            )
+    finally:
+        projects_endpoint.settings.MANAGED_PROJECTS_ROOT = original_managed_root
+        projects_endpoint.settings.ZIP_STORAGE_PATH = original_zip_root
+        projects_endpoint.AsyncSessionLocal = original_session_factory
+
+    async with session_factory() as db:
+        project = await db.get(Project, "project-zip-no-prewarm")
+
+    await engine.dispose()
+
+    assert response["message"] == "ZIP archive uploaded successfully; source import queued"
+    assert response["import_status"] == "processing"
+    assert project.local_path is None
+
+
+@pytest.mark.asyncio
+async def test_upload_project_zip_queues_import_without_inline_materialization(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as db:
+        db.add(
+            User(
+                id="user-1",
+                email="owner@example.com",
+                hashed_password="not-a-real-hash",
+                full_name="Owner",
+                is_active=True,
+            )
+        )
+        db.add(
+            Project(
+                id="project-zip-queued",
+                name="Zip Queued",
+                owner_id="user-1",
+                source_type="zip",
+                repository_type="other",
+                default_branch="main",
+            )
+        )
+        await db.commit()
+
+    managed_root = make_managed_root()
+    zip_root = managed_root / "zip-storage"
+    source_root = managed_root / "project-sources"
+    original_managed_root = projects_endpoint.settings.MANAGED_PROJECTS_ROOT
+    original_zip_root = projects_endpoint.settings.ZIP_STORAGE_PATH
+    original_source_root = projects_endpoint.settings.PROJECT_SOURCE_STORAGE_PATH
+    projects_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
+    projects_endpoint.settings.ZIP_STORAGE_PATH = str(zip_root)
+    projects_endpoint.settings.PROJECT_SOURCE_STORAGE_PATH = str(source_root)
+
+    async def fail_if_materialized_inline(*args, **kwargs):
+        raise AssertionError("ZIP upload must queue import instead of materializing inline")
+
+    monkeypatch.setattr(projects_endpoint, "materialize_project_source_from_zip", fail_if_materialized_inline)
+    monkeypatch.setattr(projects_endpoint, "AsyncSessionLocal", session_factory)
+
+    zip_bytes = build_zip_bytes({"demo/app.py": "print('zip source')\n"})
+    background_tasks = BackgroundTasks()
+
+    try:
+        async with session_factory() as db:
+            response = await projects_endpoint.upload_project_zip(
+                id="project-zip-queued",
+                background_tasks=background_tasks,
+                file=UploadFile(file=io.BytesIO(zip_bytes), filename="demo.zip"),
+                keep_archive=False,
+                db=db,
+                current_user=SimpleNamespace(id="user-1", is_active=True),
+            )
+        async with session_factory() as db:
+            project = await db.get(Project, "project-zip-queued")
+    finally:
+        projects_endpoint.settings.MANAGED_PROJECTS_ROOT = original_managed_root
+        projects_endpoint.settings.ZIP_STORAGE_PATH = original_zip_root
+        projects_endpoint.settings.PROJECT_SOURCE_STORAGE_PATH = original_source_root
+
+    await engine.dispose()
+
+    assert response["import_status"] == "processing"
+    assert response["has_persistent_source"] is False
+    assert project.local_path is None
+    assert len(background_tasks.tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_project_zip_background_import_updates_project_source_and_status():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as db:
+        db.add(
+            User(
+                id="user-1",
+                email="owner@example.com",
+                hashed_password="not-a-real-hash",
+                full_name="Owner",
+                is_active=True,
+            )
+        )
+        db.add(
+            Project(
+                id="project-zip-background",
+                name="Zip Background",
+                owner_id="user-1",
+                source_type="zip",
+                repository_type="other",
+                default_branch="main",
+            )
+        )
+        await db.commit()
+
+    managed_root = make_managed_root()
+    zip_root = managed_root / "zip-storage"
+    source_root = managed_root / "project-sources"
+    original_managed_root = projects_endpoint.settings.MANAGED_PROJECTS_ROOT
+    original_zip_root = projects_endpoint.settings.ZIP_STORAGE_PATH
+    original_source_root = projects_endpoint.settings.PROJECT_SOURCE_STORAGE_PATH
+    projects_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
+    projects_endpoint.settings.ZIP_STORAGE_PATH = str(zip_root)
+    projects_endpoint.settings.PROJECT_SOURCE_STORAGE_PATH = str(source_root)
+
+    archive_path = managed_root / "archive.zip"
+    archive_path.write_bytes(build_zip_bytes({"demo/src/app.py": "print('zip source')\n"}))
+
+    try:
+        await save_project_zip(
+            "project-zip-background",
+            str(archive_path),
+            "demo.zip",
+            import_status="processing",
+            keep_archive=False,
+        )
+        await projects_endpoint._run_project_zip_import(
+            project_id="project-zip-background",
+            keep_archive=False,
+            session_factory=session_factory,
+        )
+        async with session_factory() as db:
+            project = await db.get(Project, "project-zip-background")
+        async with session_factory() as db:
+            info = await projects_endpoint.get_project_zip_info(
+                id="project-zip-background",
+                db=db,
+                current_user=SimpleNamespace(id="user-1", is_active=True),
+            )
+    finally:
+        projects_endpoint.settings.MANAGED_PROJECTS_ROOT = original_managed_root
+        projects_endpoint.settings.ZIP_STORAGE_PATH = original_zip_root
+        projects_endpoint.settings.PROJECT_SOURCE_STORAGE_PATH = original_source_root
+
+    await engine.dispose()
+
+    assert project.local_path == str((source_root / "project-zip-background").resolve())
+    assert Path(project.local_path, "src", "app.py").read_text(encoding="utf-8") == "print('zip source')\n"
+    assert info["import_status"] == "ready"
+    assert info["has_file"] is False
+    assert info["has_persistent_source"] is True
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,7 @@ import re
 import zipfile
 import shutil
 import hashlib
-from typing import Any, List, Optional, Dict, Set
+from typing import Any, Callable, List, Optional, Dict, Set
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -570,6 +570,51 @@ def _mark_task_resume_restore(task: AgentTask, restored_agents: List[Dict[str, A
     return True
 
 
+def _resolve_completed_task_tokens_used(*, current_tokens: int, result: Any, orchestrator: Any) -> int:
+    candidates = [
+        getattr(result, "tokens_used", None),
+        getattr(orchestrator, "total_tokens_used", None),
+        current_tokens,
+    ]
+    for candidate in candidates:
+        try:
+            value = int(candidate or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+def _merge_live_agent_tree_stats(
+    nodes: Dict[str, Dict[str, Any]],
+    *,
+    get_agent: Callable[[str], Any],
+) -> Dict[str, Dict[str, Any]]:
+    enriched_nodes: Dict[str, Dict[str, Any]] = {}
+    for agent_id, node in nodes.items():
+        enriched = dict(node)
+        agent_instance = get_agent(agent_id)
+        if agent_instance and hasattr(agent_instance, "get_stats"):
+            try:
+                stats = agent_instance.get_stats()
+            except Exception:
+                stats = {}
+            for node_key, stats_key in (
+                ("iterations", "iterations"),
+                ("tool_calls", "tool_calls"),
+                ("tokens_used", "tokens_used"),
+            ):
+                try:
+                    current_value = int(enriched.get(node_key, 0) or 0)
+                    stats_value = int(stats.get(stats_key, 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                enriched[node_key] = max(current_value, stats_value)
+        enriched_nodes[agent_id] = enriched
+    return enriched_nodes
+
+
 async def _load_runtime_session_ids(db: AsyncSession, task_ids: List[str]) -> Dict[str, str]:
     if not task_ids:
         return {}
@@ -591,7 +636,7 @@ async def _load_runtime_task_stats(db: AsyncSession, task_ids: List[str]) -> Dic
         return {}
 
     stats: Dict[str, Dict[str, int]] = {
-        str(task_id): {"total_iterations": 0, "tool_calls_count": 0}
+        str(task_id): {"total_iterations": 0, "tool_calls_count": 0, "tokens_used": 0}
         for task_id in task_ids
         if task_id
     }
@@ -603,7 +648,7 @@ async def _load_runtime_task_stats(db: AsyncSession, task_ids: List[str]) -> Dic
     )
     for task_id, count in turn_rows.all():
         if task_id:
-            stats.setdefault(str(task_id), {"total_iterations": 0, "tool_calls_count": 0})["total_iterations"] = int(count or 0)
+            stats.setdefault(str(task_id), {"total_iterations": 0, "tool_calls_count": 0, "tokens_used": 0})["total_iterations"] = int(count or 0)
 
     tool_rows = await db.execute(
         select(AuditSession.task_id, func.count(AuditToolCall.id))
@@ -613,7 +658,30 @@ async def _load_runtime_task_stats(db: AsyncSession, task_ids: List[str]) -> Dic
     )
     for task_id, count in tool_rows.all():
         if task_id:
-            stats.setdefault(str(task_id), {"total_iterations": 0, "tool_calls_count": 0})["tool_calls_count"] = int(count or 0)
+            stats.setdefault(str(task_id), {"total_iterations": 0, "tool_calls_count": 0, "tokens_used": 0})["tool_calls_count"] = int(count or 0)
+
+    event_rows = await db.execute(
+        select(
+            AgentEvent.task_id,
+            func.sum(case((AgentEvent.event_type == "llm_action", 1), else_=0)),
+            func.sum(case((AgentEvent.event_type == "tool_call", 1), else_=0)),
+            func.sum(case((AgentEvent.event_type == "llm_usage", AgentEvent.tokens_used), else_=0)),
+            func.max(AgentEvent.tokens_used),
+        )
+        .where(AgentEvent.task_id.in_(task_ids))
+        .group_by(AgentEvent.task_id)
+    )
+    for task_id, llm_actions, tool_calls, usage_tokens, max_tokens in event_rows.all():
+        if not task_id:
+            continue
+        task_stats = stats.setdefault(str(task_id), {"total_iterations": 0, "tool_calls_count": 0, "tokens_used": 0})
+        task_stats["total_iterations"] = max(int(task_stats["total_iterations"] or 0), int(llm_actions or 0))
+        task_stats["tool_calls_count"] = max(int(task_stats["tool_calls_count"] or 0), int(tool_calls or 0))
+        task_stats["tokens_used"] = max(
+            int(task_stats["tokens_used"] or 0),
+            int(usage_tokens or 0),
+            int(max_tokens or 0),
+        )
     return stats
 
 
@@ -1314,12 +1382,18 @@ async def _execute_agent_task_impl(task_id: str):
                 task.security_score = _calculate_security_score(findings)
                 task.total_iterations = getattr(orchestrator, "iteration_count", task.total_iterations or 0)
                 task.tool_calls_count = getattr(orchestrator, "tool_call_count", task.tool_calls_count or 0)
-                task.tokens_used = getattr(orchestrator, "total_tokens_used", task.tokens_used or 0)
+                task.tokens_used = _resolve_completed_task_tokens_used(
+                    current_tokens=task.tokens_used or 0,
+                    result=result,
+                    orchestrator=orchestrator,
+                )
                 runtime_stats = (await _load_runtime_task_stats(db, [task_id])).get(str(task_id), {})
                 if runtime_stats.get("total_iterations"):
                     task.total_iterations = max(int(task.total_iterations or 0), int(runtime_stats["total_iterations"]))
                 if runtime_stats.get("tool_calls_count"):
                     task.tool_calls_count = max(int(task.tool_calls_count or 0), int(runtime_stats["tool_calls_count"]))
+                if runtime_stats.get("tokens_used"):
+                    task.tokens_used = max(int(task.tokens_used or 0), int(runtime_stats["tokens_used"]))
                 task.analyzed_files = task.total_files
                 task.duration_ms = duration_ms
                 saved_findings = await _load_task_findings(db, task_id)
@@ -1379,6 +1453,8 @@ async def _execute_agent_task_impl(task_id: str):
                     task.total_iterations = max(int(task.total_iterations or 0), int(runtime_stats["total_iterations"]))
                 if runtime_stats.get("tool_calls_count"):
                     task.tool_calls_count = max(int(task.tool_calls_count or 0), int(runtime_stats["tool_calls_count"]))
+                if runtime_stats.get("tokens_used"):
+                    task.tokens_used = max(int(task.tokens_used or 0), int(runtime_stats["tokens_used"]))
                 await db.commit()
                 await event_emitter.emit_error(task.error_message or "Task failed")
 
@@ -1389,6 +1465,14 @@ async def _execute_agent_task_impl(task_id: str):
                 task.status = AgentTaskStatus.CANCELLED
                 task.completed_at = datetime.now(timezone.utc)
                 task.error_message = "Task cancelled"
+                task.duration_ms = int((time.time() - start_time) * 1000)
+                runtime_stats = (await _load_runtime_task_stats(db, [task_id])).get(str(task_id), {})
+                if runtime_stats.get("total_iterations"):
+                    task.total_iterations = max(int(task.total_iterations or 0), int(runtime_stats["total_iterations"]))
+                if runtime_stats.get("tool_calls_count"):
+                    task.tool_calls_count = max(int(task.tool_calls_count or 0), int(runtime_stats["tool_calls_count"]))
+                if runtime_stats.get("tokens_used"):
+                    task.tokens_used = max(int(task.tokens_used or 0), int(runtime_stats["tokens_used"]))
                 await db.commit()
             await event_emitter.emit_warning("Task cancelled")
         except Exception as exc:
@@ -2463,6 +2547,8 @@ async def list_agent_tasks(
             setattr(task, "total_iterations", max(int(task.total_iterations or 0), int(task_runtime_stats["total_iterations"])))
         if task_runtime_stats.get("tool_calls_count"):
             setattr(task, "tool_calls_count", max(int(task.tool_calls_count or 0), int(task_runtime_stats["tool_calls_count"])))
+        if task_runtime_stats.get("tokens_used"):
+            setattr(task, "tokens_used", max(int(task.tokens_used or 0), int(task_runtime_stats["tokens_used"])))
         setattr(task, "runtime_session_id", runtime_session_ids.get(task.id))
         setattr(task, "finding_runtime_stack", _resolve_task_runtime_stack(task.agent_config))
         setattr(task, "finding_outcome", runtime_result["finding_outcome"])
@@ -2582,6 +2668,8 @@ async def get_agent_task(
         total_iterations = max(total_iterations, int(task_runtime_stats["total_iterations"]))
     if task_runtime_stats.get("tool_calls_count"):
         tool_calls_count = max(tool_calls_count, int(task_runtime_stats["tool_calls_count"]))
+    if task_runtime_stats.get("tokens_used"):
+        tokens_used = max(tokens_used, int(task_runtime_stats["tokens_used"]))
     runtime_result = _get_task_finding_runtime_result(task)
 
     response_data = {
@@ -3231,6 +3319,13 @@ async def _get_project_root(
                 return single_item_path
         return root_path
 
+    if project.source_type == "zip":
+        persistent_source = str(getattr(project, "local_path", "") or "").strip()
+        if persistent_source and os.path.isdir(persistent_source):
+            check_cancelled()
+            await emit("Using persistent project source directory directly...")
+            return select_effective_root(persistent_source)
+
     if refresh and os.path.exists(base_path):
         shutil.rmtree(base_path, ignore_errors=True)
     if os.path.isdir(base_path) and os.listdir(base_path):
@@ -3345,7 +3440,9 @@ async def get_agent_tree(
     from app.services.agent.core import agent_registry
     tree = agent_registry.get_agent_tree()
     nodes = tree.get("nodes", {}) if tree else {}
-    if not nodes:
+    if nodes:
+        nodes = _merge_live_agent_tree_stats(nodes, get_agent=agent_registry.get_agent)
+    else:
         from app.models.agent_task import AgentTreeNode
         result = await db.execute(select(AgentTreeNode).where(AgentTreeNode.task_id == task_id))
         db_nodes = result.scalars().all()

@@ -46,9 +46,16 @@ from app.services.zip_storage import (
     load_project_zip,
     materialize_project_source_from_zip,
     save_project_zip,
+    update_project_zip_meta,
 )
 
 router = APIRouter()
+
+
+def _copy_uploaded_file_to_path(upload: UploadFile, target_path: str) -> None:
+    with open(target_path, 'wb') as buffer:
+        shutil.copyfileobj(upload.file, buffer)
+
 
 # Schemas
 class ProjectCreate(BaseModel):
@@ -1214,6 +1221,10 @@ class ZipFileMetaResponse(BaseModel):
     has_persistent_source: bool = False
     persistent_source_path: Optional[str] = None
     persistent_source_updated_at: Optional[str] = None
+    import_status: Optional[str] = None
+    import_error: Optional[str] = None
+    import_started_at: Optional[str] = None
+    import_completed_at: Optional[str] = None
 
 
 class ProjectSourceArtifactDeleteRequest(BaseModel):
@@ -1235,13 +1246,23 @@ async def get_project_zip_info(
         raise HTTPException(status_code=403, detail="Permission denied")
 
     has_file = await has_project_zip(id)
-    source_meta = await get_project_persistent_source_meta(id)
+    source_root = _resolve_persistent_project_root(project)
+    source_meta = None
+    if source_root:
+        source_meta = {
+            "path": str(source_root),
+            "updated_at": datetime.fromtimestamp(source_root.stat().st_mtime, tz=timezone.utc).isoformat(),
+        }
+    else:
+        source_meta = await get_project_persistent_source_meta(id)
     meta = await get_project_zip_meta(id)
     payload: dict[str, Any] = {
         "has_file": has_file,
         "has_persistent_source": source_meta is not None,
         "persistent_source_path": source_meta.get("path") if source_meta else None,
         "persistent_source_updated_at": source_meta.get("updated_at") if source_meta else None,
+        "import_status": "ready" if source_meta else None,
+        "import_error": None,
     }
     if meta:
         payload.update(
@@ -1249,20 +1270,84 @@ async def get_project_zip_info(
                 "original_filename": meta.get("original_filename"),
                 "file_size": meta.get("file_size"),
                 "uploaded_at": meta.get("uploaded_at"),
+                "import_status": meta.get("import_status") or payload["import_status"],
+                "import_error": meta.get("import_error"),
+                "import_started_at": meta.get("import_started_at"),
+                "import_completed_at": meta.get("import_completed_at"),
             }
         )
     return payload
 
 
+async def _delete_zip_archive_file_only(project_id: str) -> None:
+    zip_path = await load_project_zip(project_id)
+    if zip_path and os.path.exists(zip_path):
+        await asyncio.to_thread(os.remove, zip_path)
+
+
+async def _delete_project_persistent_source_for_project(project: Project) -> bool:
+    source_root = _resolve_persistent_project_root(project)
+    if source_root and source_root.is_dir():
+        await asyncio.to_thread(shutil.rmtree, source_root, True)
+        return True
+    return await delete_project_persistent_source(project.id)
+
+
+async def _run_project_zip_import(project_id: str, keep_archive: bool, session_factory=AsyncSessionLocal) -> None:
+    try:
+        await update_project_zip_meta(
+            project_id,
+            import_status="processing",
+            import_error=None,
+            import_started_at=datetime.now(timezone.utc).isoformat(),
+            keep_archive=keep_archive,
+        )
+        zip_path = await load_project_zip(project_id)
+        if not zip_path or not os.path.exists(zip_path):
+            raise FileNotFoundError(f"Project ZIP not found: {project_id}")
+
+        source_meta = await materialize_project_source_from_zip(project_id, zip_path)
+        async with session_factory() as db:
+            project = await db.get(Project, project_id)
+            if project:
+                project.local_path = str(source_meta.get("path") or "")
+                project.workspace_mode = "persistent_source"
+                project.updated_at = datetime.now(timezone.utc)
+                await db.commit()
+
+        if not keep_archive:
+            await _delete_zip_archive_file_only(project_id)
+
+        await update_project_zip_meta(
+            project_id,
+            import_status="ready",
+            import_error=None,
+            import_completed_at=datetime.now(timezone.utc).isoformat(),
+            persistent_source_path=source_meta.get("path"),
+            persistent_source_updated_at=source_meta.get("updated_at"),
+            keep_archive=keep_archive,
+        )
+    except Exception as exc:
+        await update_project_zip_meta(
+            project_id,
+            import_status="error",
+            import_error=str(exc),
+            import_completed_at=datetime.now(timezone.utc).isoformat(),
+            keep_archive=keep_archive,
+        )
+        raise
+
+
 @router.post("/{id}/zip")
 async def upload_project_zip(
     id: str,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     keep_archive: bool = Form(True),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    """Upload a ZIP archive, materialize persistent source, and optionally keep the archive."""
+    """Upload a ZIP archive and queue persistent source import in the background."""
     project = await db.get(Project, id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -1278,43 +1363,43 @@ async def upload_project_zip(
     temp_file_handle.close()
 
     try:
-        with open(temp_file_path, 'wb') as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        await asyncio.to_thread(_copy_uploaded_file_to_path, file, temp_file_path)
 
         file_size = os.path.getsize(temp_file_path)
         if file_size > 500 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="ZIP file size cannot exceed 500MB")
 
-        source_meta = await materialize_project_source_from_zip(id, temp_file_path)
-        archive_meta = None
-        if keep_archive:
-            archive_meta = await save_project_zip(id, temp_file_path, str(file.filename or 'upload.zip'))
-        else:
-            await delete_project_zip(id)
-
-        project.local_path = str(source_meta.get('path') or '')
-        project.workspace_mode = 'persistent_source'
-        project.updated_at = datetime.now(timezone.utc)
-        await _prepare_project_workspace(
-            project=project,
-            db=db,
-            user_id=current_user.id,
-            refresh=True,
+        archive_meta = await save_project_zip(
+            id,
+            temp_file_path,
+            str(file.filename or 'upload.zip'),
+            import_status="processing",
+            keep_archive=keep_archive,
         )
+        project.local_path = None
+        project.workspace_mode = 'importing'
+        project.updated_at = datetime.now(timezone.utc)
         await db.commit()
         await db.refresh(project)
+        background_tasks.add_task(
+            _run_project_zip_import,
+            project_id=id,
+            keep_archive=keep_archive,
+            session_factory=AsyncSessionLocal,
+        )
 
         payload = {
-            'message': 'ZIP archive uploaded successfully',
-            'has_file': archive_meta is not None,
-            'has_persistent_source': True,
-            'persistent_source_path': source_meta.get('path'),
-            'persistent_source_updated_at': source_meta.get('updated_at'),
+            'message': 'ZIP archive uploaded successfully; source import queued',
+            'has_file': True,
+            'has_persistent_source': False,
+            'persistent_source_path': None,
+            'persistent_source_updated_at': None,
             'original_filename': str(file.filename or 'upload.zip'),
             'file_size': file_size,
+            'import_status': 'processing',
+            'import_error': None,
         }
-        if archive_meta:
-            payload['uploaded_at'] = archive_meta.get('uploaded_at')
+        payload['uploaded_at'] = archive_meta.get('uploaded_at')
         return payload
     finally:
         if os.path.exists(temp_file_path):
@@ -1360,9 +1445,10 @@ async def delete_project_source_artifacts(
     if payload.delete_zip:
         deleted_zip = await delete_project_zip(id)
     if payload.delete_persistent_source:
-        deleted_persistent_source = await delete_project_persistent_source(id)
+        deleted_persistent_source = await _delete_project_persistent_source_for_project(project)
         if deleted_persistent_source:
             project.local_path = None
+            project.workspace_mode = None
             project.updated_at = datetime.now(timezone.utc)
     await db.commit()
 

@@ -21,7 +21,7 @@ import {
 
 import routes from '@/app/routes';
 import { Button } from '@/components/ui/button';
-import { version } from '../../../package.json';
+import { appVersionLabel } from '@/shared/config/version';
 
 const routeIcons: Record<string, ReactNode> = {
   '/': <Bot className="h-[18px] w-[18px]" />,
@@ -152,7 +152,7 @@ export default function Sidebar({ collapsed, setCollapsed }: SidebarProps) {
 
             {!collapsed && (
               <div className="mt-3 flex items-center justify-between px-1 text-xs text-slate-400">
-                <span>v{version}</span>
+                <span>{appVersionLabel}</span>
                 <span className="flex items-center gap-2">
                   <span className="h-2 w-2 rounded-full bg-emerald-400" />
                   Online

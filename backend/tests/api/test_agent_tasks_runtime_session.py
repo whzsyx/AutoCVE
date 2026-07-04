@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -1280,7 +1281,7 @@ async def test_get_project_root_falls_back_to_managed_directory_when_zip_missing
 
 
 @pytest.mark.asyncio
-async def test_get_project_root_copies_persistent_zip_source_directory_when_available(tmp_path):
+async def test_get_project_root_uses_persistent_zip_source_directory_without_copying(tmp_path):
     managed_root = tmp_path / 'projects'
     persistent_root = managed_root / 'zip-demo'
     persistent_root.mkdir(parents=True)
@@ -1301,34 +1302,40 @@ async def test_get_project_root_copies_persistent_zip_source_directory_when_avai
     try:
         project_root = await agent_tasks_endpoint._get_project_root(project, 'zip-persistent-task')
         assert Path(project_root, 'README.md').read_text(encoding='utf-8') == 'persistent workspace'
-        assert Path(project_root).resolve() != persistent_root.resolve()
-        assert Path(project_root).resolve().is_relative_to(
-            managed_root.resolve() / '.auditai_workspaces' / 'projects' / project.id
-        )
+        assert Path(project_root).resolve() == persistent_root.resolve()
+        assert not (managed_root / '.auditai_workspaces' / 'projects' / project.id / 'README.md').exists()
     finally:
         agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = original_root
 
 
 @pytest.mark.asyncio
-async def test_get_project_root_reuses_project_scoped_workspace_without_refresh(tmp_path):
+async def test_get_project_root_reuses_project_scoped_workspace_without_refresh(tmp_path, monkeypatch):
     managed_root = tmp_path / 'projects'
-    persistent_root = managed_root / 'zip-demo'
-    persistent_root.mkdir(parents=True)
-    (persistent_root / 'README.md').write_text('persistent workspace', encoding='utf-8')
+    repo_root = tmp_path / 'repo'
+    repo_root.mkdir()
+    (repo_root / 'README.md').write_text('repository workspace', encoding='utf-8')
     original_root = agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT
     agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
 
     project = Project(
         id='project-reuse-1',
-        name='zip-demo',
+        name='repo-demo',
         owner_id='user-1',
-        source_type='zip',
-        local_path=str(persistent_root.resolve()),
+        source_type='repository',
+        repository_url='https://github.com/example/repo.git',
         repository_type='other',
         default_branch='main',
     )
 
+    completed = SimpleNamespace(returncode=0, stderr='', stdout='')
+
+    def fake_run(cmd, capture_output, text, timeout):
+        target_dir = Path(cmd[-1])
+        shutil.copytree(repo_root, target_dir, dirs_exist_ok=True)
+        return completed
+
     try:
+        monkeypatch.setattr(subprocess, 'run', fake_run)
         first_root = Path(await agent_tasks_endpoint._get_project_root(project, 'task-a'))
         marker = first_root / '.auditai' / 'tasks' / 'task-a' / 'marker.txt'
         marker.parent.mkdir(parents=True)
@@ -1345,26 +1352,118 @@ async def test_get_project_root_reuses_project_scoped_workspace_without_refresh(
         agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = original_root
 
 
+def test_completed_task_token_count_prefers_agent_result():
+    result = SimpleNamespace(tokens_used=6612)
+    orchestrator = SimpleNamespace(total_tokens_used=0)
+
+    assert agent_tasks_endpoint._resolve_completed_task_tokens_used(
+        current_tokens=0,
+        result=result,
+        orchestrator=orchestrator,
+    ) == 6612
+
+
+def test_live_agent_tree_nodes_include_agent_token_stats():
+    agent = SimpleNamespace(get_stats=lambda: {"iterations": 3, "tool_calls": 4, "tokens_used": 6612})
+    nodes = {
+        "agent-1": {
+            "id": "agent-1",
+            "name": "Analysis",
+            "iterations": 0,
+            "tool_calls": 0,
+            "tokens_used": 0,
+        }
+    }
+
+    enriched = agent_tasks_endpoint._merge_live_agent_tree_stats(
+        nodes,
+        get_agent=lambda agent_id: agent if agent_id == "agent-1" else None,
+    )
+
+    assert enriched["agent-1"]["iterations"] == 3
+    assert enriched["agent-1"]["tool_calls"] == 4
+    assert enriched["agent-1"]["tokens_used"] == 6612
+
+
 @pytest.mark.asyncio
-async def test_get_project_root_refresh_rebuilds_project_scoped_workspace(tmp_path):
+async def test_runtime_task_stats_include_agent_event_counts_and_tokens():
+    engine = create_async_engine('sqlite+aiosqlite:///:memory:')
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as db:
+        db.add_all([
+            AgentEvent(
+                id='event-llm-1',
+                task_id='task-1',
+                event_type='llm_action',
+                sequence=1,
+                created_at=datetime.now(timezone.utc),
+            ),
+            AgentEvent(
+                id='event-llm-2',
+                task_id='task-1',
+                event_type='llm_action',
+                sequence=2,
+                created_at=datetime.now(timezone.utc),
+            ),
+            AgentEvent(
+                id='event-tool-1',
+                task_id='task-1',
+                event_type='tool_call',
+                sequence=3,
+                created_at=datetime.now(timezone.utc),
+            ),
+            AgentEvent(
+                id='event-usage-1',
+                task_id='task-1',
+                event_type='llm_usage',
+                sequence=4,
+                tokens_used=6612,
+                created_at=datetime.now(timezone.utc),
+            ),
+        ])
+        await db.commit()
+
+        stats = await agent_tasks_endpoint._load_runtime_task_stats(db, ['task-1'])
+
+    await engine.dispose()
+
+    assert stats['task-1']['total_iterations'] == 2
+    assert stats['task-1']['tool_calls_count'] == 1
+    assert stats['task-1']['tokens_used'] == 6612
+
+
+@pytest.mark.asyncio
+async def test_get_project_root_refresh_rebuilds_project_scoped_workspace(tmp_path, monkeypatch):
     managed_root = tmp_path / 'projects'
-    persistent_root = managed_root / 'zip-demo'
-    persistent_root.mkdir(parents=True)
-    (persistent_root / 'README.md').write_text('persistent workspace', encoding='utf-8')
+    repo_root = tmp_path / 'repo'
+    repo_root.mkdir()
+    (repo_root / 'README.md').write_text('repository workspace', encoding='utf-8')
     original_root = agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT
     agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = str(managed_root)
 
     project = Project(
         id='project-refresh-1',
-        name='zip-demo',
+        name='repo-demo',
         owner_id='user-1',
-        source_type='zip',
-        local_path=str(persistent_root.resolve()),
+        source_type='repository',
+        repository_url='https://github.com/example/repo.git',
         repository_type='other',
         default_branch='main',
     )
 
+    completed = SimpleNamespace(returncode=0, stderr='', stdout='')
+
+    def fake_run(cmd, capture_output, text, timeout):
+        target_dir = Path(cmd[-1])
+        shutil.copytree(repo_root, target_dir, dirs_exist_ok=True)
+        return completed
+
     try:
+        monkeypatch.setattr(subprocess, 'run', fake_run)
         project_root = Path(await agent_tasks_endpoint._get_project_root(project, 'task-a'))
         marker = project_root / '.auditai' / 'tasks' / 'task-a' / 'marker.txt'
         marker.parent.mkdir(parents=True)
@@ -1376,7 +1475,7 @@ async def test_get_project_root_refresh_rebuilds_project_scoped_workspace(tmp_pa
 
         assert refreshed_root.resolve() == project_root.resolve()
         assert not marker.exists()
-        assert (refreshed_root / 'README.md').read_text(encoding='utf-8') == 'persistent workspace'
+        assert (refreshed_root / 'README.md').read_text(encoding='utf-8') == 'repository workspace'
     finally:
         agent_tasks_endpoint.settings.MANAGED_PROJECTS_ROOT = original_root
 

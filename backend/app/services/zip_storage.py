@@ -8,6 +8,7 @@ This module manages two separate assets for ZIP-based projects:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -21,6 +22,12 @@ from app.core.config import settings
 
 def get_zip_storage_path() -> Path:
     path = Path(settings.ZIP_STORAGE_PATH).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_project_source_storage_path() -> Path:
+    path = Path(settings.PROJECT_SOURCE_STORAGE_PATH).resolve()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -40,7 +47,7 @@ def get_managed_projects_root() -> Path:
 
 
 def get_project_persistent_source_path(project_id: str) -> Path:
-    return get_managed_projects_root() / project_id
+    return get_project_source_storage_path() / project_id
 
 
 def _is_within_directory(base_dir: Path, candidate: Path) -> bool:
@@ -82,7 +89,14 @@ def _collapse_single_root_directory(target_dir: Path) -> None:
     temp_dir.rename(target_dir)
 
 
-async def save_project_zip(project_id: str, file_path: str, original_filename: str) -> dict:
+def _save_project_zip_sync(
+    project_id: str,
+    file_path: str,
+    original_filename: str,
+    *,
+    import_status: str = "ready",
+    keep_archive: bool = True,
+) -> dict:
     target_path = get_project_zip_path(project_id)
     meta_path = get_project_zip_meta_path(project_id)
 
@@ -93,13 +107,34 @@ async def save_project_zip(project_id: str, file_path: str, original_filename: s
         "file_size": file_size,
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "project_id": project_id,
+        "import_status": import_status,
+        "import_error": None,
+        "keep_archive": keep_archive,
     }
     with open(meta_path, "w", encoding="utf-8") as handle:
         json.dump(meta, handle)
     return meta
 
 
-async def materialize_project_source_from_zip(project_id: str, file_path: str) -> dict[str, str]:
+async def save_project_zip(
+    project_id: str,
+    file_path: str,
+    original_filename: str,
+    *,
+    import_status: str = "ready",
+    keep_archive: bool = True,
+) -> dict:
+    return await asyncio.to_thread(
+        _save_project_zip_sync,
+        project_id,
+        file_path,
+        original_filename,
+        import_status=import_status,
+        keep_archive=keep_archive,
+    )
+
+
+def _materialize_project_source_from_zip_sync(project_id: str, file_path: str) -> dict[str, str]:
     source_root = get_project_persistent_source_path(project_id)
     if source_root.exists():
         shutil.rmtree(source_root, ignore_errors=True)
@@ -110,6 +145,10 @@ async def materialize_project_source_from_zip(project_id: str, file_path: str) -
         "path": str(source_root.resolve()),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+async def materialize_project_source_from_zip(project_id: str, file_path: str) -> dict[str, str]:
+    return await asyncio.to_thread(_materialize_project_source_from_zip_sync, project_id, file_path)
 
 
 async def load_project_zip(project_id: str) -> Optional[str]:
@@ -127,6 +166,24 @@ async def get_project_zip_meta(project_id: str) -> Optional[dict]:
         return json.load(handle)
 
 
+def _update_project_zip_meta_sync(project_id: str, **updates) -> dict:
+    meta_path = get_project_zip_meta_path(project_id)
+    if meta_path.exists():
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            meta = json.load(handle)
+    else:
+        meta = {"project_id": project_id}
+    meta.update(updates)
+    meta["updated_at"] = datetime.now(timezone.utc).isoformat()
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(meta, handle)
+    return meta
+
+
+async def update_project_zip_meta(project_id: str, **updates) -> dict:
+    return await asyncio.to_thread(_update_project_zip_meta_sync, project_id, **updates)
+
+
 async def get_project_persistent_source_meta(project_id: str) -> Optional[dict[str, str]]:
     source_root = get_project_persistent_source_path(project_id)
     if not source_root.exists() or not source_root.is_dir():
@@ -137,7 +194,7 @@ async def get_project_persistent_source_meta(project_id: str) -> Optional[dict[s
     }
 
 
-async def delete_project_zip(project_id: str) -> bool:
+def _delete_project_zip_sync(project_id: str) -> bool:
     zip_path = get_project_zip_path(project_id)
     meta_path = get_project_zip_meta_path(project_id)
 
@@ -150,12 +207,20 @@ async def delete_project_zip(project_id: str) -> bool:
     return deleted
 
 
-async def delete_project_persistent_source(project_id: str) -> bool:
+async def delete_project_zip(project_id: str) -> bool:
+    return await asyncio.to_thread(_delete_project_zip_sync, project_id)
+
+
+def _delete_project_persistent_source_sync(project_id: str) -> bool:
     source_root = get_project_persistent_source_path(project_id)
     if not source_root.exists() or not source_root.is_dir():
         return False
     shutil.rmtree(source_root, ignore_errors=True)
     return True
+
+
+async def delete_project_persistent_source(project_id: str) -> bool:
+    return await asyncio.to_thread(_delete_project_persistent_source_sync, project_id)
 
 
 async def has_project_zip(project_id: str) -> bool:

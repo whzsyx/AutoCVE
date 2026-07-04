@@ -48,6 +48,7 @@ import {
   getZipFileInfo,
   type ZipFileMeta,
   uploadZipFile,
+  waitForZipImport,
 } from "@/shared/utils/zipStorage";
 import { isLocalDirectoryProject, isRepositoryProject, isZipProject, getSourceTypeBadge } from "@/shared/utils/projectUtils";
 import { Link } from "react-router-dom";
@@ -299,16 +300,6 @@ export default function Projects() {
       setProjectImportMessage("正在创建 ZIP 项目记录...");
       setUploadProgress(0);
 
-      const progressInterval = setInterval(() => {
-        setUploadProgress(prev => {
-          if (prev >= 100) {
-            clearInterval(progressInterval);
-            return 100;
-          }
-          return prev + 20;
-        });
-      }, 100);
-
       const project = await api.createProject({
         ...createForm,
         source_type: "zip",
@@ -317,13 +308,28 @@ export default function Projects() {
       } as any);
 
       try {
-        setProjectImportMessage("正在上传并解压 ZIP 源码...");
-        await uploadZipFile(project.id, selectedFile, { keepArchive: false });
+        setProjectImportMessage("正在上传 ZIP 源码...");
+        const uploadResult = await uploadZipFile(project.id, selectedFile, {
+          keepArchive: false,
+          onUploadProgress: progress => setUploadProgress(Math.min(80, Math.round(progress * 0.8))),
+        });
+        if (!uploadResult.success) {
+          throw new Error(uploadResult.message || "ZIP upload failed");
+        }
+        setUploadProgress(85);
+        setProjectImportMessage("上传完成，正在导入源码目录...");
+        await waitForZipImport(project.id, {
+          onStatus: info => {
+            if (info.import_status === "processing") {
+              setUploadProgress(prev => Math.max(prev, Math.min(95, prev + 2)));
+            }
+          },
+        });
       } catch (error) {
         console.error('保存ZIP文件失败:', error);
+        throw error;
       }
 
-      clearInterval(progressInterval);
       setUploadProgress(100);
 
       import('@/shared/utils/logger').then(({ logger }) => {
@@ -491,6 +497,7 @@ export default function Projects() {
           keepArchive: editKeepZipArchive,
         });
         if (result.success) {
+          await waitForZipImport(projectToEdit.id);
           toast.success(`ZIP file updated: ${result.original_filename}`);
           setEditZipFile(null);
           await refreshEditZipInfo(projectToEdit.id);

@@ -120,6 +120,18 @@ class OrchestratorAgent(BaseAgent):
             data["findings"] = []
         return AgentResult(success=True, data=data, metadata={"skipped": True, "reason": reason, "agent": agent_name})
 
+    @staticmethod
+    def _result_tokens_used(result: Optional[AgentResult]) -> int:
+        if result is None:
+            return 0
+        try:
+            return int(result.tokens_used or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _sum_result_tokens(self, *results: Optional[AgentResult]) -> int:
+        return sum(self._result_tokens_used(result) for result in results)
+
     def register_sub_agent(self, name: str, agent: BaseAgent):
         self.sub_agents[name] = agent
 
@@ -873,6 +885,13 @@ class OrchestratorAgent(BaseAgent):
                 phases["finding"] = finding_result.to_dict()
             if workflow_state["effective_agents"]["verification"] and verification_result:
                 phases["verification"] = verification_result.to_dict()
+            total_tokens_used = self._sum_result_tokens(
+                recon_result,
+                scan_result,
+                triage_result,
+                finding_result,
+                verification_result,
+            )
             return AgentResult(
                 success=True,
                 data={
@@ -886,7 +905,7 @@ class OrchestratorAgent(BaseAgent):
                 },
                 iterations=1,
                 tool_calls=self._tool_calls,
-                tokens_used=self._total_tokens,
+                tokens_used=total_tokens_used,
                 duration_ms=duration_ms,
                 handoff=verification_result.handoff if verification_result else None,
             )

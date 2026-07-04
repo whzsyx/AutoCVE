@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
 import { ArrowRight, CheckCircle2, Lock, Mail, ShieldCheck, User, Wand2 } from "lucide-react";
-import { version } from "../../package.json";
+import { appVersionLabel } from "@/shared/config/version";
 
 const onboardingPoints = [
   {
@@ -101,7 +101,7 @@ export default function Register() {
             </div>
 
             <div className="relative flex items-center justify-between text-sm text-slate-400">
-              <span>v{version}</span>
+              <span>{appVersionLabel}</span>
               <span>{new Date().toLocaleDateString("zh-CN")}</span>
             </div>
           </div>
