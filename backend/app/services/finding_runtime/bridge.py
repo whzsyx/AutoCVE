@@ -958,15 +958,6 @@ class FindingRuntimeBridge:
             RUNTIME_FINALIZATION_PROMPT
             + "\n如果仍需继续查看文件、验证调用链、补齐 source/sink/PoC/影响面，请继续调用工具，不要结束。"
         ]
-        return [
-            RUNTIME_FINALIZATION_PROMPT,
-            (
-                "现在请立即仅以严格 JSON 返回最终报告。"
-                "不要再请求任何工具。"
-                "响应必须是一个单独的 JSON 对象，顶层键只能是 findings 和 summary。"
-
-            ),
-        ]
 
     @classmethod
     def _default_fallback_payload(cls, snapshot: Any) -> dict[str, Any]:
