@@ -190,6 +190,57 @@ async def test_post_follow_up_message_appends_to_session():
 
 
 @pytest.mark.asyncio
+async def test_resume_audit_session_enqueues_once_and_rejects_duplicate_running_job(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async with session_factory() as db:
+        session = AuditSession(
+            project_id="project-1",
+            runtime_stack="runtime",
+            state="failed",
+            runtime_state_json={},
+        )
+        db.add(session)
+        await db.commit()
+        session_id = session.id
+
+    enqueued = []
+
+    async def fake_enqueue(session_id, resume_token):
+        enqueued.append((session_id, resume_token))
+
+    monkeypatch.setattr(audit_sessions_endpoint, "enqueue_audit_session_resume", fake_enqueue)
+    app = build_test_app()
+
+    async def override_get_db():
+        async with session_factory() as db:
+            yield db
+
+    async def override_get_current_user():
+        return SimpleNamespace(id="user-1", is_active=True)
+
+    app.dependency_overrides[deps.get_db] = override_get_db
+    app.dependency_overrides[deps.get_current_user] = override_get_current_user
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first = await client.post(f"/api/v1/audit-sessions/{session_id}/resume")
+        second = await client.post(f"/api/v1/audit-sessions/{session_id}/resume")
+
+    async with session_factory() as db:
+        session = await db.get(AuditSession, session_id)
+    await engine.dispose()
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert len(enqueued) == 1
+    assert enqueued[0][0] == session_id
+    assert session.state == "running"
+    assert session.runtime_state_json["metadata"]["resume_job"]["status"] == "queued"
+
+
+@pytest.mark.asyncio
 async def test_get_audit_session_handoffs():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     session_factory = async_sessionmaker(engine, expire_on_commit=False)

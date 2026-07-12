@@ -1,38 +1,39 @@
-"""
-LLM服务类型定义
-"""
+"""LLM service type definitions."""
 
-from enum import Enum
-from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
 
 class LLMProvider(str, Enum):
-    """支持的LLM提供商类型"""
-    GEMINI = "gemini"        # Google Gemini
-    OPENAI = "openai"        # OpenAI (GPT系列)
-    CLAUDE = "claude"        # Anthropic Claude
-    QWEN = "qwen"            # 阿里云通义千问
-    DEEPSEEK = "deepseek"    # DeepSeek
-    ZHIPU = "zhipu"          # 智谱AI (GLM系列)
-    MOONSHOT = "moonshot"    # 月之暗面 Kimi
-    BAIDU = "baidu"          # 百度文心一言
-    MINIMAX = "minimax"      # MiniMax
-    DOUBAO = "doubao"        # 字节豆包
-    OLLAMA = "ollama"        # Ollama 本地大模型
+    """Supported LLM providers."""
+
+    GEMINI = "gemini"
+    OPENAI = "openai"
+    CLAUDE = "claude"
+    QWEN = "qwen"
+    DEEPSEEK = "deepseek"
+    ZHIPU = "zhipu"
+    MOONSHOT = "moonshot"
+    BAIDU = "baidu"
+    MINIMAX = "minimax"
+    DOUBAO = "doubao"
+    MIMO = "mimo"
+    OLLAMA = "ollama"
 
 
 @dataclass
 class LLMConfig:
-    """LLM配置"""
+    """LLM configuration."""
+
     provider: LLMProvider
     api_key: str
     model: str
     base_url: Optional[str] = None
     timeout: int = 300
-    temperature: float = 0.2
+    temperature: Optional[float] = None
     max_tokens: int = 4096
-    top_p: float = 1.0
+    top_p: Optional[float] = None
     frequency_penalty: float = 0
     presence_penalty: float = 0
     endpoint_protocol: str = "openai_compatible"
@@ -42,8 +43,9 @@ class LLMConfig:
 
 @dataclass
 class LLMMessage:
-    """LLM请求消息"""
-    role: str  # 'system', 'user', 'assistant', 'tool'
+    """LLM request message."""
+
+    role: str
     content: Any
     name: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
@@ -76,7 +78,8 @@ class LLMMessage:
 
 @dataclass
 class LLMRequest:
-    """LLM请求参数"""
+    """LLM request parameters."""
+
     messages: List[LLMMessage]
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
@@ -88,7 +91,8 @@ class LLMRequest:
 
 @dataclass
 class LLMUsage:
-    """Token使用统计"""
+    """Token usage."""
+
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
@@ -96,7 +100,8 @@ class LLMUsage:
 
 @dataclass
 class LLMResponse:
-    """LLM响应"""
+    """LLM response."""
+
     content: str
     model: Optional[str] = None
     usage: Optional[LLMUsage] = None
@@ -106,39 +111,39 @@ class LLMResponse:
 
 
 class LLMError(Exception):
-    """LLM错误"""
+    """LLM error with provider context."""
+
     def __init__(
         self,
         message: str,
         provider: Optional[LLMProvider] = None,
         status_code: Optional[int] = None,
         original_error: Optional[Any] = None,
-        api_response: Optional[str] = None
+        api_response: Optional[str] = None,
     ):
         super().__init__(message)
         self.provider = provider
         self.status_code = status_code
         self.original_error = original_error
-        self.api_response = api_response  # API 服务器返回的原始错误信息
+        self.api_response = api_response
 
 
-# 各平台默认模型 (2025年最新推荐)
 DEFAULT_MODELS: Dict[LLMProvider, str] = {
-    LLMProvider.GEMINI: "gemini-3-pro",
-    LLMProvider.OPENAI: "gpt-5",
-    LLMProvider.CLAUDE: "claude-sonnet-4.5",
-    LLMProvider.QWEN: "qwen3-max-instruct",
-    LLMProvider.DEEPSEEK: "deepseek-v3.1-terminus",
-    LLMProvider.ZHIPU: "glm-4.6",
-    LLMProvider.MOONSHOT: "kimi-k2",
+    LLMProvider.GEMINI: "gemini-3.5-flash",
+    LLMProvider.OPENAI: "gpt-5.5",
+    LLMProvider.CLAUDE: "claude-opus-4-8",
+    LLMProvider.QWEN: "qwen3.7-max",
+    LLMProvider.DEEPSEEK: "deepseek-v4-pro",
+    LLMProvider.ZHIPU: "glm-5.2",
+    LLMProvider.MOONSHOT: "kimi-k2.6",
     LLMProvider.BAIDU: "ernie-4.5",
-    LLMProvider.MINIMAX: "minimax-m2",
+    LLMProvider.MINIMAX: "minimax-m2.7",
     LLMProvider.DOUBAO: "doubao-1.6-pro",
+    LLMProvider.MIMO: "mimo-v2.5-pro",
     LLMProvider.OLLAMA: "llama3.3-70b",
 }
 
 
-# 各平台API端点
 DEFAULT_BASE_URLS: Dict[LLMProvider, str] = {
     LLMProvider.OPENAI: "https://api.openai.com/v1",
     LLMProvider.QWEN: "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -148,10 +153,8 @@ DEFAULT_BASE_URLS: Dict[LLMProvider, str] = {
     LLMProvider.BAIDU: "https://aip.baidubce.com/rpc/2.0/ai_custom/v1",
     LLMProvider.MINIMAX: "https://api.minimax.chat/v1",
     LLMProvider.DOUBAO: "https://ark.cn-beijing.volces.com/api/v3",
+    LLMProvider.MIMO: "https://api.xiaomimimo.com/v1",
     LLMProvider.OLLAMA: "http://localhost:11434/v1",
     LLMProvider.GEMINI: "https://generativelanguage.googleapis.com/v1beta",
     LLMProvider.CLAUDE: "https://api.anthropic.com/v1",
 }
-
-
-

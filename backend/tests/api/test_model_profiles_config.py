@@ -3,7 +3,10 @@ from types import SimpleNamespace
 
 from app.api.v1.endpoints.config import (
     LLMConfigSchema,
+    LLMConnectionTestRequest,
     SENSITIVE_LLM_FIELDS,
+    _apply_llm_connection_test_overrides,
+    _explicit_sampling_updates,
     _decrypt_config,
     _encrypt_config,
     _merge_user_config,
@@ -12,10 +15,56 @@ from app.api.v1.endpoints.config import (
 )
 
 
+def test_llm_connection_test_uses_unsaved_temperature_override():
+    llm_config = {
+        "llmProvider": "deepseek",
+        "llmModel": "deepseek-chat",
+        "llmTemperature": 0.1,
+    }
+    payload = LLMConnectionTestRequest(
+        provider="moonshot",
+        model="kimi-k2.6",
+        temperature=1,
+        topP=0.95,
+    )
+
+    _apply_llm_connection_test_overrides(llm_config, payload)
+
+    assert llm_config["llmProvider"] == "moonshot"
+    assert llm_config["llmModel"] == "kimi-k2.6"
+    assert llm_config["llmTemperature"] == 1
+    assert llm_config["llmTopP"] == 0.95
+
+
+def test_llm_connection_test_can_clear_sampling_values_for_auto_mode():
+    llm_config = {"llmTemperature": 0.1, "llmTopP": 1.0}
+    payload = LLMConnectionTestRequest(
+        provider="moonshot",
+        temperature=None,
+        topP=None,
+    )
+
+    _apply_llm_connection_test_overrides(llm_config, payload)
+
+    assert llm_config["llmTemperature"] is None
+    assert llm_config["llmTopP"] is None
+
+
+def test_sampling_fields_preserve_explicit_null_for_persistence():
+    incoming = LLMConfigSchema(llmTemperature=None, llmTopP=None)
+
+    assert _explicit_sampling_updates(incoming) == {
+        "llmTemperature": None,
+        "llmTopP": None,
+    }
+
+
 def test_default_config_exposes_empty_model_profiles():
     config = get_default_config()
 
     assert config["llmConfig"]["modelProfiles"] == []
+    assert config["llmConfig"]["llmTemperature"] is None
+    assert config["llmConfig"]["llmTopP"] is None
 
 
 def test_normalize_model_profiles_defaults_first_when_missing():

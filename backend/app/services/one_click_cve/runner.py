@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
+import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -13,6 +15,7 @@ from app.api.v1.endpoints.config import _build_test_user_config, _get_user_confi
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.agent_task import AgentFinding, AgentTask, AgentTaskPhase, AgentTaskStatus, FindingStatus
+from app.models.audit_session import AuditCheckpoint, AuditSession, AuditSessionTurn
 from app.models.managed_vulnerability import ManagedVulnerability
 from app.models.one_click_cve import (
     OneClickCveBatch,
@@ -30,14 +33,119 @@ from app.services.one_click_cve.discovery import GitHubCveDiscoveryService, GitH
 
 POLL_INTERVAL_SECONDS = 5
 ONE_CLICK_CVE_PREFLIGHT_AGENT = "finding"
+FATAL_ONE_CLICK_CVE_ERROR_KINDS = {
+    "provider_auth_error",
+    "quota_exhausted",
+    "model_stream_error",
+    "model_stream_timeout",
+    "queue_unavailable",
+    "persistence_error",
+}
+FATAL_ONE_CLICK_CVE_ERROR_TERMS = (
+    "模型服务连接失败",
+    "model stream",
+    "streaming request failed",
+    "ratelimiterror",
+    "rate limit",
+    "rate_limit",
+    "quota",
+    "billing",
+    "insufficient",
+    "invalid api key",
+    "unauthorized",
+    "authentication",
+)
+
+
+async def _mark_latest_audit_session_agent_timeout(
+    db: AsyncSession,
+    *,
+    task_id: str,
+    timeout_message: str,
+) -> None:
+    session = await db.scalar(
+        select(AuditSession)
+        .where(AuditSession.task_id == task_id, AuditSession.runtime_stack == "runtime")
+        .order_by(AuditSession.created_at.desc())
+        .limit(1)
+    )
+    if session is None:
+        return
+    session.state = "failed"
+    turn_id = await db.scalar(
+        select(AuditSessionTurn.id)
+        .where(AuditSessionTurn.session_id == session.id)
+        .order_by(AuditSessionTurn.sequence.desc())
+        .limit(1)
+    )
+    db.add(
+        AuditCheckpoint(
+            session_id=session.id,
+            turn_id=turn_id,
+            checkpoint_type="auto",
+            state_payload={
+                "checkpoint_kind": "resumable_failed",
+                "resumable": True,
+                "error_kind": "agent_timeout",
+                "error": timeout_message,
+                "phase": "one_click_agent_deadline",
+            },
+        )
+    )
 
 
 class OneClickCveBatchCancelled(Exception):
     pass
 
 
+class OneClickCveAgentTimeout(RuntimeError):
+    pass
+
+
+class OneClickCveFatalAuditError(RuntimeError):
+    """A shared provider/infrastructure failure that must stop the batch."""
+
+
+def is_fatal_one_click_cve_error(error_kind: str | None, message: str | None = None) -> bool:
+    normalized_kind = str(error_kind or "").strip().lower()
+    if normalized_kind in FATAL_ONE_CLICK_CVE_ERROR_KINDS:
+        return True
+    normalized_message = str(message or "").strip().lower()
+    return any(term in normalized_message for term in FATAL_ONE_CLICK_CVE_ERROR_TERMS) or bool(
+        re.search(r"\b(?:tpd|tpm|rpm)\b", normalized_message)
+    )
+
+
+async def _latest_runtime_failure(db: AsyncSession, task_id: str) -> tuple[AuditSession | None, str | None, str | None]:
+    session = await db.scalar(
+        select(AuditSession)
+        .where(AuditSession.task_id == task_id, AuditSession.runtime_stack == "runtime")
+        .order_by(AuditSession.created_at.desc())
+        .limit(1)
+    )
+    if session is None:
+        return None, None, None
+    checkpoint = await db.scalar(
+        select(AuditCheckpoint)
+        .where(AuditCheckpoint.session_id == session.id)
+        .order_by(AuditCheckpoint.created_at.desc())
+        .limit(1)
+    )
+    payload = dict(checkpoint.state_payload or {}) if checkpoint is not None else {}
+    return session, str(payload.get("error_kind") or "").strip() or None, str(payload.get("error") or "").strip() or None
+
+
 def _format_exception_message(exc: Exception) -> str:
     return str(exc).strip() or exc.__class__.__name__
+
+
+def _one_click_agent_timeout_message(timeout_seconds: int) -> str:
+    minutes = max(1, int(round(timeout_seconds / 60)))
+    return f"Agent审计任务超时：在一键CVE中单个项目审计时间超过{minutes}分钟，已停止"
+
+
+def _monotonic_seconds() -> float:
+    return time.monotonic()
 
 
 async def run_one_click_cve_batch(batch_id: str) -> None:
@@ -108,7 +216,11 @@ async def run_one_click_cve_batch(batch_id: str) -> None:
                 fresh.status = OneClickCveBatchStatus.FAILED
                 fresh.error_message = _format_exception_message(exc)
                 fresh.completed_at = datetime.now(timezone.utc)
-                fresh.current_step = "一键CVE执行失败"
+                fresh.current_step = (
+                    "检测到共享模型或基础设施故障，已停止整个一键 CVE"
+                    if isinstance(exc, OneClickCveFatalAuditError)
+                    else "一键CVE执行失败"
+                )
                 await db.commit()
 
 
@@ -232,6 +344,9 @@ async def _audit_candidate(db: AsyncSession, batch: OneClickCveBatch, candidate:
 
             run_task = asyncio.create_task(execute_agent_task(task.id))
             await _wait_for_task_completion(db, task.id, run_task, batch_id=batch_id)
+        runtime_session, runtime_error_kind, runtime_error = await _latest_runtime_failure(db, task.id)
+        if runtime_session is not None and runtime_session.state != "completed":
+            raise RuntimeError(runtime_error or task.error_message or "Finding runtime did not complete")
         findings_count = await _count_task_findings(db, task.id)
         item.findings_count = findings_count
         item.status = OneClickCveProjectStatus.COMPLETED
@@ -253,12 +368,28 @@ async def _audit_candidate(db: AsyncSession, batch: OneClickCveBatch, candidate:
         await db.rollback()
         item_ref = await db.get(OneClickCveBatchProject, item_id) if item_id else None
         batch_ref = await db.get(OneClickCveBatch, batch_id)
+        task_ref = await db.get(AgentTask, item_ref.agent_task_id) if item_ref is not None and item_ref.agent_task_id else None
+        runtime_error_kind = None
+        runtime_error = None
+        if task_ref is not None:
+            _, runtime_error_kind, runtime_error = await _latest_runtime_failure(db, str(task_ref.id))
+        failure_message = runtime_error or _format_exception_message(exc)
+        if task_ref is not None:
+            task_ref.status = AgentTaskStatus.FAILED
+            task_ref.error_message = failure_message
+            task_ref.completed_at = datetime.now(timezone.utc)
         if item_ref is not None:
             item_ref.status = OneClickCveProjectStatus.FAILED
-            item_ref.error_message = _format_exception_message(exc)
+            item_ref.error_message = failure_message
         if batch_ref is not None:
-            batch_ref.current_step = f"{candidate.full_name} 审计失败，继续下一个候选项目"
+            batch_ref.current_step = (
+                f"{candidate.full_name} 审计遇到全局故障，已停止一键 CVE"
+                if is_fatal_one_click_cve_error(runtime_error_kind, failure_message)
+                else f"{candidate.full_name} 审计失败，继续下一个候选项目"
+            )
         await db.commit()
+        if is_fatal_one_click_cve_error(runtime_error_kind, failure_message):
+            raise OneClickCveFatalAuditError(failure_message) from exc
 
 
 async def _get_or_create_project(
@@ -326,7 +457,7 @@ async def _create_agent_task(
         verification_level="sandbox",
         exclude_patterns=["node_modules", "__pycache__", ".git", "*.min.js", "dist", "build", "vendor"],
         max_iterations=settings.AGENT_MAX_ITERATIONS,
-        timeout_seconds=settings.AGENT_TIMEOUT_SECONDS,
+        timeout_seconds=getattr(settings, "ONE_CLICK_CVE_AGENT_TIMEOUT_SECONDS", 3000),
         agent_config={
             "finding_runtime_stack": getattr(settings, "FINDING_RUNTIME_STACK_DEFAULT", "runtime"),
             "one_click_cve_batch_id": batch_id,
@@ -357,6 +488,8 @@ async def _wait_for_task_completion(
     *,
     batch_id: str | None = None,
 ) -> None:
+    started_at = _monotonic_seconds()
+    timeout_seconds: int | None = None
     while run_task is None or not run_task.done():
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
         await db.commit()
@@ -373,6 +506,30 @@ async def _wait_for_task_completion(
         task = await db.get(AgentTask, task_id, populate_existing=True)
         if task is None:
             raise RuntimeError("Agent task disappeared during one-click CVE run")
+        if timeout_seconds is None:
+            timeout_seconds = int(
+                task.timeout_seconds
+                if task.timeout_seconds is not None
+                else getattr(settings, "ONE_CLICK_CVE_AGENT_TIMEOUT_SECONDS", 3000)
+            )
+        if _monotonic_seconds() - started_at >= timeout_seconds:
+            timeout_message = _one_click_agent_timeout_message(timeout_seconds)
+            with contextlib.suppress(Exception):
+                request_agent_task_cancellation(task_id)
+            task.status = AgentTaskStatus.CANCELLED
+            task.error_message = timeout_message
+            task.completed_at = datetime.now(timezone.utc)
+            await _mark_latest_audit_session_agent_timeout(
+                db,
+                task_id=task_id,
+                timeout_message=timeout_message,
+            )
+            await db.commit()
+            if run_task is not None and not run_task.done():
+                run_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await run_task
+            raise OneClickCveAgentTimeout(timeout_message)
         if task.status in {AgentTaskStatus.COMPLETED, AgentTaskStatus.FAILED, AgentTaskStatus.CANCELLED}:
             break
     if run_task is not None:

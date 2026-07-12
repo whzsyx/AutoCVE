@@ -29,6 +29,21 @@ class TestFileTools:
         assert result.success is True
         assert "SELECT * FROM users" in result.data
         assert "sql_injection" in result.data.lower() or "cursor.execute" in result.data
+
+    @pytest.mark.asyncio
+    async def test_file_read_tool_makes_nul_characters_printable(self, tmp_path):
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        source_path = project_root / "source.js"
+        source_path.write_bytes(b"const forbidden = ['\x00'];\n")
+        tool = FileReadTool(str(project_root))
+
+        result = await tool.execute(file_path="source.js")
+
+        assert result.success is True
+        assert "\x00" not in result.data
+        assert "\\x00" in result.data
+        assert result.metadata["nul_characters_escaped"] == 1
     
     @pytest.mark.asyncio
     async def test_file_read_tool_not_found(self, temp_project_dir):

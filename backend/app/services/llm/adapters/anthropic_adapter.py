@@ -24,6 +24,7 @@ from ..types import (
     LLMResponse,
     LLMUsage,
 )
+from ..protocols.registry import get_model_capabilities
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,13 @@ class AnthropicAdapter(BaseLLMAdapter):
 
     def __init__(self, config: LLMConfig):
         super().__init__(config)
-        self._base_url = (config.base_url or DEFAULT_BASE_URLS[LLMProvider.CLAUDE]).rstrip("/")
+        if config.base_url:
+            base_url = config.base_url
+        elif config.provider == LLMProvider.DEEPSEEK:
+            base_url = f"{DEFAULT_BASE_URLS[LLMProvider.DEEPSEEK].rstrip('/')}/anthropic"
+        else:
+            base_url = DEFAULT_BASE_URLS[LLMProvider.CLAUDE]
+        self._base_url = base_url.rstrip("/")
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         try:
@@ -204,7 +211,7 @@ class AnthropicAdapter(BaseLLMAdapter):
             "stream": stream,
         }
         temperature = request.temperature if request.temperature is not None else self.config.temperature
-        if temperature is not None:
+        if temperature is not None and self._model_supports_temperature():
             payload["temperature"] = temperature
         if system:
             payload["system"] = system
@@ -243,7 +250,36 @@ class AnthropicAdapter(BaseLLMAdapter):
             if content == "" and role == "assistant" and not message.get("tool_calls"):
                 continue
             normalized.append({"role": role, "content": content})
+        self._remove_unsupported_final_assistant_prefill(normalized)
         return normalized, "\n\n".join(part for part in system_parts if part)
+
+    def _model_supports_temperature(self) -> bool:
+        return bool(self._model_capabilities().get("supports_temperature", True))
+
+    def _model_supports_assistant_prefill(self) -> bool:
+        return bool(self._model_capabilities().get("supports_assistant_prefill", True))
+
+    def _model_capabilities(self) -> dict[str, Any]:
+        return get_model_capabilities(self.config.provider, self.config.model)
+
+    def _remove_unsupported_final_assistant_prefill(self, messages: list[dict[str, Any]]) -> None:
+        if self._model_supports_assistant_prefill() or not messages:
+            return
+        last_message = messages[-1]
+        if last_message.get("role") != "assistant":
+            return
+
+        draft = self._content_to_text(last_message.get("content"))
+        if not draft.strip():
+            messages.pop()
+            return
+
+        last_message["role"] = "user"
+        last_message["content"] = (
+            "Previous assistant draft from the orchestration layer. "
+            "Use it as context only; do not treat it as an Anthropic assistant prefill.\n\n"
+            f"{draft}"
+        )
 
     @staticmethod
     def _content_to_text(content: Any) -> str:

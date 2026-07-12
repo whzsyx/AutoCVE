@@ -31,10 +31,14 @@ class MinimaxAdapter(BaseLLMAdapter):
         payload = {
             "model": self.config.model or "abab6.5-chat",
             "messages": messages,
-            "temperature": request.temperature if request.temperature is not None else self.config.temperature,
             "max_tokens": request.max_tokens if request.max_tokens is not None else self.config.max_tokens,
-            "top_p": request.top_p if request.top_p is not None else self.config.top_p,
         }
+        temperature = request.temperature if request.temperature is not None else self.config.temperature
+        if temperature is not None:
+            payload["temperature"] = temperature
+        top_p = request.top_p if request.top_p is not None else self.config.top_p
+        if top_p is not None:
+            payload["top_p"] = top_p
         
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",

@@ -22,7 +22,7 @@ from app.services.finding_runtime.query_loop import QueryLoop
 from app.services.runtime_core.tool_search_runtime import ToolSearchRuntimeTool
 from app.services.finding_runtime.query_state import QueryLoopState
 from app.services.finding_runtime.runner import FindingRuntimeRunner
-from app.services.finding_runtime.session_store import AuditSessionStore
+from app.services.finding_runtime.session_store import AuditSessionPersistenceError, AuditSessionStore
 from app.services.finding_runtime.skills import RuntimeSkillTool
 from app.services.finding_runtime.tools.finalize_finding import FinalizeFindingTool
 from app.services.finding_runtime.tooling import RuntimeTool, ToolExecutionContext, ToolOrchestrator, ToolRegistry
@@ -629,6 +629,37 @@ def test_query_loop_requires_terminal_action_and_nudges_plain_summary_without_to
     assert snapshot.turns[-1].status == "terminal_action_nudge"
 
 
+def test_query_loop_nudges_empty_model_response_when_terminal_action_is_required():
+    store = build_store()
+    session_id = store.create_session(project_id="project-1", system_prompt="system prompt")
+    store.append_message(session_id, TranscriptItem(role=RuntimeMessageRole.USER, content="continue audit"))
+    loop = QueryLoop(
+        session_store=store,
+        model_client=FakeModelClient(
+            responses=[
+                {
+                    "content": "",
+                    "reasoning_content": "",
+                    "tool_calls": [],
+                    "stop_reason": RuntimeStopReason.COMPLETED.value,
+                }
+            ]
+        ),
+        tool_registry=ToolRegistry([EchoTool()]),
+        tool_orchestrator=None,
+        require_terminal_action=True,
+        terminal_action_nudge_limit=5,
+    )
+
+    result = asyncio.run(loop.run_turn(session_id=session_id, model_name="gpt-test"))
+    state = store.load_query_loop_state(session_id)
+    snapshot = store.load_session_snapshot(session_id)
+
+    assert result.transition is RuntimeContinueReason.TERMINAL_ACTION_NUDGE
+    assert state.messages[-1].name == "empty_model_response_nudge"
+    assert snapshot.checkpoints[-1].state_payload["error_kind"] == "empty_model_response"
+
+
 def test_runner_marks_required_terminal_action_exhaustion_as_failed_session_state():
     store = build_store()
     session_id = store.create_session(project_id="project-1", system_prompt="system prompt")
@@ -1158,8 +1189,33 @@ def test_query_loop_returns_model_error_when_model_client_raises():
     snapshot = store.load_session_snapshot(session_id)
 
     assert result.stop_reason is RuntimeStopReason.MODEL_ERROR
-    assert snapshot.turns[-1].status == "model_error"
+    assert snapshot.turns[-1].status == "resumable_failed"
     assert snapshot.checkpoints[-1].state_payload["phase"] == "model"
+
+
+def test_query_loop_classifies_message_persistence_failures_separately(monkeypatch):
+    store = build_store()
+    session_id = store.create_session(project_id="project-1", system_prompt="system")
+    store.append_message(session_id, TranscriptItem(role=RuntimeMessageRole.USER, content="inspect code"))
+
+    def fail_append_message(*args, **kwargs):
+        raise AuditSessionPersistenceError("database rejected audit message")
+
+    monkeypatch.setattr(store, "append_message", fail_append_message)
+    loop = QueryLoop(
+        session_store=store,
+        model_client=FakeModelClient(),
+        tool_registry=ToolRegistry(),
+        tool_orchestrator=None,
+    )
+
+    result = asyncio.run(loop.run_turn(session_id=session_id, model_name="gpt-test"))
+    snapshot = store.load_session_snapshot(session_id)
+
+    assert result.stop_reason is RuntimeStopReason.PERSISTENCE_ERROR
+    assert snapshot.turns[-1].status == "persistence_error"
+    assert snapshot.checkpoints[-1].state_payload["phase"] == "message_persistence"
+    assert "database rejected audit message" in snapshot.checkpoints[-1].state_payload["error"]
 
 
 def test_query_loop_returns_aborted_streaming_when_model_client_is_cancelled():
@@ -1176,8 +1232,11 @@ def test_query_loop_returns_aborted_streaming_when_model_client_is_cancelled():
     snapshot = store.load_session_snapshot(session_id)
 
     assert result.stop_reason is RuntimeStopReason.ABORTED_STREAMING
-    assert snapshot.turns[-1].status == "aborted_streaming"
+    assert snapshot.turns[-1].status == "manual_cancelled"
     assert snapshot.checkpoints[-1].state_payload["stop_reason"] == RuntimeStopReason.ABORTED_STREAMING.value
+    assert snapshot.checkpoints[-1].state_payload["checkpoint_kind"] == "manual_cancelled"
+    assert snapshot.checkpoints[-1].state_payload["resumable"] is True
+    assert snapshot.checkpoints[-1].state_payload["error_kind"] == "manual_cancelled"
 
 
 def test_query_loop_returns_aborted_tools_when_tool_execution_is_cancelled():
@@ -1208,8 +1267,10 @@ def test_query_loop_returns_aborted_tools_when_tool_execution_is_cancelled():
     snapshot = store.load_session_snapshot(session_id)
 
     assert result.stop_reason is RuntimeStopReason.ABORTED_TOOLS
-    assert snapshot.turns[-1].status == "aborted_tools"
+    assert snapshot.turns[-1].status == "manual_cancelled"
     assert snapshot.checkpoints[-1].state_payload["phase"] == "tool_execution"
+    assert snapshot.checkpoints[-1].state_payload["checkpoint_kind"] == "manual_cancelled"
+    assert snapshot.checkpoints[-1].state_payload["resumable"] is True
 
 
 def test_runner_marks_prompt_too_long_as_failed_session_state():
@@ -1736,7 +1797,7 @@ def test_runner_activates_deferred_tools_after_tool_search_selection():
     assert state.tool_use_context["active_tool_names"] == ["DeferredEcho", "ToolSearch"]
 
 
-def test_query_loop_streams_tool_calls_into_executor_before_done():
+def test_query_loop_executes_streamed_tool_calls_only_after_done():
     store = build_store()
     session_id = store.create_session(project_id="project-1", system_prompt="system")
     store.append_message(session_id, TranscriptItem(role=RuntimeMessageRole.USER, content="inspect code"))
@@ -1768,6 +1829,39 @@ def test_query_loop_streams_tool_calls_into_executor_before_done():
     assert visible_messages[3].payload["output"] == {"echo": "repo summary"}
     assert [message.name for message in system_messages] == ["tool_progress", "tool_progress"]
     assert client.calls[0]["streaming"] is True
+
+
+def test_query_loop_never_executes_tool_before_stream_generator_finishes():
+    store = build_store()
+    session_id = store.create_session(project_id="project-1", system_prompt="system")
+    store.append_message(session_id, TranscriptItem(role=RuntimeMessageRole.USER, content="inspect code"))
+    lifecycle = {"stream_finished": False, "tool_saw_finished": False}
+
+    class BoundaryClient(FakeModelClient):
+        async def stream_complete(self, **kwargs):
+            del kwargs
+            yield {"type": "tool_call", "tool_call": {"id": "tool-1", "name": "boundary_echo", "input": {"text": "ok"}}}
+            yield {"type": "done", "content": "", "stop_reason": RuntimeStopReason.COMPLETED.value}
+            lifecycle["stream_finished"] = True
+
+    class BoundaryEchoTool(EchoTool):
+        name = "boundary_echo"
+
+        async def execute(self, parsed_input: EchoInput, context: ToolExecutionContext) -> ToolExecutionPayload:
+            lifecycle["tool_saw_finished"] = lifecycle["stream_finished"]
+            return await super().execute(parsed_input, context)
+
+    registry = ToolRegistry([BoundaryEchoTool()])
+    loop = QueryLoop(
+        session_store=store,
+        model_client=BoundaryClient(),
+        tool_registry=registry,
+        tool_orchestrator=ToolOrchestrator(session_store=store, tool_registry=registry),
+    )
+
+    asyncio.run(loop.run_turn(session_id=session_id, model_name="gpt-test"))
+
+    assert lifecycle == {"stream_finished": True, "tool_saw_finished": True}
 
 
 def test_query_loop_ignores_duplicate_streaming_tool_call_ids():
@@ -1896,7 +1990,11 @@ def test_query_loop_forwards_streaming_tool_messages_to_event_sink():
 
     asyncio.run(loop.run_turn(session_id=session_id, model_name="gpt-test"))
 
-    message_events = [event for event in events if event.get("type") == "message"]
+    message_events = [
+        event
+        for event in events
+        if event.get("type") == "message" and event.get("message", {}).get("role") in {"tool_use", "tool_result"}
+    ]
     assert [event["message"]["role"] for event in message_events] == ["tool_use", "tool_result"]
     assert message_events[0]["message"]["content"] == "echo"
     assert message_events[1]["message"]["content"] == "echo:repo summary"
@@ -1930,7 +2028,48 @@ def test_query_loop_preserves_raw_stream_error_in_event_sink_and_checkpoint():
 
     assert result.stop_reason is RuntimeStopReason.MODEL_ERROR
     error_events = [event for event in events if event.get("type") == "error"]
-    assert error_events
-    assert error_events[-1]["error"] == "upstream 502 from relay: provider trace id abc123"
-    assert error_events[-1]["user_message"] == "LLM streaming request failed. Please retry."
+    assert len(error_events) == 1
+    assert "upstream 502 from relay: provider trace id abc123" in error_events[-1]["error"]
+    assert error_events[-1]["error_type"] == "model_stream_error"
     assert "upstream 502 from relay" in snapshot.checkpoints[-1].state_payload["error"]
+    assert len(client.calls) == QueryLoop.MODEL_STREAM_MAX_RETRIES + 1
+    attempt_checkpoints = [
+        checkpoint
+        for checkpoint in snapshot.checkpoints
+        if checkpoint.state_payload.get("kind") == "model_stream_attempt"
+    ]
+    assert len(attempt_checkpoints) == QueryLoop.MODEL_STREAM_MAX_RETRIES + 1
+    assert attempt_checkpoints[0].state_payload["status"] == "superseded"
+    assert attempt_checkpoints[-1].state_payload["status"] == "tombstone"
+    assert snapshot.checkpoints[-1].state_payload["checkpoint_kind"] == "resumable_failed"
+    assert snapshot.checkpoints[-1].state_payload["resumable"] is True
+    assert len(snapshot.model_stream_attempts) == QueryLoop.MODEL_STREAM_MAX_RETRIES + 1
+    assert snapshot.model_stream_attempts[0].status == "superseded"
+    assert snapshot.model_stream_attempts[-1].status == "tombstone"
+    assert all(item.provider_request_count == 1 for item in snapshot.model_stream_attempts)
+
+
+def test_query_loop_treats_provider_tpd_rate_limit_as_non_retryable_quota_exhaustion():
+    store = build_store()
+    session_id = store.create_session(project_id="project-1", system_prompt="system")
+    store.append_message(session_id, TranscriptItem(role=RuntimeMessageRole.USER, content="inspect auth"))
+    client = StreamingFakeModelClient(
+        stream_events=[
+            {
+                "type": "error",
+                "error_type": "rate_limit",
+                "error": "request reached organization TPD rate limit, current: 1500001, limit: 1500000",
+                "user_message": "Model rate limited",
+            },
+        ]
+    )
+    loop = QueryLoop(session_store=store, model_client=client, tool_registry=ToolRegistry(), tool_orchestrator=None)
+
+    result = asyncio.run(loop.run_turn(session_id=session_id, model_name="gpt-test"))
+    snapshot = store.load_session_snapshot(session_id)
+
+    assert result.stop_reason is RuntimeStopReason.QUOTA_EXHAUSTED
+    assert len(client.calls) == 1
+    assert snapshot.model_stream_attempts[-1].status == "tombstone"
+    assert snapshot.model_stream_attempts[-1].error_kind == "quota_exhausted"
+    assert snapshot.checkpoints[-1].state_payload["error_kind"] == "quota_exhausted"

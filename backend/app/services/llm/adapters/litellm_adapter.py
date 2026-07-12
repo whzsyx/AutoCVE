@@ -22,6 +22,7 @@ from ..types import (
     DEFAULT_BASE_URLS,
 )
 from ..prompt_cache import prompt_cache_manager, estimate_tokens
+from ..protocols.registry import get_model_capabilities
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,9 @@ class LiteLLMAdapter(BaseLLMAdapter):
         LLMProvider.QWEN: "openai",  # 使用 OpenAI 兼容模式
         LLMProvider.ZHIPU: "openai",  # 使用 OpenAI 兼容模式
         LLMProvider.MOONSHOT: "openai",  # 使用 OpenAI 兼容模式
+        LLMProvider.MINIMAX: "openai",
+        LLMProvider.DOUBAO: "openai",
+        LLMProvider.MIMO: "openai",
         LLMProvider.OLLAMA: "ollama",
     }
 
@@ -67,6 +71,9 @@ class LiteLLMAdapter(BaseLLMAdapter):
         LLMProvider.ZHIPU,
         LLMProvider.MOONSHOT,
         LLMProvider.DEEPSEEK,
+        LLMProvider.MINIMAX,
+        LLMProvider.DOUBAO,
+        LLMProvider.MIMO,
     }
 
     def __init__(self, config: LLMConfig):
@@ -173,6 +180,18 @@ class LiteLLMAdapter(BaseLLMAdapter):
 
         return None
 
+    def _sampling_kwargs(self, request: LLMRequest) -> Dict[str, float]:
+        """Return only sampling parameters explicitly configured for this request."""
+        sampling: Dict[str, float] = {}
+        temperature = request.temperature if request.temperature is not None else self.config.temperature
+        capabilities = get_model_capabilities(self.config.provider, self.config.model)
+        if temperature is not None and capabilities.get("supports_temperature", True):
+            sampling["temperature"] = temperature
+        top_p = request.top_p if request.top_p is not None else self.config.top_p
+        if self.config.provider != LLMProvider.CLAUDE and top_p is not None:
+            sampling["top_p"] = top_p
+        return sampling
+
     async def complete(self, request: LLMRequest) -> LLMResponse:
         """使用 LiteLLM 发送请求"""
         try:
@@ -222,13 +241,10 @@ class LiteLLMAdapter(BaseLLMAdapter):
         kwargs: Dict[str, Any] = {
             "model": self._litellm_model,
             "messages": messages,
-            "temperature": request.temperature if request.temperature is not None else self.config.temperature,
             "max_tokens": request.max_tokens if request.max_tokens is not None else self.config.max_tokens,
         }
 
-        # Claude 不允许同时传 temperature 和 top_p
-        if self.config.provider != LLMProvider.CLAUDE:
-            kwargs["top_p"] = request.top_p if request.top_p is not None else self.config.top_p
+        kwargs.update(self._sampling_kwargs(request))
         if request.tools:
             kwargs["tools"] = request.tools
         if request.parallel_tool_calls is not None:
@@ -356,13 +372,11 @@ class LiteLLMAdapter(BaseLLMAdapter):
         kwargs = {
             "model": self._litellm_model,
             "messages": messages,
-            "temperature": request.temperature if request.temperature is not None else self.config.temperature,
             "max_tokens": request.max_tokens if request.max_tokens is not None else self.config.max_tokens,
             "stream": True,
         }
 
-        if self.config.provider != LLMProvider.CLAUDE:
-            kwargs["top_p"] = request.top_p if request.top_p is not None else self.config.top_p
+        kwargs.update(self._sampling_kwargs(request))
         if request.tools:
             kwargs["tools"] = request.tools
         if request.parallel_tool_calls is not None:

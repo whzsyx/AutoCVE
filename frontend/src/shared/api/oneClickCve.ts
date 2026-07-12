@@ -24,6 +24,12 @@ export interface OneClickCveProject {
   findings_count: number;
   error_message?: string | null;
   created_at?: string | null;
+  can_resume?: boolean;
+  last_error_kind?: string | null;
+  resume_session_id?: string | null;
+  resume_status?: string | null;
+  resume_attempt?: number | null;
+  resume_max_attempts?: number | null;
 }
 
 export interface OneClickCveBatch {
@@ -62,5 +68,10 @@ export async function getOneClickCveBatch(batchId: string): Promise<OneClickCveB
 
 export async function cancelOneClickCveBatch(batchId: string): Promise<OneClickCveBatch> {
   const response = await apiClient.post(`/one-click-cve/batches/${batchId}/cancel`);
+  return response.data;
+}
+
+export async function resumeOneClickCveProject(batchId: string, projectId: string): Promise<{ session_id: string; status: string; message: string }> {
+  const response = await apiClient.post(`/one-click-cve/batches/${batchId}/projects/${projectId}/resume`);
   return response.data;
 }

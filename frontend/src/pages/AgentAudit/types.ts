@@ -120,10 +120,12 @@ export interface HeaderProps {
   task: AgentTask | null;
   isRunning: boolean;
   isCancelling: boolean;
+  isResuming?: boolean;
   sessionHref?: string | null;
   onCancel: () => void;
   onExport: () => void;
   onNewAudit: () => void;
+  onResume?: () => void;
 }
 
 export interface ActivityLogProps {

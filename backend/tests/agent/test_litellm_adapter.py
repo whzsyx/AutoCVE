@@ -60,6 +60,48 @@ class _StreamResponse:
         return _gen()
 
 
+def test_litellm_sampling_parameters_are_omitted_in_auto_mode():
+    adapter = LiteLLMAdapter(
+        LLMConfig(
+            provider=LLMProvider.MOONSHOT,
+            api_key='test-key',
+            model='kimi-k2.6',
+        )
+    )
+    request = LLMRequest(messages=[LLMMessage(role='user', content='test')])
+
+    assert adapter._sampling_kwargs(request) == {}
+
+
+def test_litellm_sampling_parameters_use_explicit_config():
+    adapter = LiteLLMAdapter(
+        LLMConfig(
+            provider=LLMProvider.MOONSHOT,
+            api_key='test-key',
+            model='kimi-k2.6',
+            temperature=1,
+            top_p=0.95,
+        )
+    )
+    request = LLMRequest(messages=[LLMMessage(role='user', content='test')])
+
+    assert adapter._sampling_kwargs(request) == {'temperature': 1, 'top_p': 0.95}
+
+
+def test_litellm_sampling_parameters_omit_temperature_for_opus_4_8():
+    adapter = LiteLLMAdapter(
+        LLMConfig(
+            provider=LLMProvider.CLAUDE,
+            api_key='test-key',
+            model='claude-opus-4-8',
+            temperature=0.1,
+        )
+    )
+    request = LLMRequest(messages=[LLMMessage(role='user', content='test')])
+
+    assert adapter._sampling_kwargs(request) == {}
+
+
 @pytest.mark.asyncio
 async def test_litellm_adapter_stream_complete_emits_tool_call_before_done(monkeypatch):
     async def fake_acompletion(**kwargs):

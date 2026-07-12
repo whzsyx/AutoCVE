@@ -531,9 +531,27 @@ class FindingAgent(AnalysisWorkflowAgent):
         if isinstance(runtime_error, dict):
             stop_reason = str(runtime_error.get("stop_reason") or "").strip()
             message = str(runtime_error.get("message") or runtime_error.get("error") or "").strip()
+            lower_message = message.lower()
+            if stop_reason == RuntimeStopReason.QUOTA_EXHAUSTED.value or any(
+                term in lower_message for term in ("insufficient_quota", "quota exceeded", "billing", "余额不足", "资源包")
+            ):
+                suffix = f"原始错误：{message}" if message else "模型账户余额或配额不足。"
+                return f"Finding 未完成：模型余额/配额不足，可补充额度或切换模型后继续同一审计。{suffix}"
+            if stop_reason == RuntimeStopReason.MODEL_STREAM_TIMEOUT.value:
+                suffix = f"原始错误：{message}" if message else "模型流连接超过配置时间。"
+                return f"Finding 未完成：模型流超时，自动重试已耗尽，可继续同一审计。{suffix}"
+            if stop_reason == RuntimeStopReason.TOOL_TIMEOUT.value or "工具执行超时" in message:
+                suffix = f"原始错误：{message}" if message else "工具执行超过配置时间。"
+                return f"Finding 未完成：工具超时，请缩小搜索范围后继续审计。{suffix}"
+            if stop_reason in {"timeout", RuntimeStopReason.AGENT_TIMEOUT.value}:
+                suffix = f"原始错误：{message}" if message else "运行超过配置的时间限制。"
+                return f"Finding 未完成：Agent 总时间超时，未进入最终提交阶段。{suffix}"
             if stop_reason == RuntimeStopReason.MODEL_ERROR.value:
                 suffix = f"原始错误：{message}" if message else "原始错误未返回详细信息。"
                 return f"Finding 未完成：模型流式请求失败，未能继续到 FinalizeFinding。{suffix}"
+            if stop_reason == RuntimeStopReason.PERSISTENCE_ERROR.value:
+                suffix = f"原始错误：{message}" if message else "原始错误未返回详细信息。"
+                return f"Finding 未完成：审计会话消息持久化失败，未能继续到 FinalizeFinding。{suffix}"
         return "Finding 未完成：runtime ended without FinalizeFinding or structured final findings."
 
     @staticmethod

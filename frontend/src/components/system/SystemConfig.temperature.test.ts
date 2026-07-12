@@ -16,4 +16,14 @@ test("model config form exposes editable temperature control", () => {
     source,
     /updateActiveConfig\(\{\s*llmTemperature: event\.target\.value === '' \? null : Number\(event\.target\.value\),\s*\}\)/,
   );
+  assert.match(
+    source,
+    /testGlobalModel\(\{[\s\S]*?temperature: globalConfig\.llmTemperature,/,
+  );
+  assert.match(source, /placeholder="自动（留空）"/);
+  assert.match(
+    source,
+    /<Label[^>]*>Top P<\/Label>[\s\S]*?value=\{\(isGlobalScope \? globalConfig\.llmTopP : activeAgentConfig\?\.llmTopP\) \?\? ''\}/,
+  );
+  assert.match(source, /topP: globalConfig\.llmTopP,/);
 });

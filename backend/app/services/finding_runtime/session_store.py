@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.models.audit_session import (
     AuditCheckpoint,
     AuditCheckpointType,
     AuditHandoff,
     AuditMemory,
+    AuditModelStreamAttempt,
     AuditSession,
     AuditSessionMessage,
     AuditSessionTurn,
@@ -19,6 +22,34 @@ from app.models.audit_session import (
 from app.services.finding_runtime.models import RuntimeMemoryRecord, RuntimeSessionSnapshot, RuntimeSessionState, TranscriptItem
 from app.services.finding_runtime.query_state import QueryLoopState
 from app.services.runtime_core.session_state import SessionRuntimeState as SharedSessionRuntimeState
+
+
+class AuditSessionPersistenceError(RuntimeError):
+    """Raised when an audit-session message cannot be persisted."""
+
+
+def _escape_nul_characters(value: Any) -> Any:
+    """Recursively make PostgreSQL-incompatible NUL characters printable."""
+    if isinstance(value, str):
+        return value.replace("\x00", "\\x00")
+    if isinstance(value, dict):
+        return {
+            _escape_nul_characters(key): _escape_nul_characters(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_escape_nul_characters(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_escape_nul_characters(item) for item in value)
+    return value
+
+
+def _raise_message_persistence_error(action: str, exc: SQLAlchemyError) -> None:
+    original = getattr(exc, "orig", None)
+    detail = str(original or exc).strip() or exc.__class__.__name__
+    raise AuditSessionPersistenceError(
+        f"Audit session message persistence failed during {action}: {detail}"
+    ) from exc
 
 
 class AuditSessionStore:
@@ -94,21 +125,31 @@ class AuditSessionStore:
         return QueryLoopState.from_payload(runtime_state.metadata.get("query_loop") or {})
 
     def append_message(self, session_id: str, item: TranscriptItem) -> str:
+        # Keep the in-memory transcript identical to the printable representation
+        # persisted in PostgreSQL so later model turns cannot receive raw NULs.
+        item.content = _escape_nul_characters(item.content)
+        item.name = _escape_nul_characters(item.name)
+        item.metadata = _escape_nul_characters(dict(item.metadata))
+        item.payload = _escape_nul_characters(dict(item.payload))
         with self._session_factory() as db:
-            sequence = self._next_sequence(db, AuditSessionMessage, AuditSessionMessage.session_id, session_id)
-            message = AuditSessionMessage(
-                session_id=session_id,
-                sequence=sequence,
-                role=item.role.value,
-                content=item.content,
-                name=item.name,
-                message_metadata=dict(item.metadata),
-                payload=dict(item.payload),
-            )
-            db.add(message)
-            db.commit()
-            db.refresh(message)
-            return message.id
+            try:
+                sequence = self._next_sequence(db, AuditSessionMessage, AuditSessionMessage.session_id, session_id)
+                message = AuditSessionMessage(
+                    session_id=session_id,
+                    sequence=sequence,
+                    role=item.role.value,
+                    content=item.content,
+                    name=item.name,
+                    message_metadata=dict(item.metadata),
+                    payload=dict(item.payload),
+                )
+                db.add(message)
+                db.commit()
+                db.refresh(message)
+                return message.id
+            except SQLAlchemyError as exc:
+                db.rollback()
+                _raise_message_persistence_error("append", exc)
 
     def get_message(self, message_id: str) -> AuditSessionMessage | None:
         with self._session_factory() as db:
@@ -116,21 +157,29 @@ class AuditSessionStore:
 
     def update_message_content(self, message_id: str, *, content: str) -> None:
         with self._session_factory() as db:
-            message = db.get(AuditSessionMessage, message_id)
-            if message is None:
-                raise LookupError(f"Unknown audit session message: {message_id}")
-            message.content = content
-            db.commit()
+            try:
+                message = db.get(AuditSessionMessage, message_id)
+                if message is None:
+                    raise LookupError(f"Unknown audit session message: {message_id}")
+                message.content = _escape_nul_characters(content)
+                db.commit()
+            except SQLAlchemyError as exc:
+                db.rollback()
+                _raise_message_persistence_error("content update", exc)
 
     def update_message_payload(self, message_id: str, *, payload: dict, merge: bool = True) -> None:
         with self._session_factory() as db:
-            message = db.get(AuditSessionMessage, message_id)
-            if message is None:
-                raise LookupError(f"Unknown audit session message: {message_id}")
-            existing = dict(message.payload or {}) if merge else {}
-            existing.update(dict(payload or {}))
-            message.payload = existing
-            db.commit()
+            try:
+                message = db.get(AuditSessionMessage, message_id)
+                if message is None:
+                    raise LookupError(f"Unknown audit session message: {message_id}")
+                existing = dict(message.payload or {}) if merge else {}
+                existing.update(dict(payload or {}))
+                message.payload = _escape_nul_characters(existing)
+                db.commit()
+            except SQLAlchemyError as exc:
+                db.rollback()
+                _raise_message_persistence_error("payload update", exc)
 
     def open_turn(self, session_id: str, *, model_name: str | None = None) -> str:
         with self._session_factory() as db:
@@ -140,6 +189,45 @@ class AuditSessionStore:
             db.commit()
             db.refresh(turn)
             return turn.id
+
+    def start_model_stream_attempt(
+        self,
+        *,
+        attempt_id: str,
+        session_id: str,
+        turn_id: str,
+        attempt_number: int,
+    ) -> None:
+        with self._session_factory() as db:
+            db.add(
+                AuditModelStreamAttempt(
+                    id=attempt_id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    attempt_number=attempt_number,
+                    status="running",
+                    provider_request_count=1,
+                )
+            )
+            db.commit()
+
+    def complete_model_stream_attempt(
+        self,
+        attempt_id: str,
+        *,
+        status: str,
+        error_kind: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        with self._session_factory() as db:
+            attempt = db.get(AuditModelStreamAttempt, attempt_id)
+            if attempt is None:
+                raise LookupError(f"Unknown model stream attempt: {attempt_id}")
+            attempt.status = status
+            attempt.error_kind = error_kind
+            attempt.error_message = error_message
+            attempt.completed_at = datetime.now(timezone.utc)
+            db.commit()
 
     def close_turn(self, turn_id: str, *, status: str = "completed") -> None:
         with self._session_factory() as db:
@@ -212,31 +300,39 @@ class AuditSessionStore:
 
     def create_handoff(self, *, session_id: str, target: str, status: str = "pending", payload: dict | None = None) -> str:
         with self._session_factory() as db:
-            handoff_payload = dict(payload or {})
-            handoff = AuditHandoff(
-                session_id=session_id,
-                target=target,
-                status=status,
-                payload=handoff_payload,
-            )
-            db.add(handoff)
-            db.flush()
-
-            sequence = self._next_sequence(db, AuditSessionMessage, AuditSessionMessage.session_id, session_id)
-            db.add(
-                AuditSessionMessage(
+            try:
+                handoff_payload = _escape_nul_characters(dict(payload or {}))
+                handoff = AuditHandoff(
                     session_id=session_id,
-                    sequence=sequence,
-                    role="handoff",
-                    content=str(handoff_payload.get("summary") or f"Handoff queued for {target}."),
-                    name="verification_handoff",
-                    message_metadata={"kind": "handoff", "status": status},
-                    payload={"handoff_id": handoff.id, "target": target, **handoff_payload},
+                    target=_escape_nul_characters(target),
+                    status=_escape_nul_characters(status),
+                    payload=handoff_payload,
                 )
-            )
-            db.commit()
-            db.refresh(handoff)
-            return handoff.id
+                db.add(handoff)
+                db.flush()
+
+                sequence = self._next_sequence(db, AuditSessionMessage, AuditSessionMessage.session_id, session_id)
+                db.add(
+                    AuditSessionMessage(
+                        session_id=session_id,
+                        sequence=sequence,
+                        role="handoff",
+                        content=_escape_nul_characters(
+                            str(handoff_payload.get("summary") or f"Handoff queued for {target}.")
+                        ),
+                        name="verification_handoff",
+                        message_metadata=_escape_nul_characters({"kind": "handoff", "status": status}),
+                        payload=_escape_nul_characters(
+                            {"handoff_id": handoff.id, "target": target, **handoff_payload}
+                        ),
+                    )
+                )
+                db.commit()
+                db.refresh(handoff)
+                return handoff.id
+            except SQLAlchemyError as exc:
+                db.rollback()
+                _raise_message_persistence_error("handoff append", exc)
 
     def list_handoffs(self, session_id: str) -> list[AuditHandoff]:
         with self._session_factory() as db:
@@ -437,6 +533,13 @@ class AuditSessionStore:
                     .order_by(AuditHandoff.created_at)
                 )
             )
+            model_stream_attempts = list(
+                db.scalars(
+                    select(AuditModelStreamAttempt)
+                    .where(AuditModelStreamAttempt.session_id == session_id)
+                    .order_by(AuditModelStreamAttempt.started_at)
+                )
+            )
             return RuntimeSessionSnapshot(
                 session=session,
                 messages=messages,
@@ -447,6 +550,7 @@ class AuditSessionStore:
                 skill_invocations=skill_invocations,
                 memories=memories,
                 handoffs=handoffs,
+                model_stream_attempts=model_stream_attempts,
             )
 
     @staticmethod

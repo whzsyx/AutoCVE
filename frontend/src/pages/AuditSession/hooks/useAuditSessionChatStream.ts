@@ -189,6 +189,11 @@ export function useAuditSessionChatStream({
       return;
     }
 
+    if (event.type === "assistant_tombstone") {
+      clearPlaceholders();
+      return;
+    }
+
     if (event.type === "error") {
       setStreamError(event.message_text || "Streaming failed");
     }

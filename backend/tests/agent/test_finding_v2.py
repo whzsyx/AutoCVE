@@ -116,6 +116,38 @@ def test_analysis_workflow_synthesizes_thought_for_action_only_structured_respon
     assert step.thought == "Searching the codebase for 'glueSource'."
 
 
+def test_finding_runtime_incomplete_error_distinguishes_timeout_from_finalize_failure():
+    message = FindingAgent._format_incomplete_runtime_error(
+        {
+            "runtime_error": {
+                "stop_reason": "timeout",
+                "message": "Agent 审计超时：一键 CVE 单项目审计超过 40 分钟",
+            }
+        }
+    )
+
+    assert "超时" in message
+    assert "40 分钟" in message
+    assert "without FinalizeFinding" not in message
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "raw_message", "expected"),
+    [
+        (RuntimeStopReason.MODEL_STREAM_TIMEOUT.value, "TimeoutException", "模型流超时"),
+        (RuntimeStopReason.TOOL_TIMEOUT.value, "工具执行超时", "工具超时"),
+        (RuntimeStopReason.AGENT_TIMEOUT.value, "50 minutes", "Agent 总时间超时"),
+        (RuntimeStopReason.QUOTA_EXHAUSTED.value, "余额不足或无可用资源包", "余额/配额不足"),
+    ],
+)
+def test_finding_runtime_incomplete_error_uses_specific_failure_category(stop_reason, raw_message, expected):
+    message = FindingAgent._format_incomplete_runtime_error(
+        {"runtime_error": {"stop_reason": stop_reason, "message": raw_message}}
+    )
+
+    assert expected in message
+
+
 @pytest.mark.asyncio
 async def test_analysis_workflow_emits_completion_events_for_fallback_results():
     agent = DummyWorkflowAgent()
@@ -2314,4 +2346,19 @@ async def test_runtime_stack_model_error_reports_llm_failure_reason(monkeypatch)
     assert result.success is False
     assert "模型流式请求失败" in result.error
     assert "LLM streaming request failed" in result.error
+
+
+def test_runtime_stack_persistence_error_reports_storage_failure_reason():
+    message = FindingAgent._format_incomplete_runtime_error(
+        {
+            "runtime_error": {
+                "stop_reason": RuntimeStopReason.PERSISTENCE_ERROR.value,
+                "message": "Audit session message persistence failed during append",
+            }
+        }
+    )
+
+    assert "审计会话消息持久化失败" in message
+    assert "模型流式请求失败" not in message
+    assert "Audit session message persistence failed" in message
 

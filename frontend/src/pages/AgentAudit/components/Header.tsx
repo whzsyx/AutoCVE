@@ -4,7 +4,7 @@
  * Features: Enhanced glow effects, refined controls, premium feel
  */
 
-import { Square, Download, Loader2, Radio, Cpu, Sparkles, MessagesSquare } from "lucide-react";
+import { Square, Download, Loader2, Radio, Cpu, Sparkles, MessagesSquare, RefreshCw } from "lucide-react";
 import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "./StatusBadge";
@@ -14,10 +14,12 @@ export function Header({
   task,
   isRunning,
   isCancelling,
+  isResuming,
   sessionHref,
   onCancel,
   onExport,
-  onNewAudit
+  onNewAudit,
+  onResume,
 }: HeaderProps) {
   return (
     <header className="flex-shrink-0 h-16 border-b border-border/50 flex items-center justify-between px-6 bg-card/80 backdrop-blur-md relative overflow-hidden">
@@ -88,6 +90,19 @@ export function Header({
                 <span>终止</span>
               </>
             )}
+          </Button>
+        )}
+
+        {!isRunning && sessionHref && onResume && ["failed", "cancelled"].includes(task?.status || "") && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onResume}
+            disabled={isResuming}
+            className="h-9 px-4 text-xs font-mono text-amber-700 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 rounded-md"
+          >
+            {isResuming ? <Loader2 className="w-3.5 h-3.5 mr-2 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5 mr-2" />}
+            <span>继续审计</span>
           </Button>
         )}
 

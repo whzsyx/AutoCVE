@@ -20,6 +20,7 @@ export interface AgentModelConfig {
   llmBaseUrl?: string;
   llmTimeout?: number | null;
   llmTemperature?: number | null;
+  llmTopP?: number | null;
   llmMaxTokens?: number | null;
   endpointProtocol?: string;
   toolMessageFormat?: string;
@@ -38,6 +39,7 @@ export interface ModelProfileConfig {
   llmBaseUrl?: string;
   llmTimeout?: number | null;
   llmTemperature?: number | null;
+  llmTopP?: number | null;
   llmMaxTokens?: number | null;
   endpointProtocol?: string;
   toolMessageFormat?: string;
@@ -58,6 +60,12 @@ export interface ProviderOption {
   label: string;
   default_model: string;
   models: string[];
+  default_endpoint_protocol?: string;
+  supported_endpoint_protocols?: string[];
+  tool_capability?: Record<string, any>;
+  default_model_capabilities?: Record<string, any>;
+  model_capabilities?: Record<string, Record<string, any>>;
+  notes?: string;
 }
 
 export interface AgentModelTestResponse {
@@ -108,11 +116,16 @@ export async function testGlobalModel(payload: {
   apiKey?: string;
   model?: string;
   baseUrl?: string;
+  temperature?: number | null;
+  topP?: number | null;
   endpointProtocol?: string;
   toolMessageFormat?: string;
   prompt?: string;
 }) {
   const response = await apiClient.post('/config/test-llm', payload);
+  if (!response.data?.success) {
+    throw new Error(response.data?.message || '模型连接测试失败');
+  }
   return response.data;
 }
 

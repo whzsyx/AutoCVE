@@ -32,6 +32,7 @@ def test_runtime_enums_expose_runtime_states_and_stop_reasons():
     assert RuntimeStopReason.PROMPT_TOO_LONG.value == "prompt_too_long"
     assert RuntimeStopReason.IMAGE_ERROR.value == "image_error"
     assert RuntimeStopReason.MODEL_ERROR.value == "model_error"
+    assert RuntimeStopReason.PERSISTENCE_ERROR.value == "persistence_error"
     assert RuntimeStopReason.ABORTED_STREAMING.value == "aborted_streaming"
     assert RuntimeStopReason.ABORTED_TOOLS.value == "aborted_tools"
     assert RuntimeStopReason.STOP_HOOK_PREVENTED.value == "stop_hook_prevented"

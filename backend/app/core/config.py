@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     LLM_TIMEOUT: int = 150
     LLM_TEMPERATURE: float = 0.1
     LLM_MAX_TOKENS: int = 4096
+    LLM_ENDPOINT_PROTOCOL: str = "openai_chat"
+    LLM_TOOL_MESSAGE_FORMAT: str = "auto"
     LLM_FIRST_TOKEN_TIMEOUT: int = 30
     LLM_STREAM_TIMEOUT: int = 60
     SUB_AGENT_TIMEOUT_SECONDS: int = 600
@@ -64,6 +66,7 @@ class Settings(BaseSettings):
     BAIDU_API_KEY: Optional[str] = None
     MINIMAX_API_KEY: Optional[str] = None
     DOUBAO_API_KEY: Optional[str] = None
+    MIMO_API_KEY: Optional[str] = None
     OLLAMA_BASE_URL: Optional[str] = "http://localhost:11434/v1"
 
     GITHUB_TOKEN: Optional[str] = None
@@ -124,7 +127,7 @@ class Settings(BaseSettings):
     AGENT_TASK_EXECUTION_MODE: str = "inline"
     AGENT_TASK_QUEUE_NAME: str = "autocve:arq:agent_tasks"
     AGENT_WORKER_CONCURRENCY: int = 2
-    AGENT_WORKER_JOB_TIMEOUT_SECONDS: int = 1800
+    AGENT_WORKER_JOB_TIMEOUT_SECONDS: int = 3600
     AGENT_WORKER_MAX_TRIES: int = 2
     AGENT_EVENT_STREAM_ENABLED: bool = False
     AGENT_EVENT_STREAM_MAXLEN: int = 5000
@@ -132,9 +135,11 @@ class Settings(BaseSettings):
     ONE_CLICK_CVE_EXECUTION_MODE: str = "inline"
     ONE_CLICK_CVE_QUEUE_NAME: str = "autocve:arq:one_click_cve_batches"
     ONE_CLICK_CVE_WORKER_CONCURRENCY: int = 1
-    ONE_CLICK_CVE_WORKER_JOB_TIMEOUT_SECONDS: int = 7200
+    ONE_CLICK_CVE_WORKER_JOB_TIMEOUT_SECONDS: int = 10800
     ONE_CLICK_CVE_WORKER_MAX_TRIES: int = 1
     ONE_CLICK_CVE_MAX_REPOSITORY_SIZE_KB: int = 512000
+    ONE_CLICK_CVE_AGENT_TIMEOUT_SECONDS: int = 3000
+    AUDIT_SESSION_RESUME_TIMEOUT_SECONDS: int = 3000
     REDIS_URL: str = "redis://localhost:6379/0"
     FINDING_RUNTIME_STACK_DEFAULT: str = "runtime"
     SANDBOX_IMAGE: str = "autocve-sandbox:latest"

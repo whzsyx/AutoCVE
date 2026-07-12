@@ -7,6 +7,7 @@ from app.db.base import Base
 from app.services.agent.tools.base import AgentTool, ToolResult
 from app.services.finding_runtime.session_store import AuditSessionStore
 from app.services.runtime_core.runtime_tool_registry import build_runtime_tool_registry
+from app.services.runtime_core.tool_runtime import ToolExecutionContext
 
 
 class FakeAgentTool(AgentTool):
@@ -26,11 +27,30 @@ class FakeAgentTool(AgentTool):
         return ToolResult(success=True, data=kwargs)
 
 
+class RecordingAgentTool(FakeAgentTool):
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.calls: list[dict] = []
+
+    async def _execute(self, **kwargs):
+        self.calls.append(kwargs)
+        return ToolResult(success=True, data={"received": kwargs})
+
+
 def build_store() -> AuditSessionStore:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
     return AuditSessionStore(session_factory=session_factory)
+
+
+def build_tool_context() -> ToolExecutionContext:
+    return ToolExecutionContext(
+        session_id="session-1",
+        turn_id="turn-1",
+        tool_use_id="tool-use-1",
+        tool_call_id="tool-call-1",
+    )
 
 
 def test_runtime_tool_registry_builder_exposes_shared_runtime_tools_for_agent():

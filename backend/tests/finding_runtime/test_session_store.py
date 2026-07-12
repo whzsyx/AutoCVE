@@ -56,6 +56,39 @@ def test_append_message_persists_transcript_sequence_in_order():
     assert [message.role for message in snapshot.messages] == ["system", "assistant"]
 
 
+def test_message_writes_recursively_escape_nul_characters():
+    store = build_store()
+    session_id = store.create_session(project_id="project-1")
+
+    item = TranscriptItem(
+        role=RuntimeMessageRole.TOOL_RESULT,
+        content="source contains \x00 byte",
+        name="Read\x00Tool",
+        metadata={"nested": {"value": "meta\x00data"}},
+        payload={"output": ["first", {"value": "payload\x00data"}]},
+    )
+    message_id = store.append_message(session_id, item)
+    store.update_message_content(message_id, content="updated\x00content")
+    store.update_message_payload(
+        message_id,
+        payload={"extra": {"value": "extra\x00data"}},
+    )
+
+    message = store.get_message(message_id)
+
+    assert message is not None
+    assert item.content == "source contains \\x00 byte"
+    assert item.metadata == {"nested": {"value": "meta\\x00data"}}
+    assert item.payload == {"output": ["first", {"value": "payload\\x00data"}]}
+    assert message.content == "updated\\x00content"
+    assert message.name == "Read\\x00Tool"
+    assert message.message_metadata == {"nested": {"value": "meta\\x00data"}}
+    assert message.payload == {
+        "output": ["first", {"value": "payload\\x00data"}],
+        "extra": {"value": "extra\\x00data"},
+    }
+
+
 def test_open_turn_checkpoint_tool_call_skill_invocation_and_memories_round_trip():
     store = build_store()
     session_id = store.create_session(project_id="project-1")

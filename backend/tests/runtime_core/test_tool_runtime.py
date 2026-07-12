@@ -66,11 +66,51 @@ class SkillTool(RuntimeTool):
         )
 
 
+class SlowTool(RuntimeTool):
+    name = "Slow"
+    description = "Slow tool"
+    input_model = EchoInput
+
+    async def execute(self, parsed_input: EchoInput, context: ToolExecutionContext) -> ToolExecutionPayload:
+        await asyncio.sleep(float(parsed_input.text))
+        return ToolExecutionPayload(content="finished")
+
+
 def build_store() -> AuditSessionStore:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
     return AuditSessionStore(session_factory=session_factory)
+
+
+def test_tool_orchestrator_times_out_slow_runtime_tools():
+    store = build_store()
+    session_id = store.create_session(project_id="project-1")
+    turn_id = store.open_turn(session_id, model_name="gpt-test")
+    registry = ToolRegistry([SlowTool()])
+    orchestrator = ToolOrchestrator(
+        session_store=store,
+        tool_registry=registry,
+        agent_type="finding",
+        default_tool_timeout_seconds=0.01,
+    )
+
+    records = asyncio.run(
+        orchestrator.execute_tool_calls(
+            session_id=session_id,
+            turn_id=turn_id,
+            tool_calls=[ToolCallRequest(id="tool-1", name="Slow", input={"text": "1"})],
+        )
+    )
+
+    snapshot = store.load_session_snapshot(session_id)
+
+    assert records[0].status == AuditToolCallStatus.FAILED.value
+    assert records[0].result.is_error is True
+    assert records[0].result.metadata["error_kind"] == "timeout_error"
+    assert "path/glob/pattern" in records[0].error_message
+    assert snapshot.tool_calls[0].status == AuditToolCallStatus.FAILED.value
+    assert snapshot.tool_calls[0].error_message == records[0].error_message
 
 
 def build_workspace_temp_dir() -> Path:

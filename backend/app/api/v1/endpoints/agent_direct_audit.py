@@ -228,7 +228,10 @@ async def _raise_or_emit_direct_audit_runtime_error_if_needed(
     db: AsyncSession,
     emit: Callable[[dict[str, Any]], Any] | None = None,
 ) -> str | None:
-    if _normalize_runner_stop_reason(runner_result) != RuntimeStopReason.MODEL_ERROR.value:
+    if _normalize_runner_stop_reason(runner_result) not in {
+        RuntimeStopReason.MODEL_ERROR.value,
+        RuntimeStopReason.PERSISTENCE_ERROR.value,
+    }:
         return None
     turn_id = getattr(runner_result, "turn_id", None)
     if turn_id is None and isinstance(runner_result, dict):

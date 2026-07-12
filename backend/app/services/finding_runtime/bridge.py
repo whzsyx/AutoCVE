@@ -1,39 +1,43 @@
 from __future__ import annotations
 
-import json
 import inspect
+import json
 import re
-from typing import Any, AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable
+from typing import Any
 
 from app.db.session import get_sync_session_factory
 from app.services.agent.json_parser import AgentJsonParser
 from app.services.finding_runtime.adapters.finding import FindingRuntimeAdapter
+from app.services.finding_runtime.memory import RuntimeMemoryManager
 from app.services.finding_runtime.models import (
     RuntimeCompletionMode,
     RuntimeMessageRole,
     RuntimeModelResponse,
     RuntimeStopReason,
-    RuntimeTerminalAction,
     TranscriptItem,
     TurnExecutionResult,
 )
-from app.services.finding_runtime.memory import RuntimeMemoryManager
 from app.services.finding_runtime.runner import FindingRuntimeRunner
 from app.services.finding_runtime.session_store import AuditSessionStore
 from app.services.finding_runtime.skills import RuntimeSkillCatalog
-from app.services.finding_runtime.tools.finalize_finding import FinalizeFindingTool
-from app.services.finding_runtime.tools.finalize_vulnerability_reports import FinalizeVulnerabilityReportsTool
 from app.services.finding_runtime.tooling import ToolOrchestrator, ToolRegistry
+from app.services.finding_runtime.tools.finalize_finding import FinalizeFindingTool
+from app.services.finding_runtime.tools.finalize_vulnerability_reports import (
+    FinalizeVulnerabilityReportsTool,
+)
 from app.services.runtime_core import build_runtime_tool_registry
 from app.services.runtime_core.tool_message_codec import (
     ToolMessageFormat,
     build_runtime_model_messages,
 )
+from app.services.llm.protocols.registry import resolve_tool_message_format
 
 READ_SAFE_RUNTIME_TOOLS = {"Read", "Glob", "Grep", "Skill"}
 REPORT_GENERATION_RUNTIME_TOOLS = {"Read", "Glob", "Grep"}
 INTERNAL_TOOL_NAMES = {"think", "reflect", "load_skill_body", "skill_resource_lookup"}
 AUTO_FINALIZER_PROMPTS_ENABLED = True
+RESUME_TERMINAL_ACTION_NUDGE_LIMIT = 5
 RUNTIME_FINALIZATION_PROMPT = (
     "你正在处理 Finding 阶段的最终提交恢复流程。\n\n"
     "不要因为当前已经存在一个完整漏洞就直接结束。FinalizeFinding 是终点工具，调用成功后审计会立即停止。\n\n"
@@ -66,6 +70,19 @@ class RuntimeLLMModelClient:
     def __init__(self, *, llm_service, agent_type: str = "finding"):
         self._llm_service = llm_service
         self._agent_type = agent_type
+
+    @staticmethod
+    def _finding_stream_retry_override(stream_fn: Callable[..., Any]) -> dict[str, Any]:
+        """Disable LLMService retries when QueryLoop owns the retry budget."""
+        try:
+            parameters = inspect.signature(stream_fn).parameters.values()
+        except (TypeError, ValueError):
+            return {}
+        if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+            return {"retry_enabled": False}
+        if any(parameter.name == "retry_enabled" for parameter in parameters):
+            return {"retry_enabled": False}
+        return {}
 
     async def complete(
         self,
@@ -129,6 +146,7 @@ class RuntimeLLMModelClient:
             tools=[self._to_llm_tool_schema(item) for item in tool_definitions],
             parallel_tool_calls=True,
             max_tokens=max_output_tokens_override,
+            **self._finding_stream_retry_override(self._llm_service.chat_completion_stream),
         ):
             if on_event is not None:
                 maybe_awaitable = on_event(event)
@@ -183,6 +201,7 @@ class RuntimeLLMModelClient:
                 tools=[self._to_llm_tool_schema(item) for item in tool_definitions],
                 parallel_tool_calls=True,
                 max_tokens=max_output_tokens_override,
+                **self._finding_stream_retry_override(stream_fn),
             ):
                 normalized = self._normalize_stream_event(event, accumulated=accumulated)
                 if normalized is None:
@@ -244,15 +263,11 @@ class RuntimeLLMModelClient:
         if not raw or str(raw).strip().lower() == "auto":
             endpoint_protocol = str(getattr(config, "endpoint_protocol", "") or "").strip().lower()
             provider = str(getattr(getattr(config, "provider", None), "value", None) or getattr(config, "provider", "") or "").strip().lower()
-            if endpoint_protocol in {"anthropic", "anthropic_messages"}:
-                return ToolMessageFormat.ANTHROPIC_BLOCKS
-            if endpoint_protocol in {"openai", "openai_compatible", "openai-compatible", "chat_completions"}:
-                return ToolMessageFormat.OPENAI_TOOLS
-            if provider in {"claude", "anthropic"}:
-                return ToolMessageFormat.ANTHROPIC_BLOCKS
-            return ToolMessageFormat.OPENAI_TOOLS
+            resolved = resolve_tool_message_format(endpoint_protocol, provider=provider, requested="auto")
+            return ToolMessageFormat(resolved)
         try:
-            return ToolMessageFormat(str(raw))
+            resolved = resolve_tool_message_format(getattr(config, "endpoint_protocol", None), provider=None, requested=str(raw))
+            return ToolMessageFormat(resolved)
         except ValueError:
             return ToolMessageFormat.OPENAI_TOOLS
 
@@ -684,6 +699,8 @@ class FindingRuntimeBridge:
             tool_registry=tool_registry,
             tool_orchestrator=tool_orchestrator,
             max_turns=max_turns,
+            require_terminal_action=True,
+            terminal_action_nudge_limit=RESUME_TERMINAL_ACTION_NUDGE_LIMIT,
         )
         adapter = FindingRuntimeAdapter(
             session_store=self._session_store,
@@ -691,6 +708,22 @@ class FindingRuntimeBridge:
             skill_catalog=RuntimeSkillCatalog(),
             memory_manager=RuntimeMemoryManager(session_factory=self._session_store._session_factory),
         )
+        self._session_store.append_message(
+            session_id,
+            TranscriptItem(
+                role=RuntimeMessageRole.USER,
+                name="runtime_resume",
+                content=(
+                    "这是一次从上一个完整审计边界恢复的任务。请基于已有审计记录继续检查尚未完成的高价值候选，"
+                    "不要把之前的中断或自然语言总结当作完成。只有确实完成审计后，才调用 FinalizeFinding 提交结构化结果；"
+                    "若仍需证据，请继续调用工具。"
+                ),
+                metadata={"kind": "runtime_resume_instruction"},
+            ),
+        )
+        # Refresh after appending the instruction: QueryLoop reads its persisted
+        # transcript state first, so refreshing before this append would make the
+        # resume instruction visible in the database but invisible to the model.
         await adapter.refresh_session_context(session_id=session_id)
         runner_result = await runner.run_once(session_id=session_id, model_name=model_name)
         snapshot = self._session_store.load_session_snapshot(session_id)
@@ -958,15 +991,6 @@ class FindingRuntimeBridge:
             RUNTIME_FINALIZATION_PROMPT
             + "\n如果仍需继续查看文件、验证调用链、补齐 source/sink/PoC/影响面，请继续调用工具，不要结束。"
         ]
-        return [
-            RUNTIME_FINALIZATION_PROMPT,
-            (
-                "现在请立即仅以严格 JSON 返回最终报告。"
-                "不要再请求任何工具。"
-                "响应必须是一个单独的 JSON 对象，顶层键只能是 findings 和 summary。"
-
-            ),
-        ]
 
     @classmethod
     def _default_fallback_payload(cls, snapshot: Any) -> dict[str, Any]:
@@ -1019,21 +1043,7 @@ class FindingRuntimeBridge:
                 )
             except ValueError:
                 completion_mode = None
-        if completion_mode in {RuntimeCompletionMode.FINALIZE_TOOL, RuntimeCompletionMode.INCOMPLETE}:
-            return False
-        terminal_action = getattr(runner_result, "terminal_action", None)
-        if terminal_action is None and isinstance(runner_result, dict):
-            terminal_action = runner_result.get("terminal_action")
-        if terminal_action is not None:
-            try:
-                terminal_action = (
-                    terminal_action
-                    if isinstance(terminal_action, RuntimeTerminalAction)
-                    else RuntimeTerminalAction(str(terminal_action))
-                )
-            except ValueError:
-                terminal_action = None
-        if terminal_action is RuntimeTerminalAction.NATURAL_END_WITHOUT_TERMINAL_ACTION:
+        if completion_mode == RuntimeCompletionMode.FINALIZE_TOOL:
             return False
         stop_reason = getattr(runner_result, "stop_reason", None)
         if stop_reason is None and isinstance(runner_result, dict):

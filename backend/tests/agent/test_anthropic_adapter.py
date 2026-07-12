@@ -40,6 +40,92 @@ def test_llm_factory_keeps_claude_openai_compatible_on_litellm():
     assert isinstance(adapter, LiteLLMAdapter)
 
 
+def test_anthropic_payload_omits_temperature_for_opus_4_8():
+    adapter = AnthropicAdapter(
+        LLMConfig(
+            provider=LLMProvider.CLAUDE,
+            api_key="test-key",
+            model="claude-opus-4-8",
+            endpoint_protocol="anthropic",
+            temperature=0.1,
+        )
+    )
+
+    payload = adapter._build_payload(
+        LLMRequest(messages=[LLMMessage(role="user", content="Audit this")]),
+        stream=False,
+    )
+
+    assert "temperature" not in payload
+
+
+def test_anthropic_payload_keeps_temperature_for_sonnet_4_5():
+    adapter = AnthropicAdapter(
+        LLMConfig(
+            provider=LLMProvider.CLAUDE,
+            api_key="test-key",
+            model="claude-sonnet-4-5",
+            endpoint_protocol="anthropic",
+            temperature=0.1,
+        )
+    )
+
+    payload = adapter._build_payload(
+        LLMRequest(messages=[LLMMessage(role="user", content="Audit this")]),
+        stream=False,
+    )
+
+    assert payload["temperature"] == 0.1
+
+
+def test_anthropic_payload_removes_final_assistant_prefill_for_opus_4_8():
+    adapter = AnthropicAdapter(
+        LLMConfig(
+            provider=LLMProvider.CLAUDE,
+            api_key="test-key",
+            model="claude-opus-4-8",
+            endpoint_protocol="anthropic",
+        )
+    )
+
+    payload = adapter._build_payload(
+        LLMRequest(
+            messages=[
+                LLMMessage(role="user", content="Finalize the finding."),
+                LLMMessage(role="assistant", content='{"findings": ['),
+            ]
+        ),
+        stream=False,
+    )
+
+    assert payload["messages"][-1]["role"] == "user"
+    assert "assistant draft" in payload["messages"][-1]["content"].lower()
+    assert '{"findings": [' in payload["messages"][-1]["content"]
+
+
+def test_anthropic_payload_keeps_final_assistant_prefill_for_sonnet_4_5():
+    adapter = AnthropicAdapter(
+        LLMConfig(
+            provider=LLMProvider.CLAUDE,
+            api_key="test-key",
+            model="claude-sonnet-4-5",
+            endpoint_protocol="anthropic",
+        )
+    )
+
+    payload = adapter._build_payload(
+        LLMRequest(
+            messages=[
+                LLMMessage(role="user", content="Finalize the finding."),
+                LLMMessage(role="assistant", content='{"findings": ['),
+            ]
+        ),
+        stream=False,
+    )
+
+    assert payload["messages"][-1] == {"role": "assistant", "content": '{"findings": ['}
+
+
 class _FakeStreamResponse:
     status_code = 200
     text = ""

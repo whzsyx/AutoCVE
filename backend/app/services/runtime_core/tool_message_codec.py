@@ -11,6 +11,8 @@ class ToolMessageFormat(StrEnum):
     LEGACY_TEXT = "legacy_text"
     OPENAI_TOOLS = "openai_tools"
     ANTHROPIC_BLOCKS = "anthropic_blocks"
+    RESPONSES_ITEMS = "responses_items"
+    GEMINI_PARTS = "gemini_parts"
 
 
 def build_runtime_model_messages(
@@ -38,6 +40,13 @@ def build_runtime_model_messages(
             system_prompt=system_prompt,
             recon_payload=recon_payload,
             transcript=transcript,
+        )
+    if message_format in {ToolMessageFormat.RESPONSES_ITEMS, ToolMessageFormat.GEMINI_PARTS}:
+        return _build_openai_messages(
+            system_prompt=system_prompt,
+            recon_payload=recon_payload,
+            transcript=transcript,
+            native_tool_history=bool(tool_definitions),
         )
     if message_format is ToolMessageFormat.LEGACY_TEXT:
         return _build_legacy_text_messages(

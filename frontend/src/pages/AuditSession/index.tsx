@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, PanelRightClose, PanelRightOpen, Sparkles } from "lucide-react";
+import { ArrowLeft, Loader2, PanelRightClose, PanelRightOpen, RefreshCw, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -15,10 +15,12 @@ import { useAuditSession } from "@/pages/AuditSession/hooks/useAuditSession";
 import { useAuditSessionChatStream } from "@/pages/AuditSession/hooks/useAuditSessionChatStream";
 import { useAuditSessionStream } from "@/pages/AuditSession/hooks/useAuditSessionStream";
 import type { AuditSessionMessageMode } from "@/shared/api/auditSessions";
+import { resumeAuditSession } from "@/shared/api/auditSessions";
 
 export default function AuditSessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [resuming, setResuming] = useState(false);
   const { session, messages, setMessages, toolCalls, skills, skillInvocations, memories, handoffs, loading, error, refresh } = useAuditSession(sessionId);
   const { isStreaming, streamError, sendMessage, stopStreaming, streamingAssistantId } = useAuditSessionChatStream({
     sessionId,
@@ -49,6 +51,20 @@ export default function AuditSessionPage() {
     }
   }
 
+  async function handleResume() {
+    if (!sessionId) return;
+    try {
+      setResuming(true);
+      await resumeAuditSession(sessionId);
+      toast.success("已从上一个完整回合继续审计");
+      await refresh();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "继续审计失败");
+    } finally {
+      setResuming(false);
+    }
+  }
+
   if (loading) {
     return <div className="p-6 text-sm text-muted-foreground">正在加载审计会话...</div>;
   }
@@ -73,6 +89,18 @@ export default function AuditSessionPage() {
       <div className="relative z-10 mx-auto max-w-[1640px] space-y-4">
         <div className="flex flex-wrap items-center gap-3">
           <AuditSessionHeader session={session} />
+          {session.can_resume ? (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void handleResume()}
+              disabled={resuming}
+              className="h-11 rounded-full border-amber-200 bg-amber-50 px-4 text-amber-800 hover:bg-amber-100"
+            >
+              {resuming ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+              继续审计
+            </Button>
+          ) : null}
           {sidebarCollapsed ? (
             <Button
               type="button"

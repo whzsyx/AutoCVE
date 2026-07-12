@@ -90,6 +90,9 @@ export interface AuditSessionDetail {
   guardrails_enabled?: boolean;
   created_at: string;
   updated_at: string;
+  can_resume?: boolean;
+  last_error_kind?: string | null;
+  resume_status?: string | null;
 }
 
 export type AuditSessionMessageMode = "chat" | "generate_report_and_sync";
@@ -110,6 +113,7 @@ export interface AuditSessionStreamEvent {
     | "done"
     | "error"
     | "llm_retry"
+    | "assistant_tombstone"
     | "heartbeat";
   session_id?: string;
   project_id?: string;
@@ -122,6 +126,9 @@ export interface AuditSessionStreamEvent {
   attempt?: number;
   max_attempts?: number;
   error_type?: string;
+  attempt_id?: string;
+  status?: string;
+  message_id?: string;
   mode?: AuditSessionMessageMode;
   synced_managed_vulnerability?: ManagedVulnerability | null;
 }
@@ -133,6 +140,11 @@ export interface AuditSessionStreamResult {
 
 export async function getAuditSession(sessionId: string): Promise<AuditSessionDetail> {
   const response = await apiClient.get(`/audit-sessions/${sessionId}`);
+  return response.data;
+}
+
+export async function resumeAuditSession(sessionId: string): Promise<{ session_id: string; status: string; message: string }> {
+  const response = await apiClient.post(`/audit-sessions/${sessionId}/resume`);
   return response.data;
 }
 

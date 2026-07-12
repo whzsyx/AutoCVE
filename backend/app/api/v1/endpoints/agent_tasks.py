@@ -31,7 +31,7 @@ from app.models.agent_task import (
     AgentTaskStatus, AgentTaskPhase, AgentEventType,
     VulnerabilitySeverity, FindingStatus,
 )
-from app.models.audit_session import AuditSession, AuditSessionMessage, AuditSessionTurn, AuditToolCall
+from app.models.audit_session import AuditCheckpoint, AuditSession, AuditSessionMessage, AuditSessionTurn, AuditToolCall
 from app.services.finding_runtime.config import FindingRuntimeStack, coerce_finding_runtime_stack
 from app.services.finding_runtime.final_finding_contract import has_meaningful_poc, is_placeholder_finding
 from app.models.project import Project
@@ -62,6 +62,71 @@ router = APIRouter()
 
 # Automatically generate managed-vulnerability reports after finalized findings are imported.
 AUTO_MANAGED_REPORT_POSTPROCESSING_ENABLED = True
+
+
+async def _mark_latest_runtime_session_manual_cancelled(db: AsyncSession, task_id: str) -> None:
+    """Close a fully stopped runtime task at a durable resumable boundary."""
+    from app.models.one_click_cve import OneClickCveBatchProject, OneClickCveProjectStatus
+
+    batch_project = await db.scalar(
+        select(OneClickCveBatchProject)
+        .where(OneClickCveBatchProject.agent_task_id == task_id)
+        .order_by(OneClickCveBatchProject.created_at.desc())
+        .limit(1)
+    )
+    if batch_project is not None:
+        batch_project.status = OneClickCveProjectStatus.CANCELLED
+        batch_project.error_message = "用户已手动终止，可继续审计"
+        batch_project.updated_at_local = datetime.now(timezone.utc)
+
+    session = await db.scalar(
+        select(AuditSession)
+        .where(AuditSession.task_id == task_id, AuditSession.runtime_stack == "runtime")
+        .order_by(AuditSession.created_at.desc())
+        .limit(1)
+    )
+    if session is None or session.state == "completed":
+        return
+    session.state = "failed"
+    runtime_state = dict(session.runtime_state_json or {})
+    metadata = dict(runtime_state.get("metadata") or {})
+    metadata["manual_cancel"] = {
+        "status": "stopped",
+        "can_resume": True,
+        "stopped_at": datetime.now(timezone.utc).isoformat(),
+    }
+    runtime_state["metadata"] = metadata
+    session.runtime_state_json = runtime_state
+
+    latest_checkpoint = await db.scalar(
+        select(AuditCheckpoint)
+        .where(AuditCheckpoint.session_id == session.id)
+        .order_by(AuditCheckpoint.created_at.desc())
+        .limit(1)
+    )
+    latest_payload = dict(latest_checkpoint.state_payload or {}) if latest_checkpoint is not None else {}
+    if latest_payload.get("checkpoint_kind") == "manual_cancelled":
+        return
+    turn_id = await db.scalar(
+        select(AuditSessionTurn.id)
+        .where(AuditSessionTurn.session_id == session.id)
+        .order_by(AuditSessionTurn.sequence.desc())
+        .limit(1)
+    )
+    db.add(
+        AuditCheckpoint(
+            session_id=session.id,
+            turn_id=turn_id,
+            checkpoint_type="auto",
+            state_payload={
+                "checkpoint_kind": "manual_cancelled",
+                "resumable": True,
+                "error_kind": "manual_cancelled",
+                "error": "Audit manually cancelled by user",
+                "phase": "task_shutdown",
+            },
+        )
+    )
 
 # Running task registry kept for cancellation and legacy task lookups.
 
@@ -882,6 +947,7 @@ async def _generate_managed_report_bundle_from_session(
                 payload_extractor=report_service.extract_generation_payload_from_snapshot,
                 finalizer_prompts=[],
                 terminal_action_nudge_message=report_service.build_generation_terminal_nudge(),
+                fallback_payload_builder=lambda _: None,
             )
             bundle = continuation.get("final_payload")
             if bundle is None:
@@ -1196,6 +1262,7 @@ async def _execute_agent_task_impl(task_id: str):
                         "llmBaseUrl",
                         "llmTimeout",
                         "llmTemperature",
+                        "llmTopP",
                         "llmMaxTokens",
                         "alwaysThinkingEnabled",
                     ):
@@ -1444,7 +1511,8 @@ async def _execute_agent_task_impl(task_id: str):
                 await event_emitter.emit_info("Final vulnerability report generated")
                 await event_emitter.emit_phase_complete("reporting", f"Audit completed with {saved_count} findings")
             else:
-                task.status = AgentTaskStatus.CANCELLED if is_task_cancelled(task_id) else AgentTaskStatus.FAILED
+                task_was_cancelled = is_task_cancelled(task_id)
+                task.status = AgentTaskStatus.CANCELLED if task_was_cancelled else AgentTaskStatus.FAILED
                 task.completed_at = datetime.now(timezone.utc)
                 task.error_message = result.error if hasattr(result, "error") else "Unknown execution error"
                 task.duration_ms = duration_ms
@@ -1455,6 +1523,8 @@ async def _execute_agent_task_impl(task_id: str):
                     task.tool_calls_count = max(int(task.tool_calls_count or 0), int(runtime_stats["tool_calls_count"]))
                 if runtime_stats.get("tokens_used"):
                     task.tokens_used = max(int(task.tokens_used or 0), int(runtime_stats["tokens_used"]))
+                if task_was_cancelled:
+                    await _mark_latest_runtime_session_manual_cancelled(db, task_id)
                 await db.commit()
                 await event_emitter.emit_error(task.error_message or "Task failed")
 
@@ -1462,9 +1532,10 @@ async def _execute_agent_task_impl(task_id: str):
             logger.info(f"Task {task_id} cancelled")
             task = await db.get(AgentTask, task_id)
             if task:
+                existing_error_message = task.error_message
                 task.status = AgentTaskStatus.CANCELLED
                 task.completed_at = datetime.now(timezone.utc)
-                task.error_message = "Task cancelled"
+                task.error_message = existing_error_message or "Task cancelled"
                 task.duration_ms = int((time.time() - start_time) * 1000)
                 runtime_stats = (await _load_runtime_task_stats(db, [task_id])).get(str(task_id), {})
                 if runtime_stats.get("total_iterations"):
@@ -1473,6 +1544,7 @@ async def _execute_agent_task_impl(task_id: str):
                     task.tool_calls_count = max(int(task.tool_calls_count or 0), int(runtime_stats["tool_calls_count"]))
                 if runtime_stats.get("tokens_used"):
                     task.tokens_used = max(int(task.tokens_used or 0), int(runtime_stats["tokens_used"]))
+                await _mark_latest_runtime_session_manual_cancelled(db, task_id)
                 await db.commit()
             await event_emitter.emit_warning("Task cancelled")
         except Exception as exc:

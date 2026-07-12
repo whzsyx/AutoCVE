@@ -39,6 +39,11 @@ class RuntimeStopReason(StrEnum):
     PROMPT_TOO_LONG = "prompt_too_long"
     IMAGE_ERROR = "image_error"
     MODEL_ERROR = "model_error"
+    MODEL_STREAM_TIMEOUT = "model_stream_timeout"
+    TOOL_TIMEOUT = "tool_timeout"
+    AGENT_TIMEOUT = "agent_timeout"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+    PERSISTENCE_ERROR = "persistence_error"
     ABORTED_STREAMING = "aborted_streaming"
     ABORTED_TOOLS = "aborted_tools"
     STOP_HOOK_PREVENTED = "stop_hook_prevented"
@@ -154,6 +159,7 @@ class RuntimeSessionSnapshot:
     skill_invocations: list[Any] = field(default_factory=list)
     memories: list[Any] = field(default_factory=list)
     handoffs: list[Any] = field(default_factory=list)
+    model_stream_attempts: list[Any] = field(default_factory=list)
 
 
 @dataclass(slots=True)

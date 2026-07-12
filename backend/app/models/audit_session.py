@@ -61,6 +61,12 @@ class AuditSession(Base):
         cascade="all, delete-orphan",
         order_by="AuditSessionTurn.sequence",
     )
+    model_stream_attempts = relationship(
+        "AuditModelStreamAttempt",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="AuditModelStreamAttempt.started_at",
+    )
     checkpoints = relationship(
         "AuditCheckpoint",
         back_populates="session",
@@ -123,6 +129,29 @@ class AuditSessionTurn(Base):
     checkpoints = relationship("AuditCheckpoint", back_populates="turn")
     tool_calls = relationship("AuditToolCall", back_populates="turn", order_by="AuditToolCall.sequence")
     skill_invocations = relationship("AuditSkillInvocation", back_populates="turn", order_by="AuditSkillInvocation.sequence")
+    model_stream_attempts = relationship(
+        "AuditModelStreamAttempt",
+        back_populates="turn",
+        order_by="AuditModelStreamAttempt.attempt_number",
+    )
+
+
+class AuditModelStreamAttempt(Base):
+    __tablename__ = "audit_model_stream_attempts"
+
+    id = Column(String(36), primary_key=True)
+    session_id = Column(String(36), ForeignKey("audit_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    turn_id = Column(String(36), ForeignKey("audit_session_turns.id", ondelete="CASCADE"), nullable=False, index=True)
+    attempt_number = Column(Integer, nullable=False)
+    status = Column(String(32), nullable=False, default="running")
+    error_kind = Column(String(64), nullable=True)
+    error_message = Column(Text, nullable=True)
+    provider_request_count = Column(Integer, nullable=False, default=1)
+    started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    session = relationship("AuditSession", back_populates="model_stream_attempts")
+    turn = relationship("AuditSessionTurn", back_populates="model_stream_attempts")
 
 
 class AuditCheckpoint(Base):

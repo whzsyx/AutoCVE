@@ -23,6 +23,7 @@ import {
   getAuditSession,
   getAuditSessionHandoffs,
   getAuditSessionMessages,
+  resumeAuditSession,
 } from "@/shared/api/auditSessions";
 import type { AuditSessionDetail, AuditSessionHandoff, AuditSessionMessage } from "@/pages/AuditSession/types";
 import CreateAgentTaskDialog from "@/components/agent/CreateAgentTaskDialog";
@@ -284,6 +285,8 @@ function AgentAuditPageContent() {
   // 馃敟 浣跨敤 state 鏉ユ爣璁板巻鍙蹭簨浠跺姞杞界姸鎬佸拰瑙﹀彂 streamOptions 閲嶆柊璁＄畻
   const [afterSequence, setAfterSequence] = useState<number>(0);
   const [historicalEventsLoaded, setHistoricalEventsLoaded] = useState<boolean>(false);
+  const [isResuming, setIsResuming] = useState(false);
+  const [runtimeSessionCanResume, setRuntimeSessionCanResume] = useState(false);
 
   // 馃敟 褰?taskId 鍙樺寲鏃剁珛鍗抽噸缃姸鎬侊紙鏂板缓浠诲姟鏃舵竻鐞嗘棫鏃ュ織锛?
   useEffect(() => {
@@ -369,6 +372,7 @@ function AgentAuditPageContent() {
 
   const loadRuntimeSessionSnapshot = useCallback(async (runtimeSessionId?: string | null): Promise<LogItem[]> => {
     if (!runtimeSessionId) {
+      setRuntimeSessionCanResume(false);
       return [];
     }
     try {
@@ -377,8 +381,10 @@ function AgentAuditPageContent() {
         getAuditSessionMessages(runtimeSessionId),
         getAuditSessionHandoffs(runtimeSessionId),
       ]);
+      setRuntimeSessionCanResume(Boolean(session.can_resume));
       return buildRuntimeSessionLogs(messages, handoffs, session);
     } catch (error) {
+      setRuntimeSessionCanResume(false);
       console.error('[AgentAudit] Failed to load runtime session trace:', error);
       return [];
     }
@@ -1377,6 +1383,10 @@ function AgentAuditPageContent() {
       toast.success("Task cancellation requested");
       dispatch({ type: 'ADD_LOG', payload: { type: 'info', title: 'Task cancellation confirmed' } });
       await loadTask();
+      if (task?.runtime_session_id) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1500));
+        await loadRuntimeSessionSnapshot(task.runtime_session_id);
+      }
       disconnectStream();
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -1390,6 +1400,21 @@ function AgentAuditPageContent() {
   const handleExportReport = () => {
     if (!task) return;
     setShowExportDialog(true);
+  };
+
+  const handleResumeAudit = async () => {
+    const sessionId = task?.runtime_session_id;
+    if (!sessionId) return;
+    try {
+      setIsResuming(true);
+      await resumeAuditSession(sessionId);
+      await loadTask();
+      toast.success('已从上一个完整回合继续审计');
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '继续审计失败');
+    } finally {
+      setIsResuming(false);
+    }
   };
 
   // ============ Render ============
@@ -1429,10 +1454,12 @@ function AgentAuditPageContent() {
         task={task}
         isRunning={isRunning}
         isCancelling={isCancelling}
+        isResuming={isResuming}
         sessionHref={task?.runtime_session_id ? `/audit-sessions/${task.runtime_session_id}` : null}
         onCancel={handleCancel}
         onExport={handleExportReport}
         onNewAudit={() => setShowCreateDialog(true)}
+        onResume={runtimeSessionCanResume ? handleResumeAudit : undefined}
       />
 
       {/* Main content */}

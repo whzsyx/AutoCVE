@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
+import uuid
 from datetime import datetime, timezone
 
 from app.models.audit_session import AuditCheckpointType
@@ -40,6 +41,7 @@ from app.services.finding_runtime.query_context import (
 from app.services.finding_runtime.query_degradation import handle_recoverable_response
 from app.services.finding_runtime.query_messages import normalize_messages_for_model
 from app.services.finding_runtime.query_state import QueryLoopState
+from app.services.finding_runtime.session_store import AuditSessionPersistenceError
 from app.services.runtime_core.tool_search_runtime import TOOL_SEARCH_TOOL_NAME
 from app.services.finding_runtime.query_stop_hooks import (
     build_stop_hook_artifact_messages,
@@ -58,6 +60,7 @@ from app.services.finding_runtime.query_transitions import (
 
 class QueryLoop:
     ALLOW_LEGACY_TEXT_TOOL_CALLS = False
+    MODEL_STREAM_MAX_RETRIES = 5
     _CONTINUE_INTENT_PATTERNS = (
         re.compile(r"继续审查"),
         re.compile(r"继续检查"),
@@ -160,18 +163,98 @@ class QueryLoop:
         assistant_stream_placeholder_id = f"streaming-{session_id}-{turn_id}"
 
         try:
-            collected = await self._collect_model_turn(
-                session_id=session_id,
-                turn_id=turn_id,
-                state=state,
-                snapshot=snapshot,
-                effective_system_prompt=effective_system_prompt,
-                prepared_messages=prepared_messages,
-                model_name=model_name,
-                tool_definitions=tool_definitions,
-                assistant_stream_placeholder_id=assistant_stream_placeholder_id,
-                assistant_stream_sequence=assistant_stream_sequence,
-            )
+            collected = None
+            last_model_error: Exception | None = None
+            for attempt_number in range(1, self.MODEL_STREAM_MAX_RETRIES + 2):
+                attempt_id = str(uuid.uuid4())
+                attempt_placeholder_id = f"{assistant_stream_placeholder_id}-{attempt_id}"
+                self._session_store.start_model_stream_attempt(
+                    attempt_id=attempt_id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    attempt_number=attempt_number,
+                )
+                try:
+                    collected = await self._collect_model_turn(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        state=state,
+                        snapshot=snapshot,
+                        effective_system_prompt=effective_system_prompt,
+                        prepared_messages=prepared_messages,
+                        model_name=model_name,
+                        tool_definitions=tool_definitions,
+                        assistant_stream_placeholder_id=attempt_placeholder_id,
+                        assistant_stream_sequence=assistant_stream_sequence,
+                        attempt_id=attempt_id,
+                    )
+                    self._session_store.complete_model_stream_attempt(attempt_id, status="committed")
+                    break
+                except AuditSessionPersistenceError as exc:
+                    self._session_store.complete_model_stream_attempt(
+                        attempt_id,
+                        status="tombstone",
+                        error_kind="persistence_error",
+                        error_message=str(exc).strip() or repr(exc),
+                    )
+                    raise
+                except asyncio.CancelledError:
+                    self._session_store.complete_model_stream_attempt(
+                        attempt_id,
+                        status="tombstone",
+                        error_kind="cancelled",
+                        error_message="Model stream attempt cancelled",
+                    )
+                    raise
+                except Exception as exc:
+                    last_model_error = exc
+                    error_kind = self._classify_model_stream_error(exc)
+                    retryable = self._is_retryable_model_stream_error(exc)
+                    exhausted = attempt_number > self.MODEL_STREAM_MAX_RETRIES
+                    attempt_status = "superseded" if retryable and not exhausted else "tombstone"
+                    self._session_store.complete_model_stream_attempt(
+                        attempt_id,
+                        status=attempt_status,
+                        error_kind=error_kind,
+                        error_message=str(exc).strip() or repr(exc),
+                    )
+                    self._session_store.create_checkpoint(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        checkpoint_type=AuditCheckpointType.AUTO,
+                        state_payload={
+                            "kind": "model_stream_attempt",
+                            "attempt_id": attempt_id,
+                            "attempt_number": attempt_number,
+                            "status": attempt_status,
+                            "error_kind": error_kind,
+                            "error": str(exc).strip() or repr(exc),
+                        },
+                    )
+                    await self._emit_event(
+                        {
+                            "type": "assistant_tombstone",
+                            "attempt_id": attempt_id,
+                            "message_id": attempt_placeholder_id,
+                            "status": attempt_status,
+                            "error_kind": error_kind,
+                        }
+                    )
+                    if not retryable or exhausted:
+                        raise
+                    await self._emit_event(
+                        {
+                            "type": "llm_retry",
+                            "attempt": attempt_number + 1,
+                            "max_attempts": self.MODEL_STREAM_MAX_RETRIES + 1,
+                            "attempt_id": attempt_id,
+                            "message_text": "模型流中断，正在从上一个完整回合自动重试。",
+                            "error_type": error_kind,
+                        }
+                    )
+                    await asyncio.sleep(min(4.0, float(2 ** (attempt_number - 1))))
+            if collected is None:
+                raise last_model_error or RuntimeError("Model stream failed without an error detail")
         except asyncio.CancelledError:
             return self._finalize_terminal_result(
                 session_id=session_id,
@@ -179,18 +262,59 @@ class QueryLoop:
                 state=state,
                 messages=state.messages,
                 stop_reason=RuntimeStopReason.ABORTED_STREAMING,
-                status="aborted_streaming",
+                status="manual_cancelled",
+                checkpoint_extra={
+                    "phase": "model",
+                    "checkpoint_kind": "manual_cancelled",
+                    "resumable": True,
+                    "error_kind": "manual_cancelled",
+                    "error": "Audit manually cancelled during model streaming",
+                },
             )
-        except Exception as exc:
+        except AuditSessionPersistenceError as exc:
             return self._finalize_terminal_result(
                 session_id=session_id,
                 turn_id=turn_id,
                 state=state,
                 messages=state.messages,
-                stop_reason=RuntimeStopReason.MODEL_ERROR,
-                status="model_error",
+                stop_reason=RuntimeStopReason.PERSISTENCE_ERROR,
+                status="persistence_error",
+                checkpoint_extra={
+                    "phase": "message_persistence",
+                    "error": str(exc).strip() or repr(exc),
+                    "error_class": exc.__class__.__name__,
+                },
+            )
+        except Exception as exc:
+            error_kind = self._classify_model_stream_error(exc)
+            stop_reason = (
+                RuntimeStopReason.MODEL_STREAM_TIMEOUT
+                if error_kind == "model_stream_timeout"
+                else RuntimeStopReason.QUOTA_EXHAUSTED
+                if error_kind == "quota_exhausted"
+                else RuntimeStopReason.MODEL_ERROR
+            )
+            await self._emit_event(
+                {
+                    "type": "error",
+                    "error_type": error_kind,
+                    "error": str(exc).strip() or repr(exc),
+                    "user_message": "模型流自动重试已耗尽，可稍后继续同一审计。",
+                    "message_text": "模型流自动重试已耗尽，可稍后继续同一审计。",
+                }
+            )
+            return self._finalize_terminal_result(
+                session_id=session_id,
+                turn_id=turn_id,
+                state=state,
+                messages=state.messages,
+                stop_reason=stop_reason,
+                status="resumable_failed",
                 checkpoint_extra={
                     "phase": "model",
+                    "checkpoint_kind": "resumable_failed",
+                    "resumable": True,
+                    "error_kind": error_kind,
                     "error": str(exc).strip() or repr(exc),
                     "error_class": exc.__class__.__name__,
                 },
@@ -213,6 +337,7 @@ class QueryLoop:
         completion_mode: RuntimeCompletionMode | None = None
         final_payload: dict[str, Any] | None = None
         continue_intent_without_action = False
+        empty_model_response = False
 
         if not tool_requests and legacy_text_tool_calls and tool_definitions and self._tool_orchestrator is not None:
             legacy_tool_names = [str(item.get("name") or "").strip() for item in legacy_text_tool_calls if str(item.get("name") or "").strip()]
@@ -345,9 +470,30 @@ class QueryLoop:
                         state=state,
                         messages=working_messages,
                         stop_reason=RuntimeStopReason.ABORTED_TOOLS,
-                        status="aborted_tools",
+                        status="manual_cancelled",
                         assistant_message_id=assistant_message_id,
-                        checkpoint_extra={"phase": "tool_execution"},
+                        checkpoint_extra={
+                            "phase": "tool_execution",
+                            "checkpoint_kind": "manual_cancelled",
+                            "resumable": True,
+                            "error_kind": "manual_cancelled",
+                            "error": "Audit manually cancelled during tool execution",
+                        },
+                    )
+                except AuditSessionPersistenceError as exc:
+                    return self._finalize_terminal_result(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        state=state,
+                        messages=working_messages,
+                        stop_reason=RuntimeStopReason.PERSISTENCE_ERROR,
+                        status="persistence_error",
+                        assistant_message_id=assistant_message_id,
+                        checkpoint_extra={
+                            "phase": "message_persistence",
+                            "error": str(exc).strip() or repr(exc),
+                            "error_class": exc.__class__.__name__,
+                        },
                     )
                 except Exception as exc:
                     return self._finalize_terminal_result(
@@ -550,6 +696,14 @@ class QueryLoop:
                         model_response=model_response,
                         tool_definitions=tool_definitions,
                     )
+            empty_model_response = self._is_empty_model_response(model_response)
+            if empty_model_response:
+                checkpoint_extra = {
+                    "phase": "model",
+                    "error_kind": "empty_model_response",
+                    "empty_model_response": True,
+                    "error": "Model stream ended normally without content, reasoning, or tool calls.",
+                }
             if (
                 stop_reason is RuntimeStopReason.COMPLETED
                 and self._should_issue_terminal_action_nudge(
@@ -583,6 +737,15 @@ class QueryLoop:
                     "不要再只用自然语言说明“继续审计”“让我检查”“下一步会做什么”。"
                     "继续就必须实际调用工具，完成就必须提交结构化终点。"
                 )
+                if empty_model_response:
+                    nudge_message.name = "empty_model_response_nudge"
+                    nudge_message.content = (
+                        "上一轮模型流正常结束，但没有返回任何正文、reasoning 或原生工具调用。"
+                        "这不是完成，不能停在这里。下一条 assistant 响应必须二选一："
+                        "仍需审计就立即调用 Read/Grep/Glob/Skill/PowerShell 等工具；"
+                        "审计已完成就调用 FinalizeFinding 提交结构化结果。"
+                    )
+                    nudge_message.metadata = {"synthetic": True, "kind": "empty_model_response_nudge"}
                 next_state = build_continue_state(state, messages=[*working_messages, nudge_message], transition=transition)
                 next_state.tool_use_context["missing_terminal_action_nudge_count"] = int(
                     (state.tool_use_context or {}).get("missing_terminal_action_nudge_count") or 0
@@ -596,6 +759,7 @@ class QueryLoop:
                     transition=transition,
                     assistant_message_id=assistant_message_id,
                     tool_call_ids=[],
+                    extra_state_payload=checkpoint_extra,
                 )
                 return TurnExecutionResult(
                     turn_id=turn_id,
@@ -891,7 +1055,9 @@ class QueryLoop:
         tool_definitions: list[dict[str, Any]],
         assistant_stream_placeholder_id: str,
         assistant_stream_sequence: int,
+        attempt_id: str = "",
     ) -> dict[str, Any]:
+        attempt_id = attempt_id or str(uuid.uuid4())
         stream_fn = getattr(self._model_client, "stream_complete", None)
         if not callable(stream_fn):
             model_response = self._normalize_model_response(
@@ -998,16 +1164,6 @@ class QueryLoop:
         assistant_reasoning_content = ""
         stream_done: dict[str, Any] | None = None
         assistant_stream_started = False
-        executor = None
-        if self._tool_orchestrator is not None:
-            executor = self._tool_orchestrator.build_streaming_executor(
-                session_id=session_id,
-                turn_id=turn_id,
-                tool_calls=[],
-                session=snapshot.session,
-                recon_payload=snapshot.session.recon_payload or {},
-                initial_context=tool_use_context,
-            )
         async for event in stream_fn(
             system_prompt=effective_system_prompt,
             recon_payload=snapshot.session.recon_payload or {},
@@ -1030,7 +1186,7 @@ class QueryLoop:
                                 "sequence": assistant_stream_sequence,
                                 "role": "assistant",
                                 "content": "",
-                                "metadata": {"kind": "direct_audit_assistant_message", "streaming": True},
+                                "metadata": {"kind": "direct_audit_assistant_message", "streaming": True, "attempt_id": attempt_id},
                                 "payload": {},
                                 "created_at": datetime.now(timezone.utc).isoformat(),
                             },
@@ -1063,7 +1219,7 @@ class QueryLoop:
                                 "sequence": assistant_stream_sequence,
                                 "role": "assistant",
                                 "content": "",
-                                "metadata": {"kind": "direct_audit_assistant_message", "streaming": True},
+                                "metadata": {"kind": "direct_audit_assistant_message", "streaming": True, "attempt_id": attempt_id},
                                 "payload": {},
                                 "created_at": datetime.now(timezone.utc).isoformat(),
                             },
@@ -1104,45 +1260,29 @@ class QueryLoop:
                                 "sequence": assistant_stream_sequence,
                                 "role": "assistant",
                                 "content": "",
-                                "metadata": {"kind": "direct_audit_assistant_message", "streaming": True},
+                                "metadata": {"kind": "direct_audit_assistant_message", "streaming": True, "attempt_id": attempt_id},
                                 "payload": {},
                                 "created_at": datetime.now(timezone.utc).isoformat(),
                             },
                         }
                     )
-                if assistant_message_id is None:
-                    assistant_message_id = self._append_streaming_assistant_message(
-                        session_id=session_id,
-                        working_messages=working_messages,
-                        content=assistant_content,
-                        reasoning_content=assistant_reasoning_content,
-                    )
-                tool_use_message_id = self._append_tool_use_message(session_id=session_id, working_messages=working_messages, request=request)
-                await self._emit_message_event(tool_use_message_id)
                 tool_requests.append(request)
-                if executor is not None:
-                    executor.add_tool_call_request(request)
-                    await executor.process_queue()
-                    for update in executor.get_completed_updates():
-                        tool_use_context = await self._consume_executor_update(
-                            session_id=session_id,
-                            update=update,
-                            working_messages=working_messages,
-                            records=records,
-                            tool_call_ids=tool_call_ids,
-                            tool_result_message_ids=tool_result_message_ids,
-                            tool_use_context=tool_use_context,
-                        )
             elif event_type == "done":
                 stream_done = dict(event or {})
                 assistant_content = str(stream_done.get("content") or assistant_content)
                 assistant_reasoning_content = str(stream_done.get("reasoning_content") or assistant_reasoning_content)
-                if assistant_message_id is None and (assistant_content or assistant_reasoning_content):
+                if assistant_message_id is None and (
+                    assistant_content
+                    or assistant_reasoning_content
+                    or tool_requests
+                    or stream_done.get("tool_calls")
+                ):
                     assistant_message_id = self._append_streaming_assistant_message(
                         session_id=session_id,
                         working_messages=working_messages,
                         content=assistant_content,
                         reasoning_content=assistant_reasoning_content,
+                        attempt_id=attempt_id,
                     )
                 elif assistant_message_id is not None:
                     self._session_store.update_message_content(assistant_message_id, content=assistant_content)
@@ -1165,22 +1305,7 @@ class QueryLoop:
                     )
                     if any(existing.id == request.id for existing in tool_requests):
                         continue
-                    tool_use_message_id = self._append_tool_use_message(session_id=session_id, working_messages=working_messages, request=request)
-                    await self._emit_message_event(tool_use_message_id)
                     tool_requests.append(request)
-                    if executor is not None:
-                        executor.add_tool_call_request(request)
-                        await executor.process_queue()
-                        for update in executor.get_completed_updates():
-                            tool_use_context = await self._consume_executor_update(
-                                session_id=session_id,
-                                update=update,
-                                working_messages=working_messages,
-                                records=records,
-                                tool_call_ids=tool_call_ids,
-                                tool_result_message_ids=tool_result_message_ids,
-                                tool_use_context=tool_use_context,
-                            )
             elif event_type == "llm_retry":
                 await self._emit_event(
                     {
@@ -1198,20 +1323,9 @@ class QueryLoop:
                     error_event["accumulated"] = assistant_content
                 if assistant_reasoning_content and not error_event.get("reasoning_content"):
                     error_event["reasoning_content"] = assistant_reasoning_content
-                await self._emit_event(error_event)
                 raise RuntimeError(self._format_stream_error_for_exception(error_event))
-        if executor is not None:
-            async for update in executor.get_remaining_updates():
-                tool_use_context = await self._consume_executor_update(
-                    session_id=session_id,
-                    update=update,
-                    working_messages=working_messages,
-                    records=records,
-                    tool_call_ids=tool_call_ids,
-                    tool_result_message_ids=tool_result_message_ids,
-                    tool_use_context=tool_use_context,
-                )
-            tool_use_context = executor.get_updated_context()
+        if stream_done is None:
+            raise RuntimeError("Model stream ended before a complete done event")
         model_response = self._normalize_model_response(
             {
                 "content": assistant_content,
@@ -1236,7 +1350,7 @@ class QueryLoop:
                                 "sequence": assistant_message.sequence,
                                 "role": "assistant",
                                 "content": "",
-                                "metadata": {"kind": "direct_audit_assistant_message", "streaming": True},
+                            "metadata": {"kind": "direct_audit_assistant_message", "streaming": True, "attempt_id": attempt_id},
                                 "payload": {},
                                 "created_at": assistant_message.created_at.isoformat(),
                             },
@@ -1289,7 +1403,7 @@ class QueryLoop:
             "tool_call_ids": tool_call_ids,
             "records": records,
             "tool_use_context": tool_use_context,
-            "tool_uses_appended": bool(tool_requests and assistant_message_id is not None),
+            "tool_uses_appended": False,
             "legacy_text_tool_calls": legacy_text_tool_calls,
         }
 
@@ -1300,6 +1414,41 @@ class QueryLoop:
         if user_message and raw_error and raw_error != user_message:
             return f"{user_message} 原始错误：{raw_error}"
         return user_message or raw_error or "Streaming failed"
+
+    @staticmethod
+    def _classify_model_stream_error(exc: Exception) -> str:
+        message = f"{exc.__class__.__name__}: {exc}".lower()
+        if any(
+            term in message
+            for term in (
+                "余额不足",
+                "资源包",
+                "insufficient_quota",
+                "quota exceeded",
+                "billing",
+                "rate limit",
+                "rate_limit",
+                "tokens per day",
+                "tokens per minute",
+                "requests per minute",
+            )
+        ) or re.search(r"\b(?:tpd|tpm|rpm)\b", message):
+            return "quota_exhausted"
+        if any(term in message for term in ("timeout", "timed out", "超时")):
+            return "model_stream_timeout"
+        if any(term in message for term in ("401", "403", "unauthorized", "forbidden", "invalid api key")):
+            return "provider_auth_error"
+        if any(term in message for term in ("context length", "prompt too long", "maximum context")):
+            return "prompt_too_long"
+        return "model_stream_error"
+
+    @classmethod
+    def _is_retryable_model_stream_error(cls, exc: Exception) -> bool:
+        return cls._classify_model_stream_error(exc) not in {
+            "quota_exhausted",
+            "provider_auth_error",
+            "prompt_too_long",
+        }
 
     async def _consume_executor_update(
         self,
@@ -1402,6 +1551,14 @@ class QueryLoop:
             return False
         return self._require_terminal_action or continue_intent_without_action
 
+    @staticmethod
+    def _is_empty_model_response(model_response: RuntimeModelResponse) -> bool:
+        return not (
+            str(model_response.content or "").strip()
+            or str(model_response.reasoning_content or "").strip()
+            or list(model_response.tool_calls or [])
+        )
+
     @classmethod
     def _should_issue_legacy_tool_syntax_nudge(
         cls,
@@ -1434,8 +1591,12 @@ class QueryLoop:
         working_messages: list[TranscriptItem],
         content: str,
         reasoning_content: str = "",
+        attempt_id: str | None = None,
     ) -> str:
         payload = {"reasoning_content": reasoning_content} if reasoning_content else {}
+        if attempt_id:
+            payload["attempt_id"] = attempt_id
+            payload["attempt_status"] = "committed"
         assistant_item = TranscriptItem(role=RuntimeMessageRole.ASSISTANT, content=content, payload=payload)
         message_id = self._session_store.append_message(session_id, assistant_item)
         assistant_item.payload = {**payload, "message_id": message_id}

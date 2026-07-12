@@ -360,6 +360,32 @@ async def test_llm_service_chat_completion_stream_retries_connection_failures_be
 
 
 @pytest.mark.asyncio
+async def test_llm_service_chat_completion_stream_can_disable_internal_retry(monkeypatch):
+    adapter = _StreamingRetryProbeAdapter(failures_before_success=2)
+    service = LLMService(
+        user_config={
+            "llmConfig": {
+                "llmProvider": "openai",
+                "llmApiKey": "test-key",
+                "llmModel": "test-model",
+            }
+        }
+    )
+    monkeypatch.setattr("app.services.llm.service.LLMFactory.create_adapter", lambda config: adapter)
+
+    events = []
+    async for event in service.chat_completion_stream(
+        messages=[{"role": "user", "content": "runtime owns retry"}],
+        retry_enabled=False,
+    ):
+        events.append(event)
+
+    assert [event["type"] for event in events] == ["error"]
+    assert events[0]["error_type"] == "connection"
+    assert adapter.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_llm_service_chat_completion_stream_retries_unknown_empty_error_before_first_output(monkeypatch):
     adapter = _StreamingUnknownErrorEventAdapter(failures_before_success=2)
     service = LLMService(

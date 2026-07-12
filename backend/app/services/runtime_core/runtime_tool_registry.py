@@ -34,8 +34,21 @@ from app.services.runtime_core.shell_runtime_tools import (
     detect_powershell_executable,
     is_powershell_runtime_tool_enabled,
 )
-from app.services.runtime_core.tool_runtime import RuntimeTool, ToolExecutionContext, ToolRegistry
+from app.services.runtime_core.tool_runtime import (
+    RUNTIME_SEARCH_TOOL_TIMEOUT_SECONDS,
+    RUNTIME_SEARCH_TOOL_MAX_TIMEOUT_SECONDS,
+    RuntimeTool,
+    ToolExecutionContext,
+    ToolRegistry,
+)
 from app.services.runtime_core.tool_search_runtime import ToolSearchRuntimeTool
+
+
+GLOB_DEFAULT_MAX_RESULTS = 100
+GLOB_HARD_MAX_RESULTS = 100
+GREP_DEFAULT_MAX_RESULTS = 250
+GREP_HARD_MAX_RESULTS = 250
+TRUNCATED_RESULT_HINT = "结果被截断，使用更具体的 path 或 pattern。"
 
 
 class ReadToolInput(BaseModel):
@@ -51,7 +64,8 @@ class GlobToolInput(BaseModel):
     path: str = Field(default=".", description="Directory relative to the project root.")
     pattern: str | None = Field(default=None, description="Optional glob pattern, for example **/*.java or *.xml.")
     recursive: bool = Field(default=True, description="Whether to walk child directories.")
-    max_results: int = Field(default=120, description="Maximum files to return.")
+    max_results: int = Field(default=GLOB_DEFAULT_MAX_RESULTS, description="Maximum files to return.")
+    timeout_seconds: int = Field(default=RUNTIME_SEARCH_TOOL_TIMEOUT_SECONDS, ge=1, le=RUNTIME_SEARCH_TOOL_MAX_TIMEOUT_SECONDS)
 
 
 class GrepToolInput(BaseModel):
@@ -59,8 +73,9 @@ class GrepToolInput(BaseModel):
     path: str | None = Field(default=None, description="Optional directory relative to the project root.")
     glob: str | None = Field(default=None, description="Optional glob such as *.py or **/*.java.")
     case_sensitive: bool = Field(default=False, description="Whether the search is case sensitive.")
-    max_results: int = Field(default=80, description="Maximum number of matches to return.")
+    max_results: int = Field(default=GREP_DEFAULT_MAX_RESULTS, description="Maximum number of matches to return.")
     is_regex: bool = Field(default=False, description="Whether pattern should be treated as regex.")
+    timeout_seconds: int = Field(default=RUNTIME_SEARCH_TOOL_TIMEOUT_SECONDS, ge=1, le=RUNTIME_SEARCH_TOOL_MAX_TIMEOUT_SECONDS)
 
 
 class WriteToolInput(BaseModel):
@@ -77,6 +92,46 @@ def _result_to_payload(result: Any) -> ToolExecutionPayload:
         metadata={"success": result.success, **(result.metadata or {})},
         is_error=not result.success,
     )
+
+
+def _append_truncation_hint(payload: ToolExecutionPayload, *, requested: int, limit: int) -> ToolExecutionPayload:
+    if requested <= limit:
+        return payload
+    content = payload.content.rstrip()
+    if TRUNCATED_RESULT_HINT not in content:
+        content = f"{content}\n\n{TRUNCATED_RESULT_HINT}" if content else TRUNCATED_RESULT_HINT
+    metadata = dict(payload.metadata or {})
+    metadata.update(
+        {
+            "truncated": True,
+            "requested_limit": requested,
+            "applied_limit": limit,
+        }
+    )
+    output_payload = dict(payload.output_payload or {})
+    output_payload.update(
+        {
+            "truncated": True,
+            "requested_limit": requested,
+            "applied_limit": limit,
+            "truncation_hint": TRUNCATED_RESULT_HINT,
+        }
+    )
+    return ToolExecutionPayload(
+        content=content,
+        output_payload=output_payload,
+        metadata=metadata,
+        is_error=payload.is_error,
+        context_modifier=payload.context_modifier,
+    )
+
+
+def _coerce_positive_int(value: Any, default: int) -> int:
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError):
+        resolved = default
+    return max(1, resolved)
 
 
 def _infer_project_root(agent_tools: dict[str, AgentTool]) -> str | None:
@@ -180,26 +235,39 @@ class CanonicalGlobTool(RuntimeTool):
 
     def validate_input(self, raw_input: dict[str, Any]) -> GlobToolInput:
         payload = dict(raw_input or {})
+        requested_max_results = _coerce_positive_int(
+            payload.get("max_results") or payload.get("max_files"),
+            GLOB_DEFAULT_MAX_RESULTS,
+        )
         normalized = {
             "path": payload.get("path") or payload.get("directory") or ".",
             "pattern": payload.get("pattern") or payload.get("glob"),
             "recursive": payload.get("recursive", True),
-            "max_results": payload.get("max_results") or payload.get("max_files") or 120,
+            "max_results": requested_max_results,
+            "timeout_seconds": payload.get("timeout_seconds") or RUNTIME_SEARCH_TOOL_TIMEOUT_SECONDS,
         }
         return GlobToolInput.model_validate(normalized)
 
     def is_concurrency_safe(self, parsed_input: Any) -> bool:
         return True
 
+    def execution_timeout_seconds(self, parsed_input: Any = None, context: ToolExecutionContext | None = None) -> float | None:
+        del context
+        return min(RUNTIME_SEARCH_TOOL_MAX_TIMEOUT_SECONDS, max(1, int(parsed_input.timeout_seconds))) + 2
+
     async def execute(self, parsed_input: GlobToolInput, context: ToolExecutionContext) -> ToolExecutionPayload:
         del context
+        requested_max_results = parsed_input.max_results
+        applied_max_results = min(max(1, int(parsed_input.max_results)), GLOB_HARD_MAX_RESULTS)
         result = await self._list_tool.execute(
             directory=parsed_input.path,
             pattern=parsed_input.pattern,
             recursive=parsed_input.recursive,
-            max_files=parsed_input.max_results,
+            max_files=applied_max_results,
+            timeout_seconds=parsed_input.timeout_seconds,
         )
-        return _result_to_payload(result)
+        payload = _result_to_payload(result)
+        return _append_truncation_hint(payload, requested=requested_max_results, limit=applied_max_results)
 
 
 class CanonicalGrepTool(RuntimeTool):
@@ -229,30 +297,43 @@ class CanonicalGrepTool(RuntimeTool):
 
     def validate_input(self, raw_input: dict[str, Any]) -> GrepToolInput:
         payload = dict(raw_input or {})
+        requested_max_results = _coerce_positive_int(
+            payload.get("max_results") or payload.get("limit"),
+            GREP_DEFAULT_MAX_RESULTS,
+        )
         normalized = {
             "pattern": payload.get("pattern") or payload.get("query") or payload.get("keyword"),
             "path": payload.get("path") or payload.get("directory"),
             "glob": payload.get("glob") or payload.get("file_pattern"),
             "case_sensitive": payload.get("case_sensitive", False),
-            "max_results": payload.get("max_results") or payload.get("limit") or 80,
+            "max_results": requested_max_results,
             "is_regex": payload.get("is_regex", False),
+            "timeout_seconds": payload.get("timeout_seconds") or RUNTIME_SEARCH_TOOL_TIMEOUT_SECONDS,
         }
         return GrepToolInput.model_validate(normalized)
 
     def is_concurrency_safe(self, parsed_input: Any) -> bool:
         return True
 
+    def execution_timeout_seconds(self, parsed_input: Any = None, context: ToolExecutionContext | None = None) -> float | None:
+        del context
+        return min(RUNTIME_SEARCH_TOOL_MAX_TIMEOUT_SECONDS, max(1, int(parsed_input.timeout_seconds))) + 2
+
     async def execute(self, parsed_input: GrepToolInput, context: ToolExecutionContext) -> ToolExecutionPayload:
         del context
+        requested_max_results = parsed_input.max_results
+        applied_max_results = min(max(1, int(parsed_input.max_results)), GREP_HARD_MAX_RESULTS)
         result = await self._search_tool.execute(
             keyword=parsed_input.pattern,
             file_pattern=parsed_input.glob,
             directory=parsed_input.path,
             case_sensitive=parsed_input.case_sensitive,
-            max_results=parsed_input.max_results,
+            max_results=applied_max_results,
             is_regex=parsed_input.is_regex,
+            timeout_seconds=parsed_input.timeout_seconds,
         )
-        return _result_to_payload(result)
+        payload = _result_to_payload(result)
+        return _append_truncation_hint(payload, requested=requested_max_results, limit=applied_max_results)
 
 
 class CanonicalWriteTool(RuntimeTool):

@@ -38,13 +38,14 @@ import {
   createOneClickCveBatch,
   getOneClickCveBatch,
   listOneClickCveBatches,
+  resumeOneClickCveProject,
   type OneClickCveBatch,
   type OneClickCveProject,
 } from "@/shared/api/oneClickCve";
 
 const ACTIVE_STATUSES = new Set(["pending", "running"]);
 const TARGET_COUNT_MIN = 1;
-const TARGET_COUNT_MAX = 20;
+const TARGET_COUNT_MAX = 10;
 
 function errorMessage(error: unknown, fallback: string) {
   if (typeof error === "object" && error && "response" in error) {
@@ -141,8 +142,12 @@ export default function OneClickCVE() {
   const [starting, setStarting] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [resumingProjectId, setResumingProjectId] = useState("");
 
-  const active = selectedBatch ? ACTIVE_STATUSES.has(selectedBatch.status) : false;
+  const hasActiveResume = Boolean(
+    selectedBatch?.projects.some((project) => project.resume_status === "queued" || project.resume_status === "running"),
+  );
+  const active = selectedBatch ? ACTIVE_STATUSES.has(selectedBatch.status) || hasActiveResume : false;
   const progress = selectedBatch?.requested_count ? Math.min(100, Math.round((selectedBatch.found_count / selectedBatch.requested_count) * 100)) : 0;
   const batchStats = useMemo(() => {
     const projects = selectedBatch?.projects || [];
@@ -191,7 +196,7 @@ export default function OneClickCVE() {
   async function startBatch() {
     const requestedCount = Number(targetCount);
     if (!Number.isInteger(requestedCount) || requestedCount < TARGET_COUNT_MIN || requestedCount > TARGET_COUNT_MAX) {
-      const message = "请输入 1-20 之间的整数";
+      const message = "请输入 1-10 之间的整数";
       setTargetCountError(message);
       toast.error(message);
       return;
@@ -224,6 +229,20 @@ export default function OneClickCVE() {
       toast.error(errorMessage(error, "取消一键 CVE 失败"));
     } finally {
       setCancelling(false);
+    }
+  }
+
+  async function resumeProject(project: OneClickCveProject) {
+    if (!selectedBatch?.id) return;
+    try {
+      setResumingProjectId(project.id);
+      await resumeOneClickCveProject(selectedBatch.id, project.id);
+      toast.success("已从上一个完整回合继续审计");
+      await refreshBatch(selectedBatch.id);
+    } catch (error) {
+      toast.error(errorMessage(error, "继续审计失败"));
+    } finally {
+      setResumingProjectId("");
     }
   }
 
@@ -403,7 +422,12 @@ export default function OneClickCVE() {
                   <div className="px-5 py-14 text-center text-sm text-slate-500">暂无项目记录</div>
                 )}
                 {(selectedBatch?.projects || []).map((project) => (
-                  <ProjectRow key={project.id} project={project} />
+                  <ProjectRow
+                    key={project.id}
+                    project={project}
+                    onResume={resumeProject}
+                    resuming={resumingProjectId === project.id}
+                  />
                 ))}
               </div>
             </section>
@@ -434,7 +458,7 @@ export default function OneClickCVE() {
               <div className="mb-2 flex items-center justify-between gap-3">
                 <label className="text-sm font-semibold text-slate-900">目标漏洞数量</label>
                 <span className="rounded-full border border-[#d8e6de] bg-[#f7fbf8] px-2.5 py-1 text-xs font-medium text-[#5f7567]">
-                  1-20
+                  1-10
                 </span>
               </div>
               <Input
@@ -449,10 +473,10 @@ export default function OneClickCVE() {
                   setTargetCountError("");
                 }}
                 className="h-12 rounded-2xl border-[#cfded5] bg-[#fbfdfb] text-base font-semibold text-slate-950 shadow-inner focus-visible:ring-[#6d9a76]"
-                placeholder="输入 1-20 之间的整数"
+                placeholder="输入 1-10 之间的整数"
               />
               <div className={`mt-2 text-xs ${targetCountError ? "text-red-600" : "text-slate-500"}`}>
-                {targetCountError || "仅支持 1-20 之间的整数"}
+                {targetCountError || "仅支持 1-10 之间的整数"}
               </div>
             </div>
 
@@ -555,8 +579,33 @@ function InteractiveProgress({ value, active }: { value: number; active: boolean
   );
 }
 
-function ProjectRow({ project }: { project: OneClickCveProject }) {
+function ProjectRow({
+  project,
+  onResume,
+  resuming,
+}: {
+  project: OneClickCveProject;
+  onResume: (project: OneClickCveProject) => void | Promise<void>;
+  resuming: boolean;
+}) {
   const canViewFindings = project.findings_count > 0;
+  const resumeState = (() => {
+    if (project.resume_status === "queued") {
+      return { label: "排队中", className: "border-amber-200 bg-amber-50 text-amber-800" };
+    }
+    if (project.resume_status === "running") {
+      const attempt = Number(project.resume_attempt || 0);
+      const maxAttempts = Number(project.resume_max_attempts || 6);
+      return {
+        label: attempt > 1 ? `重试第 ${attempt}/${maxAttempts} 次` : "审计中",
+        className: "border-sky-200 bg-sky-50 text-sky-800",
+      };
+    }
+    if (project.resume_status === "resumable_failed" || project.resume_status === "enqueue_failed") {
+      return { label: "恢复失败", className: "border-red-200 bg-red-50 text-red-700" };
+    }
+    return null;
+  })();
 
   return (
     <div className="px-5 py-4 transition hover:bg-[#f8fbf9]">
@@ -590,6 +639,12 @@ function ProjectRow({ project }: { project: OneClickCveProject }) {
             <span>更新 {formatTime(project.pushed_at)}</span>
           </div>
           {project.description && <div className="mt-2 line-clamp-2 text-sm leading-6 text-slate-600">{project.description}</div>}
+          {resumeState && (
+            <div className={`mt-2 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold ${resumeState.className}`}>
+              {(project.resume_status === "queued" || project.resume_status === "running") && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              {resumeState.label}
+            </div>
+          )}
           {project.error_message && <div className="mt-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-sm leading-6 text-red-600">{project.error_message}</div>}
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-2xl border border-[#dce8e1] bg-[#fbfdfb] p-2 shadow-[0_10px_26px_rgba(61,85,75,0.06)]">
@@ -619,6 +674,19 @@ function ProjectRow({ project }: { project: OneClickCveProject }) {
                 <FileSearch className="h-4 w-4" />
                 审计
               </Link>
+            </Button>
+          )}
+          {project.agent_task_id && project.can_resume && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-12 rounded-xl border-amber-200 bg-amber-50 px-3 text-amber-800 hover:bg-amber-100"
+              disabled={resuming}
+              onClick={() => void onResume(project)}
+            >
+              {resuming ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              继续审计
             </Button>
           )}
         </div>

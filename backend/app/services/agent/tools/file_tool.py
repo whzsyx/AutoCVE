@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import json
 import os
-import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -111,6 +112,7 @@ class FileSearchInput(BaseModel):
     case_sensitive: bool = Field(default=False, description="Whether the search is case sensitive")
     max_results: int = Field(default=50, description="Maximum number of matches to return")
     is_regex: bool = Field(default=False, description="Whether keyword should be treated as regex")
+    timeout_seconds: int = Field(default=45, ge=1, le=120, description="Search timeout in seconds (1-120)")
 
 
 class ListFilesInput(BaseModel):
@@ -118,6 +120,30 @@ class ListFilesInput(BaseModel):
     pattern: Optional[str] = Field(default=None, description="Optional glob such as *.py")
     recursive: bool = Field(default=False, description="Whether to walk child directories")
     max_files: int = Field(default=100, description="Maximum number of files to return")
+    timeout_seconds: int = Field(default=45, ge=1, le=120, description="Search timeout in seconds (1-120)")
+
+
+async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    """Terminate rg promptly on result limit, timeout, or task cancellation."""
+    if process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=1.5)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+
+
+def _rg_exclude_args(exclude_dirs: set[str], exclude_patterns: List[str]) -> List[str]:
+    args: List[str] = []
+    for directory in sorted(exclude_dirs):
+        args.extend(["--glob", f"!**/{directory}/**"])
+    for pattern in exclude_patterns:
+        normalized = str(pattern or "").strip().replace("\\", "/")
+        if normalized:
+            args.extend(["--glob", f"!{normalized}"])
+    return args
 
 
 class FileReadTool(AgentTool):
@@ -229,7 +255,12 @@ class FileReadTool(AgentTool):
             end_idx = min(total_lines, end_line) if end_line is not None else min(total_lines, start_idx + max_lines)
             selected_lines = lines[start_idx:end_idx]
 
-        numbered_lines = [f"{index:4d}| {line.rstrip()}" for index, line in enumerate(selected_lines, start=start_idx + 1)]
+        nul_character_count = sum(line.count("\x00") for line in selected_lines)
+        printable_lines = [line.replace("\x00", "\\x00") for line in selected_lines]
+        numbered_lines = [
+            f"{index:4d}| {line.rstrip()}"
+            for index, line in enumerate(printable_lines, start=start_idx + 1)
+        ]
         display_path = _best_display_path(full_path, self.project_root, self.allowed_roots, requested_path)
         language = _detect_language(full_path)
         output = f"文件: {display_path}\n"
@@ -248,6 +279,7 @@ class FileReadTool(AgentTool):
                 "start_line": start_idx + 1,
                 "end_line": end_idx,
                 "language": language,
+                "nul_characters_escaped": nul_character_count,
             },
         )
 
@@ -371,7 +403,19 @@ class FileSearchTool(AgentTool):
         ".vscode",
         ".idea",
         ".vs",
+        ".cache",
+        ".next",
+        ".nuxt",
+        ".parcel-cache",
+        ".pnpm-store",
+        ".svelte-kit",
+        ".turbo",
+        "bower_components",
+        "logs",
+        "out",
         "target",
+        "tmp",
+        "temp",
         "venv",
         "env",
     }
@@ -443,6 +487,7 @@ class FileSearchTool(AgentTool):
         case_sensitive: bool = False,
         max_results: int = 50,
         is_regex: bool = False,
+        timeout_seconds: int = 45,
         **kwargs,
     ) -> ToolResult:
         normalized_keyword = self._normalize_keyword_input(keyword, **kwargs)
@@ -459,64 +504,82 @@ class FileSearchTool(AgentTool):
                 error="Security error: search is limited to the audit project and approved shared roots.",
             )
 
-        flags = 0 if case_sensitive else re.IGNORECASE
-        try:
-            pattern = re.compile(normalized_keyword if is_regex else re.escape(normalized_keyword), flags)
-        except re.error as exc:
-            return ToolResult(success=False, error=f"Invalid search pattern: {exc}")
-
+        rg = shutil.which("rg")
+        if not rg:
+            return ToolResult(success=False, error="Grep unavailable: ripgrep (rg) is not installed in the runtime.")
+        max_results = max(1, int(max_results))
+        timeout_seconds = min(120, max(1, int(timeout_seconds)))
         results: List[Dict[str, Any]] = []
-        files_searched = 0
-        for root, dirs, files in os.walk(search_dir):
-            dirs[:] = [directory_name for directory_name in dirs if directory_name not in self.exclude_dirs]
-            for filename in files:
-                if file_pattern and not fnmatch.fnmatch(filename, file_pattern):
-                    continue
-                full_path = os.path.join(root, filename)
-                display_path = _best_display_path(full_path, self.project_root, self.allowed_roots, full_path)
-                if self.target_files and display_path not in self.target_files and display_path.startswith("skill_library/") is False:
-                    continue
-                if any(
-                    fnmatch.fnmatch(display_path, pattern_text) or fnmatch.fnmatch(filename, pattern_text)
-                    for pattern_text in self.exclude_patterns
-                ):
-                    continue
-
-                try:
-                    lines = await asyncio.to_thread(self._read_file_lines_sync, full_path)
-                except Exception:
-                    continue
-                files_searched += 1
-
-                for index, line in enumerate(lines):
-                    if not pattern.search(line):
+        args = [rg, "--json", "--no-messages", "--line-number", "--with-filename"]
+        if not case_sensitive:
+            args.append("--ignore-case")
+        if not is_regex:
+            args.append("--fixed-strings")
+        if file_pattern:
+            args.extend(["--glob", file_pattern])
+        args.extend(_rg_exclude_args(self.exclude_dirs, self.exclude_patterns))
+        args.extend(["--", normalized_keyword, "."])
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=search_dir,
+        )
+        timed_out = False
+        truncated = False
+        try:
+            assert process.stdout is not None
+            async with asyncio.timeout(timeout_seconds):
+                while raw_line := await process.stdout.readline():
+                    try:
+                        event = json.loads(raw_line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
                         continue
-                    start = max(0, index - 1)
-                    end = min(len(lines), index + 2)
-                    context_lines = []
-                    for inner_index in range(start, end):
-                        prefix = ">" if inner_index == index else " "
-                        context_lines.append(f"{prefix} {inner_index + 1:4d}| {lines[inner_index].rstrip()}")
+                    if event.get("type") != "match":
+                        continue
+                    data = event.get("data") or {}
+                    raw_path = str((data.get("path") or {}).get("text") or "")
+                    if raw_path and not os.path.isabs(raw_path):
+                        raw_path = os.path.join(search_dir, raw_path)
+                    display_path = _best_display_path(raw_path, self.project_root, self.allowed_roots, raw_path)
+                    if self.target_files and display_path not in self.target_files and not display_path.startswith("skill_library/"):
+                        continue
+                    text = str((data.get("lines") or {}).get("text") or "").rstrip("\r\n").replace("\x00", "\\x00")
+                    line_number = int(data.get("line_number") or 0)
                     results.append(
                         {
                             "file": display_path,
-                            "line": index + 1,
-                            "match": line.strip()[:200],
-                            "context": "\n".join(context_lines),
+                            "line": line_number,
+                            "match": text[:200],
+                            "context": f"> {line_number:4d}| {text}",
                         }
                     )
                     if len(results) >= max_results:
+                        truncated = True
+                        await _terminate_process(process)
                         break
-                if len(results) >= max_results:
-                    break
-            if len(results) >= max_results:
-                break
+                if process.returncode is None:
+                    await process.wait()
+        except TimeoutError:
+            timed_out = True
+            await _terminate_process(process)
+        finally:
+            if process.returncode is None:
+                await _terminate_process(process)
+
+        files_searched = len({item["file"] for item in results})
 
         if not results:
             return ToolResult(
                 success=True,
                 data=f"未找到 '{normalized_keyword}' 的匹配结果。\n已搜索 {files_searched} 个文件。",
-                metadata={"files_searched": files_searched, "matches": 0, "keyword": normalized_keyword},
+                metadata={
+                    "files_searched": files_searched,
+                    "matches": 0,
+                    "keyword": normalized_keyword,
+                    "timed_out": timed_out,
+                    "timeout_seconds": timeout_seconds,
+                },
             )
 
         output_parts = [
@@ -526,8 +589,10 @@ class FileSearchTool(AgentTool):
         for result in results:
             output_parts.append(f"\nFile {result['file']}:{result['line']}")
             output_parts.append(f"```\n{result['context']}\n```")
-        if len(results) >= max_results:
+        if truncated:
             output_parts.append(f"\n... results truncated (max {max_results})")
+        if timed_out:
+            output_parts.append(f"\n... search stopped after {timeout_seconds}s; complete matches collected so far are shown")
 
         return ToolResult(
             success=True,
@@ -537,6 +602,9 @@ class FileSearchTool(AgentTool):
                 "files_searched": files_searched,
                 "matches": len(results),
                 "results": results[:10],
+                "truncated": truncated,
+                "timed_out": timed_out,
+                "timeout_seconds": timeout_seconds,
             },
         )
 
@@ -550,6 +618,24 @@ class ListFilesTool(AgentTool):
         "__pycache__",
         ".pytest_cache",
         "coverage",
+        ".cache",
+        ".next",
+        ".nuxt",
+        ".parcel-cache",
+        ".pnpm-store",
+        ".svelte-kit",
+        ".turbo",
+        ".vscode",
+        ".idea",
+        ".vs",
+        "bower_components",
+        "logs",
+        "out",
+        "target",
+        "tmp",
+        "temp",
+        "venv",
+        "env",
     }
 
     def __init__(
@@ -598,6 +684,7 @@ class ListFilesTool(AgentTool):
         pattern: Optional[str] = None,
         recursive: bool = False,
         max_files: int = 100,
+        timeout_seconds: int = 45,
         **kwargs,
     ) -> ToolResult:
         if "path" in kwargs and kwargs["path"]:
@@ -611,6 +698,11 @@ class ListFilesTool(AgentTool):
         if not os.path.isdir(target_dir):
             return ToolResult(success=False, error=f"不是目录: {directory}")
 
+        rg = shutil.which("rg")
+        if not rg:
+            return ToolResult(success=False, error="Glob unavailable: ripgrep (rg) is not installed in the runtime.")
+        max_files = max(1, int(max_files))
+        timeout_seconds = min(120, max(1, int(timeout_seconds)))
         files: List[str] = []
         dirs: List[str] = []
 
@@ -623,32 +715,44 @@ class ListFilesTool(AgentTool):
                 return False
             return True
 
-        if recursive:
-            for root, dirnames, filenames in os.walk(target_dir):
-                dirnames[:] = [name for name in dirnames if name not in self.exclude_dirs]
-                for filename in filenames:
-                    full_path = os.path.join(root, filename)
+        timed_out = False
+        truncated = False
+        args = [rg, "--files", "--no-messages"]
+        if not recursive:
+            args.extend(["--max-depth", "1"])
+        if pattern:
+            args.extend(["--glob", pattern])
+        args.extend(_rg_exclude_args(self.exclude_dirs, self.exclude_patterns))
+        args.extend(["--", "."])
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=target_dir,
+        )
+        try:
+            assert process.stdout is not None
+            async with asyncio.timeout(timeout_seconds):
+                while raw_line := await process.stdout.readline():
+                    full_path = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if full_path and not os.path.isabs(full_path):
+                        full_path = os.path.join(target_dir, full_path)
                     display_path = _best_display_path(full_path, self.project_root, self.allowed_roots, full_path)
-                    if not include_file(display_path, filename):
+                    if not include_file(display_path, os.path.basename(full_path)):
                         continue
                     files.append(display_path)
                     if len(files) >= max_files:
+                        truncated = True
+                        await _terminate_process(process)
                         break
-                if len(files) >= max_files:
-                    break
-        else:
-            for item in os.listdir(target_dir):
-                if item in self.exclude_dirs:
-                    continue
-                full_path = os.path.join(target_dir, item)
-                display_path = _best_display_path(full_path, self.project_root, self.allowed_roots, full_path)
-                if os.path.isdir(full_path):
-                    dirs.append(display_path.rstrip("/") + "/")
-                    continue
-                if include_file(display_path, item):
-                    files.append(display_path)
-                if len(files) >= max_files:
-                    break
+                if process.returncode is None:
+                    await process.wait()
+        except TimeoutError:
+            timed_out = True
+            await _terminate_process(process)
+        finally:
+            if process.returncode is None:
+                await _terminate_process(process)
 
         output_parts = [f"目录: {directory}\n"]
         if dirs:
@@ -679,5 +783,8 @@ class ListFilesTool(AgentTool):
                 "directory": directory,
                 "file_count": len(files),
                 "dir_count": len(dirs),
+                "truncated": truncated,
+                "timed_out": timed_out,
+                "timeout_seconds": timeout_seconds,
             },
         )
